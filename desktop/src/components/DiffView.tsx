@@ -39,7 +39,9 @@ const AUTHOR_COLORS = [
 ];
 const UNATTRIBUTED = "unattributed";
 
-function authorName(c: FileContributor | null | undefined): string {
+function authorName(
+  c: { provider: string | null; terminal_id: string } | null | undefined,
+): string {
   if (!c) return "unattributed";
   return PROVIDER_NAME[c.provider ?? ""] ?? c.provider ?? c.terminal_id.slice(0, 6);
 }
@@ -163,6 +165,8 @@ export function DiffView() {
     attribution?.files[path]?.contributors.length ?? 0;
   const colorFor = (tid: string | null | undefined) =>
     tid && colorIndexById[tid] != null ? AUTHOR_COLORS[colorIndexById[tid]] : null;
+  const hunkAuthor = (path: string, index: number) =>
+    attribution?.files[path]?.hunks?.[String(index)] ?? null;
 
   const agentName =
     (frame && (PROVIDER_NAME[frame.provider] ?? frame.provider)) ??
@@ -496,11 +500,14 @@ export function DiffView() {
                 })()}
                 {current && contribCount(current.path) > 1 && (
                   <span className="rounded bg-amber/15 px-1.5 normal-case text-amber">
-                    multiple authors — review per hunk
+                    multiple authors — labeled per hunk
                   </span>
                 )}
               </p>
-              {currentHunks.map((h) => (
+              {currentHunks.map((h) => {
+                const ha = current ? hunkAuthor(current.path, h.index) : null;
+                const hcol = colorFor(ha?.terminal_id);
+                return (
                 <label
                   key={h.index}
                   className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 hover:bg-ink-700"
@@ -511,6 +518,15 @@ export function DiffView() {
                     onChange={() => toggleHunk(current.path, h.index)}
                     className="accent-sky-500"
                   />
+                  {ha && (
+                    <span
+                      className={`flex shrink-0 items-center gap-1 rounded px-1 text-[9px] ${hcol?.chip ?? "text-zinc-400"}`}
+                      title={`hunk by ${authorName(ha)} (turn ${ha.turn_index + 1})`}
+                    >
+                      <span className={`h-1.5 w-1.5 rounded-full ${hcol?.dot ?? "bg-zinc-500"}`} />
+                      {authorName(ha)} · t{ha.turn_index + 1}
+                    </span>
+                  )}
                   <span className="truncate font-mono text-[11px] text-zinc-400">
                     {h.header}
                   </span>
@@ -519,7 +535,8 @@ export function DiffView() {
                     <span className="text-rose-400"> -{h.deletions}</span>
                   </span>
                 </label>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
