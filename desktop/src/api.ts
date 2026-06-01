@@ -174,6 +174,7 @@ export interface WorktreeInfo {
   branch: string | null;
   base_sha: string | null;
   provider: string | null;
+  member_of?: string | null;
 }
 
 /** Options for launching an agent into an isolated git worktree. */
@@ -373,6 +374,7 @@ export interface ActivityGraph {
     provider: string | null;
     mode: string | null;
     branch: string | null;
+    member_of: string | null;
     turns: GraphTurn[];
   }[];
   edges: { kind: string; source: string | null; target: string | null; ts: string | null }[];
