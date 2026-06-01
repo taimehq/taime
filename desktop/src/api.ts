@@ -132,6 +132,12 @@ export interface FileContributor {
   turn_index: number;
   ended_at: string | null;
 }
+/** Per-hunk author (which member/turn authored a hunk in a shared file). */
+export interface HunkAuthor {
+  terminal_id: string;
+  provider: string | null;
+  turn_index: number;
+}
 export interface AttributionResponse {
   team: {
     terminal_id: string;
@@ -139,7 +145,14 @@ export interface AttributionResponse {
     mode: string | null;
     member_of: string | null;
   }[];
-  files: Record<string, { last: FileContributor | null; contributors: FileContributor[] }>;
+  files: Record<
+    string,
+    {
+      last: FileContributor | null;
+      contributors: FileContributor[];
+      hunks?: Record<string, HunkAuthor>;
+    }
+  >;
 }
 
 /** One hunk of a file's diff (Taime selective merge/revert). */
