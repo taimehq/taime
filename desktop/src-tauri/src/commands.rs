@@ -77,14 +77,24 @@ pub fn pty_spawn_claude(
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    permission_mode: Option<String>,
 ) -> Result<String, String> {
-    // Mirror CAO's claude launch: --dangerously-skip-permissions enables
-    // "bypass permissions" mode (no per-tool prompts). The recurring "Yes, I
-    // accept" dialog is suppressed by skipDangerousModePermissionPrompt:true in
-    // ~/.claude/settings.json, which CAO already writes.
+    // Permission mode mirrors CAO's _build_claude_command: a caller-supplied
+    // `--permission-mode <mode>` (e.g. "default", "acceptEdits", "plan") when
+    // given, else the bypass default ("bypass permissions on" — no per-tool
+    // prompts) that the rest of Taime/CAO uses for unattended orchestration.
+    // SECURITY: bypass runs tools without prompts; it's the deliberate model
+    // for driving real CLIs in the user's workspace, and is overridable here
+    // rather than hardcoded. The recurring "Yes, I accept" dialog is suppressed
+    // by skipDangerousModePermissionPrompt in ~/.claude/settings.json (written
+    // by CAO; not touched here, so the user can still revoke bypass there).
+    let args: Vec<String> = match permission_mode {
+        Some(mode) if !mode.is_empty() => vec!["--permission-mode".to_string(), mode],
+        _ => vec!["--dangerously-skip-permissions".to_string()],
+    };
     pty.spawn(
         &claude_binary(),
-        &["--dangerously-skip-permissions".to_string()],
+        &args,
         cwd.as_deref(),
         &[],
         rows.unwrap_or(24),
