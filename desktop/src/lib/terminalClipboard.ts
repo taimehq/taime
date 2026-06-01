@@ -1,4 +1,23 @@
 import type { Terminal } from "@xterm/xterm";
+import { invoke } from "@tauri-apps/api/core";
+import { inTauri } from "../backend";
+import { shellQuotePath } from "./terminalInput";
+
+/** Persist a pasted image to a temp file (native only) and return its path. */
+async function savePastedImage(file: File): Promise<string | null> {
+  if (!inTauri()) return null;
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    let bin = "";
+    for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+    const b64 = btoa(bin);
+    const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
+    return await invoke<string>("save_paste_image", { data: b64, ext });
+  } catch (e) {
+    console.warn("[taime] save_paste_image failed", e);
+    return null;
+  }
+}
 
 /**
  * Cross-platform copy/paste for an xterm terminal, shared by EVERY transport
@@ -22,6 +41,22 @@ export function wireClipboard(term: Terminal, el: HTMLElement): () => void {
     (navigator.platform.toLowerCase().includes("mac") || /Mac/.test(navigator.userAgent));
 
   const onPaste = (e: ClipboardEvent) => {
+    // Screenshot/image paste (e.g. macOS Cmd+Ctrl+Shift+4 → clipboard): save it
+    // to a temp file and insert the PATH, which CLIs like Claude Code read.
+    const items = e.clipboardData?.items;
+    const imageItem = items
+      ? Array.from(items).find((it) => it.kind === "file" && it.type.startsWith("image/"))
+      : undefined;
+    if (imageItem) {
+      const file = imageItem.getAsFile();
+      if (file) {
+        e.preventDefault();
+        savePastedImage(file).then((p) => {
+          if (p) term.paste(shellQuotePath(p) + " ");
+        });
+        return;
+      }
+    }
     const text = e.clipboardData?.getData("text");
     if (text) {
       term.paste(text);

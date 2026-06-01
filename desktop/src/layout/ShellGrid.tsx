@@ -67,9 +67,12 @@ function FrameCell({ frame }: { frame: Frame }) {
   const active = activeFrameKey === frame.key;
   const title =
     TARGET_NAME[frame.provider] ?? frame.provider.replace(/_/g, " ");
+  // Key the frame for drag-and-drop hit-testing (file/screenshot drop → path).
+  const termKey = isRustPty ? frame.ptySessionId : frame.terminalId;
 
   return (
     <div
+      data-term-key={termKey ?? undefined}
       onMouseDown={() => setActiveFrameGuarded(frame.key)}
       className={`flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border ${
         active ? "border-teal-600/70" : "border-ink-600"

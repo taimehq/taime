@@ -12,6 +12,7 @@ import {
   onPtyExit,
 } from "../pty";
 import { wireClipboard } from "../lib/terminalClipboard";
+import { registerTerminalInput } from "../lib/terminalInput";
 
 interface Props {
   sessionId: string;
@@ -90,6 +91,11 @@ export function TerminalViewRustPty({ sessionId, onConnectionChange }: Props) {
     // Cross-platform copy/paste (shared across transports).
     const cleanupClipboard = wireClipboard(term, el);
 
+    // Register an input writer so dropped file/screenshot paths can be typed in.
+    const unregisterInput = registerTerminalInput(sessionId, (text) => {
+      ptyWrite(sessionId, text);
+    });
+
     term.onData((data) => {
       ptyWrite(sessionId, data);
     });
@@ -130,6 +136,7 @@ export function TerminalViewRustPty({ sessionId, onConnectionChange }: Props) {
       clearTimeout(resizeTimer);
       resizeObserver?.disconnect();
       cleanupClipboard();
+      unregisterInput();
       unlistenData?.();
       unlistenExit?.();
       // Closing the view detaches — it does NOT kill the agent.

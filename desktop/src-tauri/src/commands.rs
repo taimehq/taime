@@ -130,3 +130,23 @@ pub fn pty_kill(pty: State<'_, PtyManager>, session_id: String) {
 pub fn pty_list(pty: State<'_, PtyManager>) -> Vec<SessionInfo> {
     pty.list_sessions()
 }
+
+/// Persist a pasted/dropped image (base64) to a temp file and return its path,
+/// so a screenshot pasted into the terminal can be referenced by path (which is
+/// what CLIs like Claude Code read). Used by both terminal transports.
+#[tauri::command]
+pub fn save_paste_image(data: String, ext: Option<String>) -> Result<String, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| format!("bad base64: {e}"))?;
+    let ext = ext.unwrap_or_else(|| "png".to_string());
+    let dir = std::env::temp_dir().join("taime-pastes");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {e}"))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("paste-{stamp}.{ext}"));
+    std::fs::write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
