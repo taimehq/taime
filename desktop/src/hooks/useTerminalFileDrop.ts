@@ -1,7 +1,13 @@
 import { useEffect } from "react";
 import { inTauri } from "../backend";
 import { useStore } from "../store";
-import { sendToTerminal, formatDroppedPaths } from "../lib/terminalInput";
+import {
+  sendToTerminal,
+  formatDroppedPaths,
+  isImagePath,
+  setClipboardImageFromPath,
+  PASTE_TRIGGER,
+} from "../lib/terminalInput";
 
 /**
  * Drag a file or screenshot from Finder onto a terminal → its absolute path is
@@ -55,14 +61,27 @@ export function useTerminalFileDrop() {
         const un = await getCurrentWebview().onDragDropEvent((event) => {
           if (event.payload.type !== "drop") return;
           const paths = (event.payload.paths ?? []) as string[];
-          const text = formatDroppedPaths(paths);
-          if (!text) return;
+          if (!paths.length) return;
 
           // Route to the frame under the cursor; fall back to the active frame.
           const pos = event.payload.position;
           const key = termKeyAtPoint(pos.x, pos.y) ?? termKeyForActiveFrame();
+          if (!key) return;
 
-          sendToTerminal(key, text);
+          const images = paths.filter(isImagePath);
+          const others = paths.filter((p) => !isImagePath(p));
+
+          // Non-image files → insert their (escaped) paths as text.
+          if (others.length) sendToTerminal(key, formatDroppedPaths(others));
+
+          // Images → load each onto the system clipboard, then send the paste
+          // trigger so the agent (e.g. Claude Code) reads it → [Image #N].
+          (async () => {
+            for (const img of images) {
+              const ok = await setClipboardImageFromPath(img);
+              if (ok) sendToTerminal(key, PASTE_TRIGGER);
+            }
+          })();
         });
         if (cancelled) un();
         else unlisten = un;

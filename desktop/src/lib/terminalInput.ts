@@ -9,9 +9,37 @@
  * user can keep typing.
  */
 
+import { invoke } from "@tauri-apps/api/core";
+import { inTauri } from "../backend";
+
 type Writer = (text: string) => void;
 
 const writers = new Map<string, Writer>();
+
+/** Ctrl+V control byte — the paste trigger CLIs like Claude Code read the
+ * system clipboard on (its image paste → `[Image #N]`). */
+export const PASTE_TRIGGER = "\x16";
+
+const IMAGE_EXTS = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "heic", "svg",
+]);
+
+export function isImagePath(p: string): boolean {
+  const ext = p.split(".").pop()?.toLowerCase() ?? "";
+  return IMAGE_EXTS.has(ext);
+}
+
+/** Put an image FILE on the macOS clipboard so the agent can read it on paste. */
+export async function setClipboardImageFromPath(path: string): Promise<boolean> {
+  if (!inTauri()) return false;
+  try {
+    await invoke("set_clipboard_image_from_path", { path });
+    return true;
+  } catch (e) {
+    console.warn("[taime] set_clipboard_image_from_path failed", e);
+    return false;
+  }
+}
 
 /** Register a terminal's input writer; returns an unregister fn. */
 export function registerTerminalInput(key: string, writer: Writer): () => void {
