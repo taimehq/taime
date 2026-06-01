@@ -23,6 +23,30 @@ const EDGE_LABEL: Record<string, string> = {
   send_message: "messaged",
 };
 
+/** Order agents so each team owner is immediately followed by its members. */
+function orderTeams<T extends { terminal_id: string; member_of: string | null }>(
+  agents: T[],
+): T[] {
+  const owners = agents.filter((a) => !a.member_of);
+  const membersByOwner = new Map<string, T[]>();
+  for (const a of agents) {
+    if (a.member_of) {
+      const list = membersByOwner.get(a.member_of) ?? [];
+      list.push(a);
+      membersByOwner.set(a.member_of, list);
+    }
+  }
+  const ordered: T[] = [];
+  for (const o of owners) {
+    ordered.push(o, ...(membersByOwner.get(o.terminal_id) ?? []));
+  }
+  // Append any members whose owner isn't in the set (orphans).
+  for (const a of agents) {
+    if (a.member_of && !ordered.includes(a)) ordered.push(a);
+  }
+  return ordered;
+}
+
 function fmtTime(iso: string | null): string {
   if (!iso) return "";
   try {
@@ -171,25 +195,41 @@ export function ActivityGraph() {
                 Agents &amp; turns
               </h3>
               <div className="flex gap-4 overflow-x-auto pb-2">
-                {graph.agents.map((a) => (
+                {orderTeams(graph.agents).map((a) => (
                   <div
                     key={a.terminal_id}
-                    className="w-64 shrink-0 rounded-lg border border-ink-600 bg-ink-800/60"
+                    className={`w-64 shrink-0 rounded-lg border bg-ink-800/60 ${
+                      a.member_of
+                        ? "ml-2 border-ink-600 border-l-2 border-l-violet-500/50"
+                        : "border-ink-600"
+                    }`}
                   >
                     <div className="border-b border-ink-600 px-3 py-2">
-                      <div className="text-sm font-medium text-zinc-100">
+                      <div className="flex items-center gap-1.5 text-sm font-medium text-zinc-100">
                         {nameFor(a.terminal_id)}
-                      </div>
-                      <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-zinc-500">
-                        {a.mode === "worktree" && a.branch ? (
-                          <span className="flex items-center gap-1 text-sky-300">
-                            <GitBranch size={10} />
-                            {a.branch}
+                        {a.member_of && (
+                          <span className="rounded bg-violet-500/20 px-1.5 text-[9px] font-semibold uppercase tracking-wide text-violet-300">
+                            member
                           </span>
-                        ) : (
-                          <span>{a.mode ?? "—"}</span>
                         )}
                       </div>
+                      {a.member_of ? (
+                        <div className="mt-0.5 truncate text-[10px] text-zinc-500">
+                          ↳ delegated by {nameFor(a.member_of)}
+                          {a.branch ? ` · shares ${a.branch}` : ""}
+                        </div>
+                      ) : (
+                        <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-zinc-500">
+                          {a.mode === "worktree" && a.branch ? (
+                            <span className="flex items-center gap-1 text-sky-300">
+                              <GitBranch size={10} />
+                              {a.branch}
+                            </span>
+                          ) : (
+                            <span>{a.mode ?? "—"}</span>
+                          )}
+                        </div>
+                      )}
                     </div>
                     <div className="space-y-2 p-2">
                       {a.turns.length === 0 && (
