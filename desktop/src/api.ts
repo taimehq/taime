@@ -310,6 +310,21 @@ export const api = {
   getWorktree: (id: string) =>
     fetchJSON<WorktreeInfo | null>(`/terminals/${id}/worktree`),
 
+  /** Taime-added: provision a worktree + terminal id for a CAO-external agent
+   * (Rust PTY), so it gets the full attribution surface keyed by that id. */
+  provisionWorktree: (body: {
+    project_root: string;
+    provider?: string;
+    isolate?: boolean;
+    session_name?: string;
+  }) =>
+    fetchJSON<WorktreeInfo>(`/worktrees/provision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      timeoutMs: 20000,
+    }),
+
   /** Taime-added: structured per-file diff (both sides) for side-by-side review. */
   getFileDiffs: (id: string) =>
     fetchJSON<FileDiffsResponse>(`/terminals/${id}/file-diffs`, {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Plus, ChevronRight, ChevronDown } from "lucide-react";
+import { Plus, ChevronRight, ChevronDown, GitBranch, Power } from "lucide-react";
 import { useStore } from "../store";
 import { api, type SessionDetail } from "../api";
 import { StatusBadge } from "../components/StatusBadge";
@@ -44,9 +44,68 @@ export function ControlColumn({
 
         <PipelineSection sessions={sessions} />
 
+        <DetachedAgentsSection />
+
         <FileInventory />
       </div>
     </aside>
+  );
+}
+
+/**
+ * Rust-PTY agents whose frame was closed but are still RUNNING (close ≠ kill).
+ * Lists them with reopen (reattach to the live process) + kill (terminate).
+ */
+function DetachedAgentsSection() {
+  const rustPtySessions = useStore((s) => s.rustPtySessions);
+  const frames = useStore((s) => s.frames);
+  const reopenRustPty = useStore((s) => s.reopenRustPty);
+  const forgetRustPty = useStore((s) => s.forgetRustPty);
+
+  const framed = new Set(frames.map((f) => f.ptySessionId).filter(Boolean));
+  const detached = Object.values(rustPtySessions).filter(
+    (m) => !framed.has(m.ptySessionId),
+  );
+  if (detached.length === 0) return null;
+
+  return (
+    <Section title={`Detached agents (${detached.length})`}>
+      <p className="-mt-1 mb-1 text-[10px] text-zinc-600">
+        Running, frame closed. Reopen reattaches; kill terminates.
+      </p>
+      <div className="flex flex-col gap-1">
+        {detached.map((m) => (
+          <div
+            key={m.ptySessionId}
+            className="flex items-center gap-2 rounded-lg border border-violet-500/30 bg-violet-500/5 px-2.5 py-1.5"
+          >
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span className="truncate text-[12px] text-zinc-200">Claude Code</span>
+              {m.branch && (
+                <span className="flex items-center gap-1 truncate font-mono text-[9px] text-sky-300/80">
+                  <GitBranch size={9} />
+                  {m.branch}
+                </span>
+              )}
+            </span>
+            <button
+              onClick={() => reopenRustPty(m.ptySessionId)}
+              className="shrink-0 rounded border border-ink-500 px-2 py-0.5 text-[11px] text-zinc-200 hover:bg-ink-600"
+            >
+              Reopen
+            </button>
+            <button
+              onClick={() => forgetRustPty(m.ptySessionId)}
+              aria-label="Kill agent"
+              className="shrink-0 rounded p-0.5 text-rose-400/80 hover:text-rose-300"
+              title="Kill agent (terminate process)"
+            >
+              <Power size={13} />
+            </button>
+          </div>
+        ))}
+      </div>
+    </Section>
   );
 }
 

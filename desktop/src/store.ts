@@ -13,7 +13,7 @@ import {
   addRecent,
 } from "./lib/recentProjects";
 import { makeSessionName } from "./lib/sessionName";
-import { ptySpawnClaude, ptyKill } from "./pty";
+import { ptySpawnClaude, ptyKill, ptyCloseView } from "./pty";
 
 /** Which transport carries a frame's terminal I/O. */
 export type TerminalTransport = "cao_ws" | "rust_pty";
@@ -46,6 +46,21 @@ export interface Frame {
   transport?: TerminalTransport;
   /** Rust PTY session id (when transport === "rust_pty"). */
   ptySessionId?: string;
+}
+
+/**
+ * Surviving metadata for a Rust-PTY agent, keyed by ptySessionId. Outlives its
+ * frame: closing a frame detaches the view (close_view ≠ kill), and this record
+ * is what lets the UI list + reopen a still-running detached agent.
+ */
+export interface RustPtyMeta {
+  ptySessionId: string;
+  /** Provisioned worktree terminal id — the attribution key (dirty/diff/graph). */
+  terminalId: string;
+  provider: string;
+  branch: string | null;
+  cwd: string | null;
+  startedAt: number;
 }
 
 /** Dirty-state surfaced by the Rust file watcher (step 4). */
@@ -86,6 +101,9 @@ interface Store {
   // UI / grid
   frames: Frame[];
   activeFrameKey: string | null;
+  /** Known Rust-PTY agents keyed by ptySessionId — survives frame close so a
+   * detached (still-running) agent can be listed + reopened (close ≠ kill). */
+  rustPtySessions: Record<string, RustPtyMeta>;
   dirty: Record<string, DirtyState>;
   /** Per-terminal attributed file-change timeline (most recent last). */
   timeline: Record<string, TimelineEvent[]>;
@@ -121,10 +139,14 @@ interface Store {
     agentProfile?: string | null;
     sessionName?: string | null;
   }) => void;
-  /** Dev: launch Claude on the Rust-owned PTY transport (CAO path untouched). */
+  /** Launch Claude on the Rust-owned PTY transport (CAO path untouched). */
   launchClaudeRustPty: () => Promise<void>;
+  /** Reopen a detached (still-running) Rust-PTY agent in a new frame. */
+  reopenRustPty: (ptySessionId: string) => void;
   /** Explicitly terminate a Rust-PTY agent (distinct from closing its frame). */
   killRustPty: (key: string) => Promise<void>;
+  /** Drop a detached Rust-PTY session from the registry after it exits. */
+  forgetRustPty: (ptySessionId: string) => Promise<void>;
   closeFrame: (key: string) => Promise<void>;
   setActiveFrame: (key: string | null) => void;
   /** Switch active frame, raising the dirty-state guard if needed. */
@@ -158,6 +180,7 @@ export const useStore = create<Store>((set, get) => ({
 
   frames: [],
   activeFrameKey: null,
+  rustPtySessions: {},
   dirty: {},
   timeline: {},
   reviewedFrames: {},
@@ -351,14 +374,30 @@ export const useStore = create<Store>((set, get) => ({
   launchClaudeRustPty: async () => {
     const dir = get().workspaceDir;
     try {
-      const sessionId = await ptySpawnClaude(dir, 24, 80);
+      // Provision a worktree FIRST so the Rust-PTY agent gets the same
+      // attribution surface (dirty/diff/timeline/graph) as a CAO terminal —
+      // all of which key off this terminalId. Claude runs in the worktree path.
+      let terminalId: string | null = null;
+      let cwd = dir;
+      let branch: string | null = null;
+      if (dir) {
+        const wt = await api.provisionWorktree({
+          project_root: dir,
+          provider: "claude_code",
+          isolate: get().isolationEnabled,
+        });
+        terminalId = wt.terminal_id;
+        cwd = wt.worktree_path;
+        branch = wt.branch;
+      }
+      const sessionId = await ptySpawnClaude(cwd, 24, 80);
       const key = nextKey();
       set((s) => ({
         frames: [
           ...s.frames,
           {
             key,
-            terminalId: null,
+            terminalId, // = provisioned worktree id → attribution lights up
             provider: "claude_code",
             agentProfile: null,
             sessionName: null,
@@ -368,6 +407,19 @@ export const useStore = create<Store>((set, get) => ({
           },
         ],
         activeFrameKey: key,
+        rustPtySessions: terminalId
+          ? {
+              ...s.rustPtySessions,
+              [sessionId]: {
+                ptySessionId: sessionId,
+                terminalId,
+                provider: "claude_code",
+                branch,
+                cwd,
+                startedAt: Date.now(),
+              },
+            }
+          : s.rustPtySessions,
       }));
       get().showSnackbar({ type: "success", message: "Claude launched (Rust PTY)" });
     } catch (e) {
@@ -376,16 +428,56 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
+  reopenRustPty: (ptySessionId) => {
+    const meta = get().rustPtySessions[ptySessionId];
+    if (!meta) return;
+    const existing = get().frames.find((f) => f.ptySessionId === ptySessionId);
+    if (existing) {
+      set({ activeFrameKey: existing.key });
+      return;
+    }
+    const key = nextKey();
+    set((s) => ({
+      frames: [
+        ...s.frames,
+        {
+          key,
+          terminalId: meta.terminalId,
+          provider: meta.provider,
+          agentProfile: null,
+          sessionName: null,
+          pending: false,
+          transport: "rust_pty",
+          ptySessionId,
+        },
+      ],
+      activeFrameKey: key,
+    }));
+  },
+
   killRustPty: async (key) => {
     const frame = get().frames.find((f) => f.key === key);
-    if (frame?.ptySessionId) await ptyKill(frame.ptySessionId);
+    const sid = frame?.ptySessionId;
+    if (sid) await ptyKill(sid);
     set((s) => {
       const frames = s.frames.filter((f) => f.key !== key);
+      const rustPtySessions = { ...s.rustPtySessions };
+      if (sid) delete rustPtySessions[sid];
       return {
         frames,
+        rustPtySessions,
         activeFrameKey:
           s.activeFrameKey === key ? (frames[frames.length - 1]?.key ?? null) : s.activeFrameKey,
       };
+    });
+  },
+
+  forgetRustPty: async (ptySessionId) => {
+    await ptyKill(ptySessionId); // safe even if already exited
+    set((s) => {
+      const rustPtySessions = { ...s.rustPtySessions };
+      delete rustPtySessions[ptySessionId];
+      return { rustPtySessions };
     });
   },
 
@@ -402,6 +494,11 @@ export const useStore = create<Store>((set, get) => ({
             : s.activeFrameKey,
       };
     });
+    // Rust-PTY: detach the view but KEEP the agent running + its registry entry,
+    // so it shows up under "detached" and can be reopened. (close ≠ kill.)
+    if (frame?.transport === "rust_pty" && frame.ptySessionId) {
+      await ptyCloseView(frame.ptySessionId);
+    }
     // Best-effort clear dirty marker for the closed terminal.
     if (frame?.terminalId) get().clearDirty(frame.terminalId);
   },

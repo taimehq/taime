@@ -151,6 +151,7 @@ impl PtyManager {
         // Reader thread: owns only Arc clones (NO manager lock held across reads).
         let sink = self.sink.clone();
         let tid = id.clone();
+        let sessions = self.sessions.clone();
         thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 8192];
@@ -173,6 +174,11 @@ impl PtyManager {
                         }
                     }
                 }
+            }
+            // Process exited (EOF): reap the child, drop the session so pty_list
+            // never reports a dead session, THEN emit Exit (running→exited→gone).
+            if let Some(s) = sessions.lock().unwrap().remove(&tid) {
+                let _ = s.child.lock().unwrap().wait();
             }
             (sink)(&tid, PtyEvent::Exit(None));
         });
@@ -306,20 +312,14 @@ mod tests {
     #[test]
     fn spawn_buffers_output_for_reattach() {
         // Spawn starts detached: output is buffered, not emitted live, and a
-        // reattach replays it (so a freshly-opened view repaints).
+        // reattach replays it (so a freshly-opened view repaints). Use a
+        // long-lived `cat` so the session is still alive at reattach (a
+        // fast-exiting process is reaped + removed, which is a separate test).
         let (sink, _rx) = channel_sink();
         let mgr = PtyManager::new(sink);
-        let id = mgr
-            .spawn(
-                "sh",
-                &["-c".into(), "printf TAIME_OK".into()],
-                None,
-                &[],
-                24,
-                80,
-            )
-            .expect("spawn");
-        std::thread::sleep(Duration::from_millis(400));
+        let id = mgr.spawn("cat", &[], None, &[], 24, 80).expect("spawn");
+        mgr.write_input(&id, b"TAIME_OK\n").expect("write");
+        std::thread::sleep(Duration::from_millis(300));
         let replay = mgr.reattach_view(&id).expect("reattach");
         assert!(
             String::from_utf8_lossy(&replay).contains("TAIME_OK"),
@@ -388,5 +388,24 @@ mod tests {
         let mgr = PtyManager::new(sink);
         let res = mgr.spawn("definitely-not-a-real-binary-xyz", &[], None, &[], 24, 80);
         assert!(res.is_err(), "missing binary should return Err, not panic");
+    }
+
+    #[test]
+    fn exited_session_is_removed_from_list() {
+        let (sink, _rx) = channel_sink();
+        let mgr = PtyManager::new(sink);
+        let id = mgr
+            .spawn("sh", &["-c".into(), "exit 0".into()], None, &[], 24, 80)
+            .expect("spawn");
+        // Wait for the process to exit + the reader to reap and drop it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mgr.list_sessions().iter().any(|s| s.id == id) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !mgr.list_sessions().iter().any(|s| s.id == id),
+            "an exited session must be removed from the manager (no dead sessions in list)"
+        );
     }
 }
