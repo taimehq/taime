@@ -5,10 +5,14 @@ mod backend;
 mod commands;
 mod config;
 mod fs_watch;
+mod pty;
 
 use backend::SupervisorHandle;
+use base64::Engine;
 use fs_watch::FsWatchState;
-use tauri::{Manager, RunEvent};
+use pty::{EventSink, PtyEvent, PtyManager};
+use std::sync::Arc;
+use tauri::{Emitter, Manager, RunEvent};
 
 /// Shared application state managed by Tauri.
 pub struct AppStateHandle {
@@ -18,6 +22,7 @@ pub struct AppStateHandle {
 #[cfg(unix)]
 mod signals {
     use crate::backend::SupervisorHandle;
+    use crate::pty::PtyManager;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -30,14 +35,16 @@ mod signals {
 
     /// Install SIGTERM/SIGINT handlers + a watcher thread that performs the
     /// (non-signal-safe) graceful child shutdown and exits. This makes
-    /// `kill`/Ctrl-C clean up the managed backend, not just window-close.
-    pub fn install(supervisor: SupervisorHandle) {
+    /// `kill`/Ctrl-C clean up the managed backend AND any Rust-owned PTYs, not
+    /// just window-close.
+    pub fn install(supervisor: SupervisorHandle, pty: PtyManager) {
         unsafe {
             libc::signal(libc::SIGTERM, handle as libc::sighandler_t);
             libc::signal(libc::SIGINT, handle as libc::sighandler_t);
         }
         std::thread::spawn(move || loop {
             if SIGNALLED.load(Ordering::SeqCst) {
+                pty.shutdown_all();
                 supervisor.shutdown();
                 std::process::exit(0);
             }
@@ -64,10 +71,26 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let supervisor = backend::start(&app.handle(), resolved.clone());
+
+            // Rust-owned PTY manager. Its output sink emits Tauri events keyed
+            // by session id; the frontend listens on `pty://{id}/data|exit`.
+            let app_handle = app.handle().clone();
+            let sink: EventSink = Arc::new(move |id: &str, ev: PtyEvent| match ev {
+                PtyEvent::Data(d) => {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&d);
+                    let _ = app_handle.emit(&format!("pty://{id}/data"), b64);
+                }
+                PtyEvent::Exit(code) => {
+                    let _ = app_handle.emit(&format!("pty://{id}/exit"), code);
+                }
+            });
+            let pty = PtyManager::new(sink);
+
             #[cfg(unix)]
-            signals::install(supervisor.clone());
+            signals::install(supervisor.clone(), pty.clone());
             app.manage(AppStateHandle { supervisor });
             app.manage(FsWatchState::new());
+            app.manage(pty);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -76,13 +99,23 @@ fn main() {
             commands::get_backend_status,
             commands::watch_terminal,
             commands::unwatch_terminal,
-            commands::clear_dirty
+            commands::clear_dirty,
+            commands::pty_spawn_claude,
+            commands::pty_write,
+            commands::pty_resize,
+            commands::pty_close_view,
+            commands::pty_reattach_view,
+            commands::pty_kill,
+            commands::pty_list
         ])
         .build(tauri::generate_context!())
         .expect("error while building Taime")
         .run(|app_handle, event| {
-            // On exit, stop the managed backend child gracefully.
+            // On exit, kill Rust-owned PTYs and stop the managed backend child.
             if let RunEvent::ExitRequested { .. } = event {
+                if let Some(pty) = app_handle.try_state::<PtyManager>() {
+                    pty.shutdown_all();
+                }
                 if let Some(state) = app_handle.try_state::<AppStateHandle>() {
                     state.supervisor.shutdown();
                 }
