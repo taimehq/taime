@@ -1,0 +1,33 @@
+# --- Build artifacts / dependencies (never commit) ---
+**/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+**/.vite/
+
+# Python
+**/__pycache__/
+*.py[cod]
+**/.venv/
+**/venv/
+*.egg-info/
+
+# Rust
+**/target/
+
+# Logs / OS
+*.log
+.DS_Store
+
+# Local tooling state
+.claude/scheduled_tasks.lock
+
+# backend/cao is its own git repo (your CAO fork). It is committed there, not
+# in this parent repo. (Convert to a submodule/subtree later if you want it
+# referenced from here.)
+backend/cao/
+
+# Playwright/test artifacts
+.playwright-mcp/
+loop-*.png
+ws-*.png
+taime-*.png

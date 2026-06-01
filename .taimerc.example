@@ -1,0 +1,19 @@
+{
+  "//": "Taime project-local config. Copy to .taimerc to use. Resolution order:",
+  "//order": "TAIME_API_URL env > ./.taimerc > ~/.taime/config.json > built-in default",
+
+  "//apiUrl": "Full backend origin. Sets host+port together. Default http://127.0.0.1:9889",
+  "apiUrl": "http://127.0.0.1:9889",
+
+  "//host": "Override host only (takes precedence over apiUrl's host).",
+  "host": "127.0.0.1",
+
+  "//port": "Override port only (takes precedence over apiUrl's port).",
+  "port": 9889,
+
+  "//externalBackend": "true = do NOT spawn cao-server; connect to one already running.",
+  "externalBackend": false,
+
+  "//backendCmd": "Override the launch command for the managed backend (default: cao-server). e.g. 'uv run cao-server'",
+  "backendCmd": "cao-server"
+}
