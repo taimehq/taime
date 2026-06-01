@@ -5,6 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { terminalWsUrl } from "../api";
 import { wireClipboard } from "../lib/terminalClipboard";
+import { registerTerminalInput } from "../lib/terminalInput";
 
 interface TerminalViewProps {
   terminalId: string;
@@ -92,6 +93,13 @@ export function TerminalView({
     // Cross-platform copy/paste (shared across transports).
     const cleanupClipboard = wireClipboard(term, el);
 
+    // Register an input writer so dropped file/screenshot paths can be typed in.
+    const unregisterInput = registerTerminalInput(terminalId, (text) => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "input", data: text }));
+      }
+    });
+
     term.onData((data) => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "input", data }));
@@ -149,6 +157,7 @@ export function TerminalView({
       clearTimeout(resizeTimer);
       resizeObserver?.disconnect();
       cleanupClipboard();
+      unregisterInput();
       ws?.close();
       term.dispose();
     };

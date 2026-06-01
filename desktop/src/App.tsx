@@ -16,6 +16,7 @@ import { LaunchAgentDialog } from "./components/LaunchAgentDialog";
 import { Snackbar } from "./components/Snackbar";
 import { ContextSwitchGuard } from "./components/ContextSwitchGuard";
 import { useTurnCheckpoints } from "./hooks/useTurnCheckpoints";
+import { useTerminalFileDrop } from "./hooks/useTerminalFileDrop";
 import { Activity } from "lucide-react";
 
 // Defer the Monaco-heavy overlays out of the initial bundle — they load only
@@ -50,6 +51,7 @@ export default function App() {
 
   useBackendSync();
   useTurnCheckpoints();
+  useTerminalFileDrop();
 
   // Inside the webview the supervisor (Rust) is the source of truth for the
   // pill. Outside it (dev-in-browser), synthesize it from REST reachability so
