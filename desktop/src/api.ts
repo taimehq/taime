@@ -125,6 +125,23 @@ export interface FileDiffsResponse {
   files: FileDiffEntry[];
 }
 
+/** Who last changed a file, and all contributing turns (team-worktree review). */
+export interface FileContributor {
+  terminal_id: string;
+  provider: string | null;
+  turn_index: number;
+  ended_at: string | null;
+}
+export interface AttributionResponse {
+  team: {
+    terminal_id: string;
+    provider: string | null;
+    mode: string | null;
+    member_of: string | null;
+  }[];
+  files: Record<string, { last: FileContributor | null; contributors: FileContributor[] }>;
+}
+
 /** One hunk of a file's diff (Taime selective merge/revert). */
 export interface HunkEntry {
   index: number;
@@ -289,6 +306,12 @@ export const api = {
   /** Taime-added: per-file, per-hunk diff for selective merge/revert. */
   getHunks: (id: string) =>
     fetchJSON<HunkedDiffResponse>(`/terminals/${id}/hunks`, { timeoutMs: 20000 }),
+
+  /** Taime-added: per-file authorship (who/which turn) for team-worktree review. */
+  getAttribution: (id: string) =>
+    fetchJSON<AttributionResponse>(`/terminals/${id}/attribution`, {
+      timeoutMs: 15000,
+    }),
 
   /** Taime-added: selectively merge/revert chosen files/hunks. */
   applySelection: (
