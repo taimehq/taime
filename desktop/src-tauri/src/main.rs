@@ -107,7 +107,7 @@ fn main() {
             commands::pty_reattach_view,
             commands::pty_kill,
             commands::pty_list,
-            commands::save_paste_image
+            commands::set_clipboard_image_from_path
         ])
         .build(tauri::generate_context!())
         .expect("error while building Taime")

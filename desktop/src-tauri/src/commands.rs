@@ -131,22 +131,41 @@ pub fn pty_list(pty: State<'_, PtyManager>) -> Vec<SessionInfo> {
     pty.list_sessions()
 }
 
-/// Persist a pasted/dropped image (base64) to a temp file and return its path,
-/// so a screenshot pasted into the terminal can be referenced by path (which is
-/// what CLIs like Claude Code read). Used by both terminal transports.
+/// Load an image FILE into the macOS system clipboard (as image data), so a
+/// dragged image can be ingested by a CLI that reads clipboard images on paste
+/// (e.g. Claude Code's Ctrl+V image paste → `[Image #N]`). A web terminal can't
+/// pipe image bytes through the PTY, so the clipboard is the channel; the caller
+/// then sends the agent its paste trigger.
+#[cfg(target_os = "macos")]
 #[tauri::command]
-pub fn save_paste_image(data: String, ext: Option<String>) -> Result<String, String> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.as_bytes())
-        .map_err(|e| format!("bad base64: {e}"))?;
-    let ext = ext.unwrap_or_else(|| "png".to_string());
-    let dir = std::env::temp_dir().join("taime-pastes");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {e}"))?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = dir.join(format!("paste-{stamp}.{ext}"));
-    std::fs::write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
-    Ok(path.to_string_lossy().to_string())
+pub fn set_clipboard_image_from_path(path: String) -> Result<(), String> {
+    // AppleScript image class for the clipboard, by extension.
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let class = match ext.as_str() {
+        "jpg" | "jpeg" => "«class JPEG»",
+        "gif" => "«class GIFf»",
+        "tif" | "tiff" => "«class TIFF»",
+        _ => "«class PNGf»", // png + default
+    };
+    let esc = path.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("set the clipboard to (read (POSIX file \"{esc}\") as {class})");
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| format!("osascript failed: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub fn set_clipboard_image_from_path(_path: String) -> Result<(), String> {
+    Err("clipboard image set is only implemented on macOS".to_string())
 }
