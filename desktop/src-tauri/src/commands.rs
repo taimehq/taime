@@ -78,9 +78,13 @@ pub fn pty_spawn_claude(
     rows: Option<u16>,
     cols: Option<u16>,
 ) -> Result<String, String> {
+    // Mirror CAO's claude launch: --dangerously-skip-permissions enables
+    // "bypass permissions" mode (no per-tool prompts). The recurring "Yes, I
+    // accept" dialog is suppressed by skipDangerousModePermissionPrompt:true in
+    // ~/.claude/settings.json, which CAO already writes.
     pty.spawn(
         &claude_binary(),
-        &[],
+        &["--dangerously-skip-permissions".to_string()],
         cwd.as_deref(),
         &[],
         rows.unwrap_or(24),
