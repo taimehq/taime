@@ -4,10 +4,11 @@ import { useStore } from "../store";
 import { ptyList } from "../pty";
 
 /**
- * Keep the Rust-PTY registry honest: every few seconds, drop any tracked
+ * Keep the Rust-PTY registry honest: every few seconds, mark any tracked
  * session whose process is no longer alive in the manager (it exited or was
- * killed — the manager removes exited sessions). This prunes the "detached
- * agents" list so it never offers a reopen for a dead agent.
+ * killed — the manager removes exited sessions) as "exited", so the detached-
+ * agents list reflects lifecycle (running → exited) instead of silently
+ * dropping it. The user dismisses exited entries explicitly.
  */
 export function useRustPtyReconcile() {
   useEffect(() => {
@@ -26,15 +27,13 @@ export function useRustPtyReconcile() {
           .frames.map((f) => f.ptySessionId)
           .filter(Boolean) as string[],
       );
-      // Prune only sessions that are neither alive in the manager nor currently
-      // framed (a just-launched frame may briefly precede pty_list visibility).
-      const dead = ids.filter((id) => !live.has(id) && !framed.has(id));
-      if (dead.length) {
-        useStore.setState((s) => {
-          const next = { ...s.rustPtySessions };
-          for (const id of dead) delete next[id];
-          return { rustPtySessions: next };
-        });
+      // Mark sessions that are neither alive in the manager nor currently framed
+      // (a just-launched frame may briefly precede pty_list visibility) as exited.
+      const markExited = useStore.getState().markRustPtyExited;
+      for (const id of ids) {
+        if (!live.has(id) && !framed.has(id) && meta[id].status === "running") {
+          markExited(id);
+        }
       }
     };
 

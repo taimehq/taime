@@ -71,39 +71,68 @@ function DetachedAgentsSection() {
   return (
     <Section title={`Detached agents (${detached.length})`}>
       <p className="-mt-1 mb-1 text-[10px] text-zinc-600">
-        Running, frame closed. Reopen reattaches; kill terminates.
+        Frame closed, process kept alive. Reopen reattaches; kill terminates.
       </p>
       <div className="flex flex-col gap-1">
-        {detached.map((m) => (
-          <div
-            key={m.ptySessionId}
-            className="flex items-center gap-2 rounded-lg border border-violet-500/30 bg-violet-500/5 px-2.5 py-1.5"
-          >
-            <span className="flex min-w-0 flex-1 flex-col">
-              <span className="truncate text-[12px] text-zinc-200">Claude Code</span>
-              {m.branch && (
-                <span className="flex items-center gap-1 truncate font-mono text-[9px] text-sky-300/80">
-                  <GitBranch size={9} />
-                  {m.branch}
+        {detached.map((m) => {
+          const exited = m.status === "exited";
+          return (
+            <div
+              key={m.ptySessionId}
+              className={`flex items-center gap-2 rounded-lg border px-2.5 py-1.5 ${
+                exited
+                  ? "border-ink-600 bg-ink-800/40"
+                  : "border-violet-500/30 bg-violet-500/5"
+              }`}
+            >
+              <span className="flex min-w-0 flex-1 flex-col">
+                <span className="flex items-center gap-1.5 truncate text-[12px] text-zinc-200">
+                  Claude Code
+                  <span
+                    className={`rounded px-1 text-[8px] font-semibold uppercase tracking-wide ${
+                      exited
+                        ? "bg-zinc-600/40 text-zinc-400"
+                        : "bg-emerald-500/20 text-emerald-300"
+                    }`}
+                  >
+                    {exited ? "exited" : "running"}
+                  </span>
                 </span>
+                {m.branch && (
+                  <span className="flex items-center gap-1 truncate font-mono text-[9px] text-sky-300/80">
+                    <GitBranch size={9} />
+                    {m.branch}
+                  </span>
+                )}
+              </span>
+              {exited ? (
+                <button
+                  onClick={() => forgetRustPty(m.ptySessionId)}
+                  className="shrink-0 rounded border border-ink-500 px-2 py-0.5 text-[11px] text-zinc-400 hover:bg-ink-600"
+                >
+                  Dismiss
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() => reopenRustPty(m.ptySessionId)}
+                    className="shrink-0 rounded border border-ink-500 px-2 py-0.5 text-[11px] text-zinc-200 hover:bg-ink-600"
+                  >
+                    Reopen
+                  </button>
+                  <button
+                    onClick={() => forgetRustPty(m.ptySessionId)}
+                    aria-label="Kill agent"
+                    className="shrink-0 rounded p-0.5 text-rose-400/80 hover:text-rose-300"
+                    title="Kill agent (terminate process)"
+                  >
+                    <Power size={13} />
+                  </button>
+                </>
               )}
-            </span>
-            <button
-              onClick={() => reopenRustPty(m.ptySessionId)}
-              className="shrink-0 rounded border border-ink-500 px-2 py-0.5 text-[11px] text-zinc-200 hover:bg-ink-600"
-            >
-              Reopen
-            </button>
-            <button
-              onClick={() => forgetRustPty(m.ptySessionId)}
-              aria-label="Kill agent"
-              className="shrink-0 rounded p-0.5 text-rose-400/80 hover:text-rose-300"
-              title="Kill agent (terminate process)"
-            >
-              <Power size={13} />
-            </button>
-          </div>
-        ))}
+            </div>
+          );
+        })}
       </div>
     </Section>
   );
