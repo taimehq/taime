@@ -31,6 +31,9 @@ tokio = { version = "1", features = ["time"] }
 notify = "6"
 notify-debouncer-full = "0.3"
 ignore = "0.4"
+# Rust-owned PTY for Claude (portable-pty path; CAO/tmux remains the fallback).
+portable-pty = "0.8"
+base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

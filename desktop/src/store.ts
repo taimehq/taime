@@ -13,6 +13,10 @@ import {
   addRecent,
 } from "./lib/recentProjects";
 import { makeSessionName } from "./lib/sessionName";
+import { ptySpawnClaude, ptyKill } from "./pty";
+
+/** Which transport carries a frame's terminal I/O. */
+export type TerminalTransport = "cao_ws" | "rust_pty";
 
 /** Re-render guard: only update when data actually changed. */
 function jsonEqual(a: unknown, b: unknown): boolean {
@@ -38,6 +42,10 @@ export interface Frame {
   sessionName: string | null;
   pending: boolean;
   error?: string;
+  /** Transport for this frame's terminal (default cao_ws). */
+  transport?: TerminalTransport;
+  /** Rust PTY session id (when transport === "rust_pty"). */
+  ptySessionId?: string;
 }
 
 /** Dirty-state surfaced by the Rust file watcher (step 4). */
@@ -113,6 +121,10 @@ interface Store {
     agentProfile?: string | null;
     sessionName?: string | null;
   }) => void;
+  /** Dev: launch Claude on the Rust-owned PTY transport (CAO path untouched). */
+  launchClaudeRustPty: () => Promise<void>;
+  /** Explicitly terminate a Rust-PTY agent (distinct from closing its frame). */
+  killRustPty: (key: string) => Promise<void>;
   closeFrame: (key: string) => Promise<void>;
   setActiveFrame: (key: string | null) => void;
   /** Switch active frame, raising the dirty-state guard if needed. */
@@ -334,6 +346,47 @@ export const useStore = create<Store>((set, get) => ({
       ],
       activeFrameKey: key,
     }));
+  },
+
+  launchClaudeRustPty: async () => {
+    const dir = get().workspaceDir;
+    try {
+      const sessionId = await ptySpawnClaude(dir, 24, 80);
+      const key = nextKey();
+      set((s) => ({
+        frames: [
+          ...s.frames,
+          {
+            key,
+            terminalId: null,
+            provider: "claude_code",
+            agentProfile: null,
+            sessionName: null,
+            pending: false,
+            transport: "rust_pty",
+            ptySessionId: sessionId,
+          },
+        ],
+        activeFrameKey: key,
+      }));
+      get().showSnackbar({ type: "success", message: "Claude launched (Rust PTY)" });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      get().showSnackbar({ type: "error", message: `Rust PTY launch failed: ${msg}` });
+    }
+  },
+
+  killRustPty: async (key) => {
+    const frame = get().frames.find((f) => f.key === key);
+    if (frame?.ptySessionId) await ptyKill(frame.ptySessionId);
+    set((s) => {
+      const frames = s.frames.filter((f) => f.key !== key);
+      return {
+        frames,
+        activeFrameKey:
+          s.activeFrameKey === key ? (frames[frames.length - 1]?.key ?? null) : s.activeFrameKey,
+      };
+    });
   },
 
   closeFrame: async (key) => {

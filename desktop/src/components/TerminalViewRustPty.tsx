@@ -3,12 +3,18 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
-import { terminalWsUrl } from "../api";
+import {
+  ptyWrite,
+  ptyResize,
+  ptyReattachView,
+  ptyCloseView,
+  onPtyData,
+  onPtyExit,
+} from "../pty";
 import { wireClipboard } from "../lib/terminalClipboard";
 
-interface TerminalViewProps {
-  terminalId: string;
-  /** Notifies parent of connection lifecycle for status display. */
+interface Props {
+  sessionId: string;
   onConnectionChange?: (state: "open" | "closed") => void;
 }
 
@@ -30,14 +36,16 @@ const THEME = {
 };
 
 /**
- * A live, low-latency view into one CLI process. Server→client frames are raw
- * PTY bytes (binary); client→server is JSON {type:input|resize}. This exactly
- * matches the CAO terminal_ws contract — do not change the framing.
+ * Terminal view for the Rust-owned PTY transport (Claude path). Same xterm UX
+ * as the CAO `TerminalView`; only the transport differs — Tauri events in,
+ * `pty_write`/`pty_resize` out.
+ *
+ * Mount protocol (no gap, no duplicate): subscribe FIRST while the session is
+ * detached, THEN reattach — which atomically attaches + returns the scrollback
+ * to replay; live output flows after. Unmount = `close_view` (the agent keeps
+ * running); explicit kill is separate.
  */
-export function TerminalView({
-  terminalId,
-  onConnectionChange,
-}: TerminalViewProps) {
+export function TerminalViewRustPty({ sessionId, onConnectionChange }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -45,7 +53,8 @@ export function TerminalView({
     if (!el) return;
 
     let alive = true;
-    let ws: WebSocket | null = null;
+    let unlistenData: (() => void) | undefined;
+    let unlistenExit: (() => void) | undefined;
     let resizeObserver: ResizeObserver | null = null;
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     let rafId = 0;
@@ -59,33 +68,22 @@ export function TerminalView({
       allowProposedApi: true,
       theme: THEME,
     });
-
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
     term.open(el);
-
-    // GPU rendering for 60fps under heavy output; gracefully fall back.
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => webgl.dispose());
       term.loadAddon(webgl);
     } catch {
-      /* canvas/dom renderer fallback — still correct, just slower */
+      /* canvas/dom fallback */
     }
 
     const safeFit = () => {
       try {
         fitAddon.fit();
       } catch {
-        /* element not measurable yet */
-      }
-    };
-
-    const sendResize = () => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }),
-        );
+        /* not measurable yet */
       }
     };
 
@@ -93,55 +91,38 @@ export function TerminalView({
     const cleanupClipboard = wireClipboard(term, el);
 
     term.onData((data) => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "input", data }));
-      }
+      ptyWrite(sessionId, data);
     });
 
     resizeObserver = new ResizeObserver(() => {
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
         safeFit();
-        sendResize();
+        ptyResize(sessionId, term.rows, term.cols);
       }, 50);
     });
     resizeObserver.observe(el);
     rafId = requestAnimationFrame(safeFit);
     term.focus();
 
-    // Connect (URL comes from the Tauri-resolved config — async).
-    terminalWsUrl(terminalId)
-      .then((url) => {
-        if (!alive) return;
-        ws = new WebSocket(url);
-        ws.binaryType = "arraybuffer";
-        ws.onopen = () => {
-          safeFit();
-          sendResize();
-          onConnectionChange?.("open");
-        };
-        ws.onmessage = (e) => {
-          if (e.data instanceof ArrayBuffer) {
-            term.write(new Uint8Array(e.data));
-          }
-        };
-        ws.onclose = () => {
-          if (alive) {
-            term.write("\r\n\x1b[33m[connection closed]\x1b[0m\r\n");
-            onConnectionChange?.("closed");
-          }
-        };
-        ws.onerror = () => {
-          if (alive) {
-            term.write("\r\n\x1b[31m[connection error]\x1b[0m\r\n");
-          }
-        };
-      })
-      .catch(() => {
-        if (alive) {
-          term.write("\r\n\x1b[31m[could not resolve backend URL]\x1b[0m\r\n");
-        }
+    (async () => {
+      // Subscribe first (session is detached → no events yet, so no dup).
+      unlistenData = await onPtyData(sessionId, (bytes) => {
+        if (alive) term.write(bytes);
       });
+      unlistenExit = await onPtyExit(sessionId, () => {
+        if (alive) term.write("\r\n\x1b[33m[process exited]\x1b[0m\r\n");
+        onConnectionChange?.("closed");
+      });
+      // Reattach: atomically attaches + returns scrollback to replay.
+      const replay = await ptyReattachView(sessionId);
+      if (!alive) return;
+      if (replay.length) term.write(replay);
+      onConnectionChange?.("open");
+      // Nudge a redraw so a reattached TUI repaints cleanly at the current size.
+      safeFit();
+      ptyResize(sessionId, term.rows, term.cols);
+    })();
 
     return () => {
       alive = false;
@@ -149,10 +130,13 @@ export function TerminalView({
       clearTimeout(resizeTimer);
       resizeObserver?.disconnect();
       cleanupClipboard();
-      ws?.close();
+      unlistenData?.();
+      unlistenExit?.();
+      // Closing the view detaches — it does NOT kill the agent.
+      ptyCloseView(sessionId);
       term.dispose();
     };
-  }, [terminalId, onConnectionChange]);
+  }, [sessionId, onConnectionChange]);
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-ink-900">

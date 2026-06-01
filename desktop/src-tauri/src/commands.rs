@@ -1,10 +1,12 @@
 //! Tauri IPC commands — the Rust↔React bridge.
 
+use base64::Engine;
 use tauri::{AppHandle, State};
 
 use crate::backend::BackendState;
 use crate::config::ResolvedConfig;
 use crate::fs_watch::FsWatchState;
+use crate::pty::{PtyManager, SessionInfo};
 use crate::AppStateHandle;
 
 /// Frontend calls this on boot to discover where the backend lives.
@@ -51,4 +53,80 @@ pub fn unwatch_terminal(fs: State<'_, FsWatchState>, terminal_id: String) {
 #[tauri::command]
 pub fn clear_dirty(fs: State<'_, FsWatchState>, terminal_id: String) {
     fs.clear_dirty(terminal_id);
+}
+
+// ---------------------------------------------------------------------------
+// Rust-owned PTY (Claude path). Output streams as `pty://{id}/data` (base64)
+// and `pty://{id}/exit`. CAO/tmux remains the default + fallback for now.
+// ---------------------------------------------------------------------------
+
+/// Resolve the claude binary: prefer the known install, else rely on PATH.
+fn claude_binary() -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let p = std::path::Path::new(&home).join(".local/bin/claude");
+        if p.exists() {
+            return p.to_string_lossy().to_string();
+        }
+    }
+    "claude".to_string()
+}
+
+#[tauri::command]
+pub fn pty_spawn_claude(
+    pty: State<'_, PtyManager>,
+    cwd: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+) -> Result<String, String> {
+    pty.spawn(
+        &claude_binary(),
+        &[],
+        cwd.as_deref(),
+        &[],
+        rows.unwrap_or(24),
+        cols.unwrap_or(80),
+    )
+}
+
+#[tauri::command]
+pub fn pty_write(
+    pty: State<'_, PtyManager>,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
+    pty.write_input(&session_id, data.as_bytes())
+}
+
+#[tauri::command]
+pub fn pty_resize(
+    pty: State<'_, PtyManager>,
+    session_id: String,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    pty.resize(&session_id, rows, cols)
+}
+
+/// Detach the view (does NOT kill the process).
+#[tauri::command]
+pub fn pty_close_view(pty: State<'_, PtyManager>, session_id: String) {
+    pty.close_view(&session_id);
+}
+
+/// Reattach a view; returns base64 scrollback to replay into a fresh terminal.
+#[tauri::command]
+pub fn pty_reattach_view(pty: State<'_, PtyManager>, session_id: String) -> Result<String, String> {
+    let bytes = pty.reattach_view(&session_id)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// Explicitly terminate the process.
+#[tauri::command]
+pub fn pty_kill(pty: State<'_, PtyManager>, session_id: String) {
+    pty.kill_session(&session_id);
+}
+
+#[tauri::command]
+pub fn pty_list(pty: State<'_, PtyManager>) -> Vec<SessionInfo> {
+    pty.list_sessions()
 }

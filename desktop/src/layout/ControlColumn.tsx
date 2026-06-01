@@ -14,20 +14,33 @@ export function ControlColumn({
 }) {
   const sessions = useStore((s) => s.sessions);
   const connected = useStore((s) => s.connected);
+  const launchClaudeRustPty = useStore((s) => s.launchClaudeRustPty);
 
   return (
     <aside className="flex w-80 shrink-0 flex-col border-r border-ink-600 bg-ink-800/40">
       <div className="flex flex-col gap-5 overflow-y-auto p-4">
         <WorkspacePicker />
 
-        <button
-          onClick={onLaunch}
-          disabled={!connected}
-          className="no-drag flex items-center justify-center gap-2 rounded-lg bg-teal px-3 py-2 text-sm font-medium text-ink-900 transition-colors hover:bg-teal-400 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          <Plus size={16} />
-          Launch agent
-        </button>
+        <div className="flex flex-col gap-2">
+          <button
+            onClick={onLaunch}
+            disabled={!connected}
+            className="no-drag flex items-center justify-center gap-2 rounded-lg bg-teal px-3 py-2 text-sm font-medium text-ink-900 transition-colors hover:bg-teal-400 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Plus size={16} />
+            Launch agent
+          </button>
+          {import.meta.env.DEV && (
+            // Temporary spike entry: Claude via the Rust-owned PTY transport.
+            // CAO/tmux remains the default for all providers.
+            <button
+              onClick={() => launchClaudeRustPty()}
+              className="no-drag flex items-center justify-center gap-2 rounded-lg border border-violet-500/40 px-3 py-1.5 text-xs text-violet-300 hover:bg-violet-500/10"
+            >
+              Claude · Rust PTY (dev)
+            </button>
+          )}
+        </div>
 
         <PipelineSection sessions={sessions} />
 

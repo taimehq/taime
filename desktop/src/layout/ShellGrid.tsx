@@ -1,8 +1,9 @@
 import { useStore, type Frame } from "../store";
 import { TerminalView } from "../components/TerminalView";
+import { TerminalViewRustPty } from "../components/TerminalViewRustPty";
 import { StatusBadge } from "../components/StatusBadge";
 import { useFsWatch } from "../hooks/useFsWatch";
-import { Loader2, X, TerminalSquare } from "lucide-react";
+import { Loader2, X, TerminalSquare, Power } from "lucide-react";
 
 const TARGET_NAME: Record<string, string> = {
   claude_code: "Claude Code",
@@ -50,6 +51,7 @@ function FrameCell({ frame }: { frame: Frame }) {
   const activeFrameKey = useStore((s) => s.activeFrameKey);
   const setActiveFrameGuarded = useStore((s) => s.setActiveFrameGuarded);
   const closeFrame = useStore((s) => s.closeFrame);
+  const killRustPty = useStore((s) => s.killRustPty);
   const status = useStore((s) =>
     frame.terminalId ? s.terminalStatuses[frame.terminalId] : undefined,
   );
@@ -57,7 +59,9 @@ function FrameCell({ frame }: { frame: Frame }) {
     frame.terminalId ? s.dirty[frame.terminalId] : undefined,
   );
 
-  // Watch this terminal's working dir while the frame is mounted.
+  const isRustPty = frame.transport === "rust_pty" && !!frame.ptySessionId;
+
+  // Watch this terminal's working dir while the frame is mounted (CAO path).
   useFsWatch(frame.terminalId);
 
   const active = activeFrameKey === frame.key;
@@ -81,6 +85,14 @@ function FrameCell({ frame }: { frame: Frame }) {
               {frame.terminalId.slice(0, 8)}
             </span>
           )}
+          {isRustPty && (
+            <span
+              className="shrink-0 rounded bg-violet-500/20 px-1.5 text-[9px] font-semibold uppercase tracking-wide text-violet-300"
+              title="Rust-owned PTY transport (dev)"
+            >
+              Rust PTY
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2.5">
           {dirty && dirty.count > 0 && (
@@ -92,11 +104,25 @@ function FrameCell({ frame }: { frame: Frame }) {
             </span>
           )}
           <StatusBadge status={frame.pending ? "PENDING" : status} />
+          {isRustPty && (
+            <button
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={() => killRustPty(frame.key)}
+              className="rounded p-0.5 text-rose-400/80 hover:text-rose-300"
+              title="Kill agent (terminate process)"
+            >
+              <Power size={13} />
+            </button>
+          )}
           <button
             onMouseDown={(e) => e.stopPropagation()}
             onClick={() => closeFrame(frame.key)}
             className="rounded p-0.5 text-zinc-500 hover:text-zinc-200"
-            title="Close frame (agent keeps running)"
+            title={
+              isRustPty
+                ? "Close view (agent keeps running)"
+                : "Close frame (agent keeps running)"
+            }
           >
             <X size={14} />
           </button>
@@ -104,7 +130,9 @@ function FrameCell({ frame }: { frame: Frame }) {
       </header>
 
       <div className="min-h-0 flex-1">
-        {frame.pending || !frame.terminalId ? (
+        {isRustPty ? (
+          <TerminalViewRustPty sessionId={frame.ptySessionId!} />
+        ) : frame.pending || !frame.terminalId ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-zinc-500">
             <Loader2 size={20} className="animate-spin text-teal-400" />
             <span className="text-xs">Starting {title}…</span>
