@@ -58,6 +58,11 @@ export function TerminalView({
         "ui-monospace, 'JetBrains Mono', SFMono-Regular, Menlo, Monaco, monospace",
       scrollback: 10000,
       allowProposedApi: true,
+      // Let the user drag-select text even when the app (tmux/TUI) has mouse
+      // tracking on — Option-drag (macOS) or Shift-drag forces local selection,
+      // so copy works in the CAO/tmux terminal too. Right-click selects a word.
+      macOptionClickForcesSelection: true,
+      rightClickSelectsWord: true,
       theme: THEME,
     });
 

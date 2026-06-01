@@ -26,6 +26,29 @@ export function useTerminalFileDrop() {
       return (f.transport === "rust_pty" ? f.ptySessionId : f.terminalId) ?? null;
     };
 
+    // Find the frame under a drop point. Tauri's position is physical pixels and
+    // can be ambiguous vs CSS pixels across displays, so test each frame's rect
+    // with BOTH the raw and DPR-scaled point — whichever lands inside wins.
+    const termKeyAtPoint = (px: number, py: number): string | null => {
+      const dpr = window.devicePixelRatio || 1;
+      const points: [number, number][] = [
+        [px, py],
+        [px / dpr, py / dpr],
+      ];
+      const els = Array.from(
+        document.querySelectorAll<HTMLElement>("[data-term-key]"),
+      );
+      for (const [x, y] of points) {
+        for (const el of els) {
+          const r = el.getBoundingClientRect();
+          if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+            return el.dataset.termKey ?? null;
+          }
+        }
+      }
+      return null;
+    };
+
     (async () => {
       try {
         const { getCurrentWebview } = await import("@tauri-apps/api/webview");
@@ -35,13 +58,9 @@ export function useTerminalFileDrop() {
           const text = formatDroppedPaths(paths);
           if (!text) return;
 
-          // Find the terminal under the drop point (position is physical px).
-          const dpr = window.devicePixelRatio || 1;
-          const x = event.payload.position.x / dpr;
-          const y = event.payload.position.y / dpr;
-          const el = document.elementFromPoint(x, y) as HTMLElement | null;
-          const frameEl = el?.closest("[data-term-key]") as HTMLElement | null;
-          const key = frameEl?.dataset.termKey ?? termKeyForActiveFrame();
+          // Route to the frame under the cursor; fall back to the active frame.
+          const pos = event.payload.position;
+          const key = termKeyAtPoint(pos.x, pos.y) ?? termKeyForActiveFrame();
 
           sendToTerminal(key, text);
         });

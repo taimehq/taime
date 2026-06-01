@@ -67,6 +67,8 @@ export function TerminalViewRustPty({ sessionId, onConnectionChange }: Props) {
         "ui-monospace, 'JetBrains Mono', SFMono-Regular, Menlo, Monaco, monospace",
       scrollback: 10000,
       allowProposedApi: true,
+      macOptionClickForcesSelection: true,
+      rightClickSelectsWord: true,
       theme: THEME,
     });
     const fitAddon = new FitAddon();

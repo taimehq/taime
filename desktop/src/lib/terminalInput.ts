@@ -30,14 +30,20 @@ export function sendToTerminal(key: string | null | undefined, text: string): bo
   return true;
 }
 
-/** POSIX single-quote escaping so paths with spaces/quotes paste safely. */
-export function shellQuotePath(p: string): string {
-  return `'${p.replace(/'/g, `'\\''`)}'`;
+/**
+ * Backslash-escape a path the way terminals do on file drag (escape whitespace
+ * + shell metacharacters, leave the path otherwise bare). This matters: Claude
+ * Code recognizes a *bare, escaped* image path and renders it as `[Image #N]`;
+ * a single-quoted path is treated as literal text ("just the link"). Bare +
+ * escaped also pastes correctly into a normal shell.
+ */
+export function escapeTerminalPath(p: string): string {
+  return p.replace(/(["'\\$`!&|;<>*?(){}\[\]\s#])/g, "\\$1");
 }
 
-/** Format dropped file paths for insertion: quoted, space-separated, trailing space. */
+/** Format dropped file paths for insertion: escaped, space-separated, trailing space. */
 export function formatDroppedPaths(paths: string[]): string {
   const cleaned = paths.filter((p) => p && p.trim());
   if (cleaned.length === 0) return "";
-  return cleaned.map(shellQuotePath).join(" ") + " ";
+  return cleaned.map(escapeTerminalPath).join(" ") + " ";
 }
