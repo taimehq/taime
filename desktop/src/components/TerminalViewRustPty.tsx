@@ -13,6 +13,7 @@ import {
 } from "../pty";
 import { wireClipboard } from "../lib/terminalClipboard";
 import { registerTerminalInput } from "../lib/terminalInput";
+import { useStore } from "../store";
 
 interface Props {
   sessionId: string;
@@ -120,6 +121,8 @@ export function TerminalViewRustPty({ sessionId, onConnectionChange }: Props) {
       });
       unlistenExit = await onPtyExit(sessionId, () => {
         if (alive) term.write("\r\n\x1b[33m[process exited]\x1b[0m\r\n");
+        // Reflect lifecycle: the agent's process is gone (running → exited).
+        useStore.getState().markRustPtyExited(sessionId);
         onConnectionChange?.("closed");
       });
       // Reattach: atomically attaches + returns scrollback to replay.

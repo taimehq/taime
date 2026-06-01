@@ -53,6 +53,8 @@ export interface Frame {
  * frame: closing a frame detaches the view (close_view ≠ kill), and this record
  * is what lets the UI list + reopen a still-running detached agent.
  */
+export type RustPtyStatus = "running" | "exited";
+
 export interface RustPtyMeta {
   ptySessionId: string;
   /** Provisioned worktree terminal id — the attribution key (dirty/diff/graph). */
@@ -61,6 +63,8 @@ export interface RustPtyMeta {
   branch: string | null;
   cwd: string | null;
   startedAt: number;
+  /** Lifecycle: "running" (reattachable) or "exited" (process gone; dismiss only). */
+  status: RustPtyStatus;
 }
 
 /** Dirty-state surfaced by the Rust file watcher (step 4). */
@@ -143,9 +147,11 @@ interface Store {
   launchClaudeRustPty: () => Promise<void>;
   /** Reopen a detached (still-running) Rust-PTY agent in a new frame. */
   reopenRustPty: (ptySessionId: string) => void;
+  /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
+  markRustPtyExited: (ptySessionId: string) => void;
   /** Explicitly terminate a Rust-PTY agent (distinct from closing its frame). */
   killRustPty: (key: string) => Promise<void>;
-  /** Drop a detached Rust-PTY session from the registry after it exits. */
+  /** Drop a Rust-PTY session from the registry (kill if alive). */
   forgetRustPty: (ptySessionId: string) => Promise<void>;
   closeFrame: (key: string) => Promise<void>;
   setActiveFrame: (key: string | null) => void;
@@ -417,6 +423,7 @@ export const useStore = create<Store>((set, get) => ({
                 branch,
                 cwd,
                 startedAt: Date.now(),
+                status: "running",
               },
             }
           : s.rustPtySessions,
@@ -428,9 +435,21 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
+  markRustPtyExited: (ptySessionId) =>
+    set((s) => {
+      const m = s.rustPtySessions[ptySessionId];
+      if (!m || m.status === "exited") return s;
+      return {
+        rustPtySessions: {
+          ...s.rustPtySessions,
+          [ptySessionId]: { ...m, status: "exited" },
+        },
+      };
+    }),
+
   reopenRustPty: (ptySessionId) => {
     const meta = get().rustPtySessions[ptySessionId];
-    if (!meta) return;
+    if (!meta || meta.status === "exited") return;
     const existing = get().frames.find((f) => f.ptySessionId === ptySessionId);
     if (existing) {
       set({ activeFrameKey: existing.key });
