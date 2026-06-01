@@ -1,7 +1,7 @@
 import type { Terminal } from "@xterm/xterm";
 import { invoke } from "@tauri-apps/api/core";
 import { inTauri } from "../backend";
-import { shellQuotePath } from "./terminalInput";
+import { escapeTerminalPath } from "./terminalInput";
 
 /** Persist a pasted image to a temp file (native only) and return its path. */
 async function savePastedImage(file: File): Promise<string | null> {
@@ -52,7 +52,7 @@ export function wireClipboard(term: Terminal, el: HTMLElement): () => void {
       if (file) {
         e.preventDefault();
         savePastedImage(file).then((p) => {
-          if (p) term.paste(shellQuotePath(p) + " ");
+          if (p) term.paste(escapeTerminalPath(p) + " ");
         });
         return;
       }
