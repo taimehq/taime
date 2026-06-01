@@ -16,6 +16,8 @@ import {
   type FileDiffEntry,
   type HunkedFileEntry,
   type WorktreeInfo,
+  type AttributionResponse,
+  type FileContributor,
 } from "../api";
 import { useStore } from "../store";
 
@@ -25,6 +27,22 @@ const PROVIDER_NAME: Record<string, string> = {
   gemini_cli: "Gemini CLI",
   grok_cli: "Grok Build CLI",
 };
+
+/** Stable color per team member, so authorship reads at a glance in the diff. */
+const AUTHOR_COLORS = [
+  { dot: "bg-sky-400", text: "text-sky-300", chip: "bg-sky-500/15 text-sky-300" },
+  { dot: "bg-violet-400", text: "text-violet-300", chip: "bg-violet-500/15 text-violet-300" },
+  { dot: "bg-emerald-400", text: "text-emerald-300", chip: "bg-emerald-500/15 text-emerald-300" },
+  { dot: "bg-amber-400", text: "text-amber-300", chip: "bg-amber-500/15 text-amber-300" },
+  { dot: "bg-rose-400", text: "text-rose-300", chip: "bg-rose-500/15 text-rose-300" },
+  { dot: "bg-cyan-400", text: "text-cyan-300", chip: "bg-cyan-500/15 text-cyan-300" },
+];
+const UNATTRIBUTED = "unattributed";
+
+function authorName(c: FileContributor | null | undefined): string {
+  if (!c) return "unattributed";
+  return PROVIDER_NAME[c.provider ?? ""] ?? c.provider ?? c.terminal_id.slice(0, 6);
+}
 
 function langForPath(path: string): string {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -64,6 +82,7 @@ export function DiffView() {
   const [files, setFiles] = useState<FileDiffEntry[]>([]);
   const [hunks, setHunks] = useState<HunkedFileEntry[]>([]);
   const [worktree, setWorktree] = useState<WorktreeInfo | null>(null);
+  const [attribution, setAttribution] = useState<AttributionResponse | null>(null);
   const [contended, setContended] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const [sel, setSel] = useState<Record<string, number[]>>({});
@@ -79,14 +98,16 @@ export function DiffView() {
     setLoading(true);
     setError(null);
     try {
-      const [fd, hk, wt] = await Promise.all([
+      const [fd, hk, wt, attr] = await Promise.all([
         api.getFileDiffs(terminalId).catch(() => ({ terminal_id: terminalId, files: [] })),
         api.getHunks(terminalId).catch(() => ({ terminal_id: terminalId, base: null, files: [] })),
         api.getWorktree(terminalId).catch(() => null),
+        api.getAttribution(terminalId).catch(() => ({ team: [], files: {} })),
       ]);
       setFiles(fd.files);
       setHunks(hk.files);
       setWorktree(wt);
+      setAttribution(attr);
       setSelected((prev) => prev ?? fd.files[0]?.path ?? null);
       if (wt?.mode === "shared" || wt?.mode === "worktree") {
         const sess = frame?.sessionName;
@@ -120,7 +141,28 @@ export function DiffView() {
     [files, selected],
   );
 
+  // Team ordering (owner first, then members) → stable author colors.
+  const teamOrder = useMemo(() => {
+    const team = attribution?.team ?? [];
+    return [...team.filter((t) => !t.member_of), ...team.filter((t) => t.member_of)].map(
+      (t) => t.terminal_id,
+    );
+  }, [attribution]);
+  const colorIndexById = useMemo(() => {
+    const m: Record<string, number> = {};
+    teamOrder.forEach((id, i) => (m[id] = i % AUTHOR_COLORS.length));
+    return m;
+  }, [teamOrder]);
+
   if (!terminalId) return null;
+
+  const isTeam = (attribution?.team.length ?? 0) > 1;
+  const lastAuthor = (path: string): FileContributor | null =>
+    attribution?.files[path]?.last ?? null;
+  const contribCount = (path: string): number =>
+    attribution?.files[path]?.contributors.length ?? 0;
+  const colorFor = (tid: string | null | undefined) =>
+    tid && colorIndexById[tid] != null ? AUTHOR_COLORS[colorIndexById[tid]] : null;
 
   const agentName =
     (frame && (PROVIDER_NAME[frame.provider] ?? frame.provider)) ??
@@ -160,6 +202,91 @@ export function DiffView() {
 
   const selectionCount = Object.values(sel).reduce((n, a) => n + a.length, 0);
   const buildSelections = (): Record<string, number[]> => sel;
+
+  // Group the changed files by their last author so the reviewer sees, at a
+  // glance, "these files were last changed by member X".
+  const fileGroups = (() => {
+    const byKey = new Map<string, FileDiffEntry[]>();
+    for (const f of files) {
+      const key = lastAuthor(f.path)?.terminal_id ?? UNATTRIBUTED;
+      const list = byKey.get(key);
+      if (list) list.push(f);
+      else byKey.set(key, [f]);
+    }
+    const order = [
+      ...teamOrder.filter((k) => byKey.has(k)),
+      ...[...byKey.keys()].filter((k) => !teamOrder.includes(k) && k !== UNATTRIBUTED),
+      ...(byKey.has(UNATTRIBUTED) ? [UNATTRIBUTED] : []),
+    ];
+    return order.map((key) => ({ key, files: byKey.get(key) ?? [] }));
+  })();
+
+  const selectGroup = (groupFiles: FileDiffEntry[], on: boolean) =>
+    setSel((s) => {
+      const next = { ...s };
+      for (const f of groupFiles) {
+        const idx = allIdx(f.path);
+        if (on && idx.length) next[f.path] = idx;
+        else delete next[f.path];
+      }
+      return next;
+    });
+
+  const renderFileRow = (f: FileDiffEntry) => {
+    const a = lastAuthor(f.path);
+    const shared = contribCount(f.path) > 1;
+    return (
+      <li key={f.path}>
+        <div
+          className={`flex items-center gap-2 px-2 py-1.5 text-[12px] ${
+            selected === f.path ? "bg-ink-600" : "hover:bg-ink-700"
+          }`}
+        >
+          <input
+            type="checkbox"
+            checked={isFileFull(f.path)}
+            ref={(el) => {
+              if (el)
+                el.indeterminate = (sel[f.path]?.length ?? 0) > 0 && !isFileFull(f.path);
+            }}
+            onChange={() => toggleFile(f.path)}
+            className="accent-sky-500"
+          />
+          <button
+            onClick={() => setSelected(f.path)}
+            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          >
+            <StatusIcon status={f.status} />
+            <span
+              className={`flex-1 truncate font-mono ${
+                selected === f.path ? "text-zinc-100" : "text-zinc-400"
+              }`}
+            >
+              {f.path}
+            </span>
+            {isTeam && a && (
+              <span className="shrink-0 text-[9px] text-zinc-500">turn {a.turn_index + 1}</span>
+            )}
+            {shared && (
+              <span
+                className="shrink-0 text-[9px] font-semibold text-amber"
+                title="changed by more than one teammate"
+              >
+                shared
+              </span>
+            )}
+            {contended.has(f.path) && (
+              <span className="shrink-0 text-[10px] font-semibold text-rose-400">contended</span>
+            )}
+            <span className="shrink-0 font-mono text-[10px]">
+              <span className="text-emerald-400">+{f.additions}</span>
+              <span className="text-rose-400"> -{f.deletions}</span>
+            </span>
+          </button>
+        </div>
+      </li>
+    );
+  };
 
   const apply = async (mode: "merge" | "revert") => {
     if (selectionCount === 0) return;
@@ -217,6 +344,14 @@ export function DiffView() {
           {worktree?.mode === "shared" && (
             <span className="shrink-0 rounded-md border border-ink-600 px-2 py-0.5 text-[11px] text-zinc-500">
               shared dir (heuristic)
+            </span>
+          )}
+          {isTeam && (
+            <span
+              className="shrink-0 rounded-md border border-violet-500/40 bg-violet-500/10 px-2 py-0.5 text-[11px] text-violet-300"
+              title="A delegation team shares this worktree; files are grouped by author below."
+            >
+              team · {attribution?.team.length} agents
             </span>
           )}
           <span className="shrink-0 text-zinc-500">{files.length} files</span>
@@ -285,51 +420,36 @@ export function DiffView() {
           {!loading && files.length === 0 && (
             <p className="p-3 text-xs text-zinc-500">No changes to review.</p>
           )}
-          <ul>
-            {files.map((f) => (
-              <li key={f.path}>
-                <div
-                  className={`flex items-center gap-2 px-2 py-1.5 text-[12px] ${
-                    selected === f.path ? "bg-ink-600" : "hover:bg-ink-700"
-                  }`}
-                >
-                  <input
-                    type="checkbox"
-                    checked={isFileFull(f.path)}
-                    ref={(el) => {
-                      if (el)
-                        el.indeterminate =
-                          (sel[f.path]?.length ?? 0) > 0 && !isFileFull(f.path);
-                    }}
-                    onChange={() => toggleFile(f.path)}
-                    className="accent-sky-500"
-                  />
-                  <button
-                    onClick={() => setSelected(f.path)}
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                  >
-                    <StatusIcon status={f.status} />
-                    <span
-                      className={`flex-1 truncate font-mono ${
-                        selected === f.path ? "text-zinc-100" : "text-zinc-400"
-                      }`}
+          {isTeam ? (
+            // Team worktree: group files by who last changed them, so authorship
+            // is obvious and you can merge one teammate's work in one click.
+            fileGroups.map((g) => {
+              const a0 = g.files[0] ? lastAuthor(g.files[0].path) : null;
+              const col = g.key === UNATTRIBUTED ? null : colorFor(g.key);
+              const name = g.key === UNATTRIBUTED ? "Unattributed" : authorName(a0);
+              const groupSelected = g.files.every((f) => isFileFull(f.path));
+              return (
+                <div key={g.key} className="border-b border-ink-700/50">
+                  <div className="flex items-center gap-1.5 bg-ink-800/80 px-2 py-1">
+                    <span className={`h-2 w-2 rounded-full ${col?.dot ?? "bg-zinc-600"}`} />
+                    <span className={`text-[11px] font-semibold ${col?.text ?? "text-zinc-400"}`}>
+                      {name}
+                    </span>
+                    <span className="text-[10px] text-zinc-600">{g.files.length}</span>
+                    <button
+                      onClick={() => selectGroup(g.files, !groupSelected)}
+                      className="ml-auto text-[10px] text-zinc-500 hover:text-zinc-300"
                     >
-                      {f.path}
-                    </span>
-                    {contended.has(f.path) && (
-                      <span className="shrink-0 text-[10px] font-semibold text-rose-400">
-                        contended
-                      </span>
-                    )}
-                    <span className="shrink-0 font-mono text-[10px]">
-                      <span className="text-emerald-400">+{f.additions}</span>
-                      <span className="text-rose-400"> -{f.deletions}</span>
-                    </span>
-                  </button>
+                      {groupSelected ? "Deselect" : "Select all"}
+                    </button>
+                  </div>
+                  <ul>{g.files.map(renderFileRow)}</ul>
                 </div>
-              </li>
-            ))}
-          </ul>
+              );
+            })
+          ) : (
+            <ul>{files.map(renderFileRow)}</ul>
+          )}
         </aside>
 
         {/* Diff + hunk selection */}
@@ -362,8 +482,23 @@ export function DiffView() {
           {/* Per-hunk selection strip */}
           {current && currentHunks.length > 0 && (
             <div className="max-h-40 shrink-0 overflow-auto border-t border-ink-600 bg-ink-800/80 p-2">
-              <p className="mb-1 px-1 text-[10px] uppercase tracking-wide text-zinc-600">
-                Hunks — select to merge/revert
+              <p className="mb-1 flex items-center gap-1.5 px-1 text-[10px] uppercase tracking-wide text-zinc-600">
+                <span>Hunks — select to merge/revert</span>
+                {(() => {
+                  const a = current ? lastAuthor(current.path) : null;
+                  if (!isTeam || !a) return null;
+                  const col = colorFor(a.terminal_id);
+                  return (
+                    <span className={`rounded px-1.5 normal-case ${col?.chip ?? "text-zinc-400"}`}>
+                      {authorName(a)} · turn {a.turn_index + 1}
+                    </span>
+                  );
+                })()}
+                {current && contribCount(current.path) > 1 && (
+                  <span className="rounded bg-amber/15 px-1.5 normal-case text-amber">
+                    multiple authors — review per hunk
+                  </span>
+                )}
               </p>
               {currentHunks.map((h) => (
                 <label
