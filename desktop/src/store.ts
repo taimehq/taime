@@ -46,6 +46,8 @@ export interface Frame {
   transport?: TerminalTransport;
   /** Rust PTY session id (when transport === "rust_pty"). */
   ptySessionId?: string;
+  /** Model label parsed from the agent's startup banner (best-effort). */
+  model?: string;
 }
 
 /**
@@ -196,6 +198,8 @@ interface Store {
 
   // misc
   setTerminalStatus: (id: string, status: string | null) => void;
+  /** Record the model parsed from a frame's startup banner. */
+  setFrameModel: (key: string, model: string) => void;
   showSnackbar: (s: Snackbar) => void;
   hideSnackbar: () => void;
 }
@@ -750,6 +754,14 @@ export const useStore = create<Store>((set, get) => ({
       if (s.terminalStatuses[id] === normalized) return s;
       return {
         terminalStatuses: { ...s.terminalStatuses, [id]: normalized },
+      };
+    }),
+
+  setFrameModel: (key, model) =>
+    set((s) => {
+      if (s.frames.find((f) => f.key === key)?.model === model) return s;
+      return {
+        frames: s.frames.map((f) => (f.key === key ? { ...f, model } : f)),
       };
     }),
 

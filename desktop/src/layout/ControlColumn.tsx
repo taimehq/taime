@@ -321,8 +321,17 @@ function SessionRow({ name, label: labelOverride }: { name: string; label?: stri
                   isOpen ? "bg-ink-700/40" : ""
                 }`}
               >
-                <span className="truncate text-[11px] text-zinc-300">
-                  {t.provider.replace(/_/g, " ")}
+                <span className="flex min-w-0 flex-col">
+                  <span className="truncate text-[11px] text-zinc-200">
+                    {t.agent_profile && t.agent_profile !== "default"
+                      ? t.agent_profile.replace(/_/g, " ")
+                      : t.provider.replace(/_/g, " ")}
+                  </span>
+                  {t.agent_profile && t.agent_profile !== "default" && (
+                    <span className="truncate text-[10px] text-zinc-500">
+                      {t.provider.replace(/_/g, " ")}
+                    </span>
+                  )}
                 </span>
                 <StatusBadge status={statuses[t.id]} />
               </button>

@@ -6,9 +6,13 @@ import "@xterm/xterm/css/xterm.css";
 import { terminalWsUrl } from "../api";
 import { wireClipboard } from "../lib/terminalClipboard";
 import { registerTerminalInput } from "../lib/terminalInput";
+import { makeModelSniffer } from "../lib/parseModel";
+import { useStore } from "../store";
 
 interface TerminalViewProps {
   terminalId: string;
+  /** Frame id — used to attribute the parsed model back to this frame. */
+  frameKey: string;
   /** Notifies parent of connection lifecycle for status display. */
   onConnectionChange?: (state: "open" | "closed") => void;
 }
@@ -37,6 +41,7 @@ const THEME = {
  */
 export function TerminalView({
   terminalId,
+  frameKey,
   onConnectionChange,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -101,6 +106,11 @@ export function TerminalView({
     // Cross-platform copy/paste (shared across transports).
     const cleanupClipboard = wireClipboard(term, el);
 
+    // Sniff the running model from the agent's startup banner (best-effort).
+    const sniffModel = makeModelSniffer((m) =>
+      useStore.getState().setFrameModel(frameKey, m),
+    );
+
     // Register an input writer so dropped file/screenshot paths can be typed in.
     const unregisterInput = registerTerminalInput(terminalId, (text) => {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -138,7 +148,9 @@ export function TerminalView({
         };
         ws.onmessage = (e) => {
           if (e.data instanceof ArrayBuffer) {
-            term.write(new Uint8Array(e.data));
+            const bytes = new Uint8Array(e.data);
+            term.write(bytes);
+            sniffModel(bytes);
           }
         };
         ws.onclose = () => {
@@ -169,7 +181,7 @@ export function TerminalView({
       ws?.close();
       term.dispose();
     };
-  }, [terminalId, onConnectionChange]);
+  }, [terminalId, frameKey, onConnectionChange]);
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-ink-900">
