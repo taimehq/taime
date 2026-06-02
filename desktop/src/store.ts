@@ -83,6 +83,21 @@ export interface TimelineEvent {
 /** Cap on retained per-terminal timeline events (most recent kept). */
 const TIMELINE_CAP = 200;
 
+/**
+ * Per-session status counts shown at-a-glance on a collapsed sidebar row.
+ * Buckets mirror the StatusBadge normalization (PROCESSING→working,
+ * WAITING_USER_ANSWER→needsYou, ERROR→error, COMPLETED→done, IDLE→idle); other
+ * states (PENDING/UNKNOWN) count toward `total` only.
+ */
+export interface SessionStatusRollup {
+  working: number;
+  needsYou: number;
+  error: number;
+  done: number;
+  idle: number;
+  total: number;
+}
+
 let frameCounter = 0;
 const nextKey = () => `frame-${++frameCounter}`;
 
@@ -92,6 +107,8 @@ interface Store {
   activeSessionDetail: SessionDetail | null;
   connected: boolean;
   terminalStatuses: Record<string, string>;
+  /** Per-session status counts for the collapsed sidebar rows (polled, 10s). */
+  sessionStatusRollup: Record<string, SessionStatusRollup>;
 
   // workspace (single active project)
   workspaceDir: string | null;
@@ -111,6 +128,9 @@ interface Store {
   dirty: Record<string, DirtyState>;
   /** Per-terminal attributed file-change timeline (most recent last). */
   timeline: Record<string, TimelineEvent[]>;
+  /** Terminal ids whose auto-surfaced frame the user explicitly closed; the
+   *  reconciler must not reopen these. (Manually reopening clears the flag.) */
+  dismissedTerminalIds: Set<string>;
   /** Frames whose dirty changes the user has acknowledged (for the switch guard). */
   reviewedFrames: Record<string, boolean>;
   /** When set, a context switch is blocked pending review of the current frame. */
@@ -130,6 +150,8 @@ interface Store {
   fetchSessions: () => Promise<void>;
   selectSessionDetail: (name: string | null) => Promise<void>;
   refreshStatuses: () => Promise<void>;
+  /** Poll per-session terminal statuses and rebuild the collapsed-row rollups. */
+  refreshSessionRollups: () => Promise<void>;
   /** Delete a CAO session (terminates its tmux + agents) and close its frames. */
   killSession: (name: string) => Promise<void>;
 
@@ -156,6 +178,8 @@ interface Store {
   /** Drop a Rust-PTY session from the registry (kill if alive). */
   forgetRustPty: (ptySessionId: string) => Promise<void>;
   closeFrame: (key: string) => Promise<void>;
+  /** Mark a terminal id as dismissed so the reconciler won't reopen it. */
+  dismissTerminal: (id: string) => void;
   setActiveFrame: (key: string | null) => void;
   /** Switch active frame, raising the dirty-state guard if needed. */
   setActiveFrameGuarded: (key: string) => void;
@@ -181,6 +205,7 @@ export const useStore = create<Store>((set, get) => ({
   activeSessionDetail: null,
   connected: false,
   terminalStatuses: {},
+  sessionStatusRollup: {},
 
   workspaceDir: loadWorkspaceDir(),
   recentProjects: loadRecentProjects(),
@@ -191,6 +216,7 @@ export const useStore = create<Store>((set, get) => ({
   rustPtySessions: {},
   dirty: {},
   timeline: {},
+  dismissedTerminalIds: new Set(),
   reviewedFrames: {},
   pendingSwitchKey: null,
   diffTerminalId: null,
@@ -277,6 +303,73 @@ export const useStore = create<Store>((set, get) => ({
     );
   },
 
+  refreshSessionRollups: async () => {
+    const sessions = get().sessions;
+    if (sessions.length === 0) {
+      if (Object.keys(get().sessionStatusRollup).length > 0) {
+        set({ sessionStatusRollup: {} });
+      }
+      return;
+    }
+    // No session endpoint returns per-terminal status, so fan out: list each
+    // session's terminals, then fetch each terminal's status, and bucket. Failed
+    // sessions are simply omitted from the rebuilt map (stale row clears).
+    // TODO: useTerminalReconcile also getSession()s these every 10s — a shared
+    // pass could halve the calls, but the two loops schedule independently today.
+    const results = await Promise.all(
+      sessions.map(async (sess) => {
+        try {
+          const detail = await api.getSession(sess.name);
+          const statuses = await Promise.all(
+            detail.terminals.map((t) =>
+              api.getTerminalStatus(t.id).catch(() => null),
+            ),
+          );
+          const roll: SessionStatusRollup = {
+            working: 0,
+            needsYou: 0,
+            error: 0,
+            done: 0,
+            idle: 0,
+            total: detail.terminals.length,
+          };
+          for (const st of statuses) {
+            switch ((st ?? "").toUpperCase()) {
+              case "PROCESSING":
+                roll.working++;
+                break;
+              case "WAITING_USER_ANSWER":
+                roll.needsYou++;
+                break;
+              case "ERROR":
+                roll.error++;
+                break;
+              case "COMPLETED":
+                roll.done++;
+                break;
+              case "IDLE":
+                roll.idle++;
+                break;
+            }
+          }
+          return [sess.name, roll] as const;
+        } catch {
+          return null; // skip unreachable session
+        }
+      }),
+    );
+    // Assign in `sessions` order (NOT Promise-resolution order) so the rebuilt
+    // map has deterministic key order — otherwise JSON.stringify in jsonEqual
+    // sees a different string each tick for identical content and set() churns.
+    const next: Record<string, SessionStatusRollup> = {};
+    for (const entry of results) {
+      if (entry) next[entry[0]] = entry[1];
+    }
+    if (!jsonEqual(get().sessionStatusRollup, next)) {
+      set({ sessionStatusRollup: next });
+    }
+  },
+
   killSession: async (name) => {
     // Close any open frames for this session first (UI only); the delete below
     // is what actually terminates the tmux session + its agents on the backend.
@@ -338,19 +431,36 @@ export const useStore = create<Store>((set, get) => ({
         );
       }
       // Resolve the placeholder to the real terminal.
-      set((s) => ({
-        frames: s.frames.map((f) =>
-          f.key === key
-            ? {
-                ...f,
-                terminalId: terminal.id,
-                sessionName: terminal.session_name,
-                agentProfile: terminal.agent_profile,
-                pending: false,
-              }
-            : f,
-        ),
-      }));
+      set((s) => {
+        // A reconcile tick may have opened a frame for this terminal while
+        // addTerminal was in flight: the placeholder's terminalId was null, so
+        // the reconciler couldn't see the collision and openTerminalFrame's
+        // existing-check couldn't either. If a frame now holds the resolved id,
+        // drop our placeholder and keep that one — strictly one frame per id.
+        const dup = s.frames.find(
+          (f) => f.key !== key && f.terminalId === terminal.id,
+        );
+        if (dup) {
+          const frames = s.frames.filter((f) => f.key !== key);
+          return {
+            frames,
+            activeFrameKey: s.activeFrameKey === key ? dup.key : s.activeFrameKey,
+          };
+        }
+        return {
+          frames: s.frames.map((f) =>
+            f.key === key
+              ? {
+                  ...f,
+                  terminalId: terminal.id,
+                  sessionName: terminal.session_name,
+                  agentProfile: terminal.agent_profile,
+                  pending: false,
+                }
+              : f,
+          ),
+        };
+      });
       get().showSnackbar({
         type: "success",
         message: `${provider} launched`,
@@ -377,13 +487,24 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   openTerminalFrame: ({ terminalId, provider, agentProfile, sessionName }) => {
+    // Opening a terminal (manually or via reconcile) clears any prior dismissal
+    // so its surfacing lifecycle resets.
+    const undismiss = (s: Store): Partial<Store> =>
+      s.dismissedTerminalIds.has(terminalId)
+        ? {
+            dismissedTerminalIds: new Set(
+              [...s.dismissedTerminalIds].filter((id) => id !== terminalId),
+            ),
+          }
+        : {};
     const existing = get().frames.find((f) => f.terminalId === terminalId);
     if (existing) {
-      set({ activeFrameKey: existing.key });
+      set((s) => ({ ...undismiss(s), activeFrameKey: existing.key }));
       return;
     }
     const key = nextKey();
     set((s) => ({
+      ...undismiss(s),
       frames: [
         ...s.frames,
         {
@@ -527,8 +648,16 @@ export const useStore = create<Store>((set, get) => ({
     // Remove from the grid immediately (closing a frame ≠ stopping the agent).
     set((s) => {
       const frames = s.frames.filter((f) => f.key !== key);
+      // Remember explicitly-closed CAO terminals so the reconciler doesn't
+      // immediately reopen them. Rust-PTY frames are excluded — they have their
+      // own detached-agent lifecycle (close detaches, doesn't kill).
+      const dismissedTerminalIds =
+        frame && frame.transport !== "rust_pty" && frame.terminalId
+          ? new Set(s.dismissedTerminalIds).add(frame.terminalId)
+          : s.dismissedTerminalIds;
       return {
         frames,
+        dismissedTerminalIds,
         activeFrameKey:
           s.activeFrameKey === key
             ? (frames[frames.length - 1]?.key ?? null)
@@ -543,6 +672,12 @@ export const useStore = create<Store>((set, get) => ({
     // Best-effort clear dirty marker for the closed terminal.
     if (frame?.terminalId) get().clearDirty(frame.terminalId);
   },
+
+  dismissTerminal: (id) =>
+    set((s) => {
+      if (s.dismissedTerminalIds.has(id)) return s;
+      return { dismissedTerminalIds: new Set(s.dismissedTerminalIds).add(id) };
+    }),
 
   setActiveFrame: (key) => set({ activeFrameKey: key }),
 
