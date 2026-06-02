@@ -341,10 +341,13 @@ fn accept_path(path: &Path, root: &Path, gitignore: Option<&Gitignore>) -> Optio
             return None;
         }
     }
-    // Honor .gitignore when available.
+    // Honor .gitignore when available. Use matched_path_or_any_parents (NOT
+    // plain `matched`): a file inside an ignored directory (e.g.
+    // .playwright-mcp/x.png) is only caught when the parent-dir rule is applied
+    // to its ancestors, which `matched` does not do — it tests the literal path.
     if let Some(gi) = gitignore {
         let is_dir = path.is_dir();
-        if gi.matched(path, is_dir).is_ignore() {
+        if gi.matched_path_or_any_parents(path, is_dir).is_ignore() {
             return None;
         }
     }
