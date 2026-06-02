@@ -1,17 +1,11 @@
 import { useStore, type Frame } from "../store";
 import { TerminalView } from "../components/TerminalView";
 import { TerminalViewRustPty } from "../components/TerminalViewRustPty";
-import { StatusBadge } from "../components/StatusBadge";
+import { StatusBadge, statusDotClass } from "../components/StatusBadge";
 import { prettySessionText } from "../lib/sessionName";
+import { providerTitle } from "../lib/providerLabel";
 import { useFsWatch } from "../hooks/useFsWatch";
-import { Loader2, X, TerminalSquare, Power } from "lucide-react";
-
-const TARGET_NAME: Record<string, string> = {
-  claude_code: "Claude Code",
-  codex: "Codex CLI",
-  gemini_cli: "Gemini CLI",
-  grok_cli: "Grok Build CLI",
-};
+import { Loader2, X, TerminalSquare, Power, LayoutGrid } from "lucide-react";
 
 /** CSS grid template that keeps frames roughly square as count grows. */
 function gridClass(n: number): string {
@@ -24,6 +18,8 @@ function gridClass(n: number): string {
 
 export function ShellGrid() {
   const frames = useStore((s) => s.frames);
+  const layoutMode = useStore((s) => s.layoutMode);
+  const activeFrameKey = useStore((s) => s.activeFrameKey);
 
   if (frames.length === 0) {
     return (
@@ -39,20 +35,141 @@ export function ShellGrid() {
     );
   }
 
+  // Tabs ARE the windows. The "Grid" tab tiles every window; a window tab
+  // fullscreens that one frame. In focus, only the active frame is mounted
+  // (switching reconnects/replays). Switching is always guarded.
+  const active = frames.find((f) => f.key === activeFrameKey) ?? frames[0];
+
   return (
-    <div className={`grid h-full w-full gap-2 ${gridClass(frames.length)}`}>
-      {frames.map((f) => (
-        <FrameCell key={f.key} frame={f} />
-      ))}
+    <div className="flex h-full w-full flex-col gap-2">
+      <ShellTabs frames={frames} layoutMode={layoutMode} activeKey={active.key} />
+      <div className="min-h-0 flex-1">
+        {layoutMode === "focus" ? (
+          <FrameCell
+            key={active.key}
+            frame={active}
+            index={frames.findIndex((f) => f.key === active.key)}
+          />
+        ) : (
+          <div className={`grid h-full w-full gap-2 ${gridClass(frames.length)}`}>
+            {frames.map((f, i) => (
+              <FrameCell key={f.key} frame={f} index={i} />
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
-function FrameCell({ frame }: { frame: Frame }) {
+/** The shell tab bar — a "Grid" tab (all windows tiled) + one tab per window.
+ *  A view over the frames, never a source of truth. Window-tab clicks route
+ *  through the guarded switch and fullscreen that frame. */
+function ShellTabs({
+  frames,
+  layoutMode,
+  activeKey,
+}: {
+  frames: Frame[];
+  layoutMode: "grid" | "focus";
+  activeKey: string;
+}) {
+  const setLayoutMode = useStore((s) => s.setLayoutMode);
+  const setActiveFrameGuarded = useStore((s) => s.setActiveFrameGuarded);
+  const terminalStatuses = useStore((s) => s.terminalStatuses);
+  const dirty = useStore((s) => s.dirty);
+
+  const tabClass = (on: boolean) =>
+    `flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1 text-left ${
+      on
+        ? "border-teal-600/70 bg-ink-700 text-zinc-100"
+        : "border-ink-600 bg-ink-800 text-zinc-400 hover:text-zinc-200"
+    }`;
+
+  return (
+    <div className="flex shrink-0 items-stretch gap-1 overflow-x-auto pb-0.5">
+      <button
+        onClick={() => setLayoutMode("grid")}
+        title="Show all windows (⌘⇧⏎)"
+        className={tabClass(layoutMode === "grid")}
+      >
+        <LayoutGrid size={12} className="shrink-0" />
+        <span className="flex flex-col leading-tight">
+          <span className="text-[11px] font-medium">Grid</span>
+          <span className="text-[9px] text-zinc-500">all windows</span>
+        </span>
+      </button>
+      <div className="mx-0.5 my-1 w-px shrink-0 bg-ink-600" />
+      {frames.map((f, i) => {
+        const raw = f.pending
+          ? "PENDING"
+          : f.terminalId
+            ? terminalStatuses[f.terminalId]
+            : undefined;
+        const d = f.terminalId ? dirty[f.terminalId] : undefined;
+        const role =
+          f.agentProfile && f.agentProfile !== "default"
+            ? f.agentProfile.replace(/_/g, " ")
+            : null;
+        const session = f.sessionName
+          ? prettySessionText(f.sessionName)
+          : null;
+        // Subtitle: who this agent is + which session it belongs to.
+        const subtitle = [role, session].filter(Boolean).join(" · ");
+        return (
+          <button
+            key={f.key}
+            onClick={() => {
+              setActiveFrameGuarded(f.key);
+              setLayoutMode("focus");
+            }}
+            title={`${providerTitle(f.provider)}${role ? " · " + role : ""}${
+              session ? " · " + session : ""
+            }${f.model ? " · " + f.model : ""} — fullscreen`}
+            className={tabClass(layoutMode === "focus" && f.key === activeKey)}
+          >
+            <span className="shrink-0 text-[10px] tabular-nums text-zinc-600">
+              {i < 9 ? i + 1 : ""}
+            </span>
+            <span className="flex min-w-0 flex-col leading-tight">
+              <span className="flex items-center gap-1.5">
+                <span
+                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass(raw)}`}
+                />
+                <span className="max-w-[130px] truncate text-[11px] font-medium">
+                  {providerTitle(f.provider)}
+                </span>
+                {f.model && (
+                  <span className="shrink-0 rounded bg-ink-600 px-1 text-[9px] font-medium text-zinc-300">
+                    {f.model}
+                  </span>
+                )}
+              </span>
+              {subtitle && (
+                <span className="max-w-[150px] truncate text-[10px] text-zinc-500">
+                  {subtitle}
+                </span>
+              )}
+            </span>
+            {d && d.count > 0 && (
+              <span className="shrink-0 rounded bg-amber/20 px-1 text-[9px] font-medium text-amber">
+                {d.count}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function FrameCell({ frame, index }: { frame: Frame; index: number }) {
   const activeFrameKey = useStore((s) => s.activeFrameKey);
   const setActiveFrameGuarded = useStore((s) => s.setActiveFrameGuarded);
   const closeFrame = useStore((s) => s.closeFrame);
   const killRustPty = useStore((s) => s.killRustPty);
+  const layoutMode = useStore((s) => s.layoutMode);
+  const setLayoutMode = useStore((s) => s.setLayoutMode);
   const status = useStore((s) =>
     frame.terminalId ? s.terminalStatuses[frame.terminalId] : undefined,
   );
@@ -66,8 +183,7 @@ function FrameCell({ frame }: { frame: Frame }) {
   useFsWatch(frame.terminalId);
 
   const active = activeFrameKey === frame.key;
-  const title =
-    TARGET_NAME[frame.provider] ?? frame.provider.replace(/_/g, " ");
+  const title = providerTitle(frame.provider);
   // Agent role (profile) — shown when it's a meaningful, non-default role.
   const role =
     frame.agentProfile && frame.agentProfile !== "default"
@@ -83,12 +199,28 @@ function FrameCell({ frame }: { frame: Frame }) {
     <div
       data-term-key={termKey ?? undefined}
       onMouseDown={() => setActiveFrameGuarded(frame.key)}
-      className={`flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border ${
+      className={`flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border ${
         active ? "border-teal-600/70" : "border-ink-600"
       } bg-ink-900`}
     >
       <header className="flex h-8 shrink-0 items-center justify-between border-b border-ink-600 bg-ink-800 px-3">
-        <div className="flex min-w-0 items-center gap-2">
+        <div
+          className="flex min-w-0 items-center gap-2"
+          title={layoutMode === "focus" ? "Double-click for grid" : "Double-click to fullscreen"}
+          onDoubleClick={() => {
+            if (layoutMode === "focus") {
+              setLayoutMode("grid");
+            } else {
+              setActiveFrameGuarded(frame.key);
+              setLayoutMode("focus");
+            }
+          }}
+        >
+          {index < 9 && (
+            <span className="shrink-0 text-[10px] tabular-nums text-zinc-600">
+              {index + 1}
+            </span>
+          )}
           <span className="shrink-0 text-xs font-medium text-zinc-200">
             {title}
           </span>

@@ -1,20 +1,85 @@
 import { useEffect, useState } from "react";
-import { Plus, ChevronRight, ChevronDown, GitBranch, Power, Trash2 } from "lucide-react";
+import {
+  Plus,
+  ChevronRight,
+  ChevronDown,
+  GitBranch,
+  Power,
+  Trash2,
+  PanelLeftOpen,
+} from "lucide-react";
 import { useStore } from "../store";
 import { api, type SessionDetail } from "../api";
-import { StatusBadge } from "../components/StatusBadge";
+import { StatusBadge, statusDotClass } from "../components/StatusBadge";
 import { FileInventory } from "../components/FileInventory";
 import { WorkspacePicker } from "../components/WorkspacePicker";
 import { prettySession } from "../lib/sessionName";
+import { providerTitle } from "../lib/providerLabel";
 
 export function ControlColumn({ onLaunch }: { onLaunch: () => void }) {
   const sessions = useStore((s) => s.sessions);
   const connected = useStore((s) => s.connected);
   const launchClaudeRustPty = useStore((s) => s.launchClaudeRustPty);
+  const width = useStore((s) => s.sidebarWidth);
+  const collapsed = useStore((s) => s.sidebarCollapsed);
+  const setSidebarWidth = useStore((s) => s.setSidebarWidth);
+  const toggleSidebar = useStore((s) => s.toggleSidebar);
+  const frames = useStore((s) => s.frames);
+  const terminalStatuses = useStore((s) => s.terminalStatuses);
+  const setActiveFrameGuarded = useStore((s) => s.setActiveFrameGuarded);
+
+  // Collapsed: a thin rail that still surfaces live agent activity — expand,
+  // launch, and a status dot per window (click to jump, guarded). Cmd+\ toggles.
+  if (collapsed) {
+    return (
+      <aside className="flex w-10 shrink-0 flex-col items-center gap-2 border-r border-ink-600 bg-ink-800/40 py-2.5">
+        <button
+          onClick={toggleSidebar}
+          title="Show sidebar (⌘\)"
+          className="no-drag rounded p-1.5 text-zinc-500 hover:bg-ink-700 hover:text-zinc-200"
+        >
+          <PanelLeftOpen size={16} />
+        </button>
+        <button
+          onClick={onLaunch}
+          disabled={!connected}
+          title="Launch agent"
+          className="no-drag rounded p-1.5 text-zinc-400 hover:bg-ink-700 hover:text-zinc-200 disabled:opacity-40"
+        >
+          <Plus size={16} />
+        </button>
+        <div className="mt-1 flex min-h-0 flex-col items-center gap-2.5 overflow-y-auto">
+          {frames.map((f) => {
+            const raw = f.pending
+              ? "PENDING"
+              : f.terminalId
+                ? terminalStatuses[f.terminalId]
+                : undefined;
+            return (
+              <button
+                key={f.key}
+                onClick={() => setActiveFrameGuarded(f.key)}
+                title={providerTitle(f.provider)}
+                className="no-drag rounded-full p-0.5 hover:bg-ink-700"
+              >
+                <span
+                  className={`block h-2.5 w-2.5 rounded-full ${statusDotClass(raw)}`}
+                />
+              </button>
+            );
+          })}
+        </div>
+      </aside>
+    );
+  }
 
   return (
-    <aside className="flex w-80 shrink-0 flex-col border-r border-ink-600 bg-ink-800/40">
-      {/* Zone 1 — context + primary actions (pinned) */}
+    <aside
+      style={{ width }}
+      className="relative flex shrink-0 flex-col border-r border-ink-600 bg-ink-800/40"
+    >
+      {/* Zone 1 — context + primary actions (pinned). Collapse toggle lives in
+          the title bar so it costs no sidebar height. */}
       <div className="flex shrink-0 flex-col gap-3 p-4 pb-3">
         <WorkspacePicker />
         <div className="flex flex-col gap-2">
@@ -51,7 +116,37 @@ export function ControlColumn({ onLaunch }: { onLaunch: () => void }) {
       <div className="max-h-[38%] shrink-0 overflow-y-auto border-t border-ink-700 p-3">
         <FileInventory />
       </div>
+
+      <ResizeHandle onResize={setSidebarWidth} />
     </aside>
+  );
+}
+
+/** Drag handle on the sidebar's right edge. Width is clamped in the store. */
+function ResizeHandle({ onResize }: { onResize: (px: number) => void }) {
+  const onMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const aside = (e.currentTarget as HTMLElement).parentElement;
+    const left = aside?.getBoundingClientRect().left ?? 0;
+    const onMove = (ev: MouseEvent) => onResize(ev.clientX - left);
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  return (
+    <div
+      onMouseDown={onMouseDown}
+      title="Drag to resize"
+      className="absolute right-0 top-0 z-10 h-full w-1 cursor-col-resize hover:bg-teal-600/40"
+    />
   );
 }
 

@@ -2,12 +2,15 @@ import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import { terminalWsUrl } from "../api";
 import { wireClipboard } from "../lib/terminalClipboard";
 import { registerTerminalInput } from "../lib/terminalInput";
 import { makeModelSniffer } from "../lib/parseModel";
 import { useStore } from "../store";
+import { useTerminalFind } from "../hooks/useTerminalFind";
+import { TerminalFindBar } from "./TerminalFindBar";
 
 interface TerminalViewProps {
   terminalId: string;
@@ -45,6 +48,21 @@ export function TerminalView({
   onConnectionChange,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Held so the font-zoom effect can mutate the live terminal without tearing
+  // it down. `applyResize` re-reports rows/cols after a size change (the
+  // ResizeObserver doesn't fire — the container didn't change, the glyphs did).
+  const termRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+  const applyResizeRef = useRef<() => void>(() => {});
+  const fontSize = useStore((s) => s.terminalFontSize);
+  const {
+    searchRef,
+    queryRef,
+    open: findOpen,
+    setOpen: setFindOpen,
+    results,
+    setResults,
+  } = useTerminalFind(frameKey);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -58,7 +76,9 @@ export function TerminalView({
 
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 13,
+      // Initial size only — read non-reactively so this mount effect isn't
+      // keyed on font size. Live changes are applied by the zoom effect below.
+      fontSize: useStore.getState().terminalFontSize,
       fontFamily:
         "ui-monospace, 'JetBrains Mono', SFMono-Regular, Menlo, Monaco, monospace",
       scrollback: 10000,
@@ -77,6 +97,8 @@ export function TerminalView({
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
     term.open(el);
+    termRef.current = term;
+    fitRef.current = fitAddon;
 
     // GPU rendering for 60fps under heavy output; gracefully fall back.
     try {
@@ -86,6 +108,14 @@ export function TerminalView({
     } catch {
       /* canvas/dom renderer fallback — still correct, just slower */
     }
+
+    // Find-in-terminal (Cmd+F). Decorations drive the match-count readout.
+    const search = new SearchAddon();
+    term.loadAddon(search);
+    searchRef.current = search;
+    const offResults = search.onDidChangeResults((r) =>
+      setResults({ index: r.resultIndex, count: r.resultCount }),
+    );
 
     const safeFit = () => {
       try {
@@ -102,6 +132,7 @@ export function TerminalView({
         );
       }
     };
+    applyResizeRef.current = sendResize;
 
     // Cross-platform copy/paste (shared across transports).
     const cleanupClipboard = wireClipboard(term, el);
@@ -179,13 +210,39 @@ export function TerminalView({
       cleanupClipboard();
       unregisterInput();
       ws?.close();
+      offResults.dispose();
+      searchRef.current = null;
+      termRef.current = null;
+      fitRef.current = null;
       term.dispose();
     };
   }, [terminalId, frameKey, onConnectionChange]);
 
+  // Apply font-zoom (Cmd ±/0) to the live terminal without recreating it.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || term.options.fontSize === fontSize) return;
+    term.options.fontSize = fontSize;
+    try {
+      fitRef.current?.fit();
+    } catch {
+      /* element not measurable yet */
+    }
+    term.refresh(0, term.rows - 1);
+    applyResizeRef.current();
+  }, [fontSize]);
+
   return (
     <div className="relative h-full w-full overflow-hidden bg-ink-900">
       <div ref={containerRef} className="absolute inset-1.5" />
+      {findOpen && (
+        <TerminalFindBar
+          searchRef={searchRef}
+          queryRef={queryRef}
+          results={results}
+          onClose={() => setFindOpen(false)}
+        />
+      )}
     </div>
   );
 }
