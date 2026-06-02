@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,6 +49,49 @@ const DENY_DIRS: &[&str] = &[
     ".vscode",
     ".DS_Store",
 ];
+
+/// Memo of directories known to carry a `CACHEDIR.TAG` marker, so a build
+/// storm under one doesn't re-stat its ancestors on every event.
+fn cache_dir_memo() -> &'static Mutex<HashSet<PathBuf>> {
+    static MEMO: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// True if any ancestor directory of `path` (up to `root`) holds a
+/// `CACHEDIR.TAG` file — the cross-tool marker for a cache/build directory
+/// (cargo's `target`, including random-suffixed temp variants like
+/// `targetIXC1zL`, plus many other tools). Everything under such a directory is
+/// build output, not an agent-driven source change.
+fn under_cachedir_tag(path: &Path, root: &Path) -> bool {
+    let memo = cache_dir_memo();
+    // Fast path: a known cache dir is an ancestor.
+    {
+        let known = memo.lock().unwrap();
+        let mut d = path.parent();
+        while let Some(dir) = d {
+            if known.contains(dir) {
+                return true;
+            }
+            if dir == root {
+                break;
+            }
+            d = dir.parent();
+        }
+    }
+    // Slow path: probe ancestors for the marker, memoizing any hit.
+    let mut d = path.parent();
+    while let Some(dir) = d {
+        if dir.join("CACHEDIR.TAG").is_file() {
+            memo.lock().unwrap().insert(dir.to_path_buf());
+            return true;
+        }
+        if dir == root {
+            break;
+        }
+        d = dir.parent();
+    }
+    false
+}
 
 /// File suffixes/markers we ignore (lockfiles, logs, editor temp/swap).
 fn is_denied_file(name: &str) -> bool {
@@ -340,6 +383,12 @@ fn accept_path(path: &Path, root: &Path, gitignore: Option<&Gitignore>) -> Optio
         if is_denied_file(name) {
             return None;
         }
+    }
+    // Reject build/cache output marked with CACHEDIR.TAG (cargo target dirs and
+    // their random-suffixed temp variants, etc.) that DENY_DIRS' exact-name
+    // match can't catch.
+    if under_cachedir_tag(path, root) {
+        return None;
     }
     // Honor .gitignore when available. Use matched_path_or_any_parents (NOT
     // plain `matched`): a file inside an ignored directory (e.g.
