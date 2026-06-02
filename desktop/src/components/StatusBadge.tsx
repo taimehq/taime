@@ -2,7 +2,7 @@
 const CONFIG: Record<string, { dot: string; label: string }> = {
   IDLE: { dot: "bg-zinc-500", label: "idle" },
   PROCESSING: { dot: "bg-teal-400 animate-pulse", label: "working" },
-  COMPLETED: { dot: "bg-teal-400", label: "done" },
+  COMPLETED: { dot: "bg-emerald-400", label: "done" },
   WAITING_USER_ANSWER: { dot: "bg-amber animate-pulse", label: "needs you" },
   ERROR: { dot: "bg-red-500", label: "error" },
   PENDING: { dot: "bg-amber animate-pulse", label: "launching" },

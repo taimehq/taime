@@ -8,7 +8,7 @@ const ICON = {
   info: Info,
 };
 const TONE = {
-  success: "border-teal-600/50 text-teal-300",
+  success: "border-emerald-600/50 text-emerald-300",
   error: "border-red-900/60 text-red-300",
   info: "border-ink-500 text-zinc-300",
 };

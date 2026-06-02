@@ -21,20 +21,20 @@ interface Props {
 }
 
 const THEME = {
-  background: "#0b0e13",
-  foreground: "#dbe1ea",
-  cursor: "#43c6b8",
-  cursorAccent: "#0b0e13",
-  selectionBackground: "#27405c",
-  black: "#0b0e13",
-  red: "#ff7b72",
-  green: "#43c6b8",
-  yellow: "#e0a458",
-  blue: "#6ea8fe",
+  background: "#0a0a0a",
+  foreground: "#ededed",
+  cursor: "#c8c7c2",
+  cursorAccent: "#0a0a0a",
+  selectionBackground: "#33363b",
+  black: "#0a0a0a",
+  red: "#f85149",
+  green: "#3fb950",
+  yellow: "#d29922",
+  blue: "#4493f8",
   magenta: "#bc8cff",
   cyan: "#39d3c2",
-  white: "#dbe1ea",
-  brightBlack: "#56606f",
+  white: "#ededed",
+  brightBlack: "#6f6f6f",
 };
 
 /**

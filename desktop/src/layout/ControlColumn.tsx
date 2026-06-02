@@ -21,7 +21,7 @@ export function ControlColumn({ onLaunch }: { onLaunch: () => void }) {
           <button
             onClick={onLaunch}
             disabled={!connected}
-            className="no-drag flex items-center justify-center gap-2 rounded-lg bg-teal px-3 py-2 text-sm font-medium text-ink-900 transition-colors hover:bg-teal-400 disabled:cursor-not-allowed disabled:opacity-50"
+            className="no-drag flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-ink-900 transition-colors hover:bg-primary-hover disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Plus size={16} />
             Launch agent
