@@ -21,7 +21,7 @@ const LABEL: Record<BackendState["status"], string> = {
 export function BackendStatusPill({ state }: { state: BackendState }) {
   return (
     <div
-      className="no-drag flex items-center gap-2 rounded-full border border-ink-500 bg-ink-700 px-3 py-1.5 text-xs"
+      className="no-drag flex items-center gap-2.5 rounded-full border border-ink-500 bg-ink-700 px-3.5 py-1.5 text-xs"
       title={state.detail}
     >
       <span className={`h-2 w-2 rounded-full ${DOT[state.status]}`} />
