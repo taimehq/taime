@@ -97,15 +97,19 @@ function TitleBar({
   backend: BackendState;
   onOpenGraph: () => void;
 }) {
+  // Unified macOS title bar. `trafficLightPosition.y` is aligned to the same
+  // 24px vertical center as this h-12 bar; keep it in sync if the bar height
+  // changes. Left padding clears the native traffic-light cluster plus a
+  // comfortable gap.
   return (
-    <header className="titlebar-drag flex h-12 shrink-0 items-center justify-between border-b border-ink-600 bg-ink-800 pl-[100px] pr-4">
-      <span className="text-[15px] font-semibold lowercase leading-none tracking-tight text-zinc-100">
+    <header className="titlebar-drag flex h-12 shrink-0 items-center justify-between border-b border-ink-600 bg-ink-800 pl-[91px] pr-4">
+      <span className="-translate-y-[2px] font-mono text-[14px] font-medium lowercase leading-none tracking-tight text-zinc-300">
         taime
       </span>
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-4">
         <button
           onClick={onOpenGraph}
-          className="no-drag flex items-center gap-1.5 rounded-lg border border-ink-600 px-2.5 py-1 text-xs text-zinc-300 hover:bg-ink-600"
+          className="no-drag flex items-center gap-2.5 rounded-full border border-ink-600 px-3.5 py-1.5 text-xs text-zinc-300 hover:bg-ink-600"
         >
           <Activity size={13} />
           Activity
