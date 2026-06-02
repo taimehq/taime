@@ -9,6 +9,16 @@ const CONFIG: Record<string, { dot: string; label: string }> = {
   UNKNOWN: { dot: "bg-zinc-600", label: "—" },
 };
 
+/** The normalized, human label for a raw terminal status (e.g. "working"). */
+export function statusLabel(status: string | undefined): string {
+  return (CONFIG[status ?? "UNKNOWN"] ?? CONFIG.UNKNOWN).label;
+}
+
+/** Tailwind classes for the status dot (color + any pulse). */
+export function statusDotClass(status: string | undefined): string {
+  return (CONFIG[status ?? "UNKNOWN"] ?? CONFIG.UNKNOWN).dot;
+}
+
 export function StatusBadge({ status }: { status: string | undefined }) {
   const cfg = CONFIG[status ?? "UNKNOWN"] ?? CONFIG.UNKNOWN;
   return (
