@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Plus, ChevronRight, ChevronDown, GitBranch, Power } from "lucide-react";
+import { Plus, ChevronRight, ChevronDown, GitBranch, Power, Trash2 } from "lucide-react";
 import { useStore } from "../store";
 import { api, type SessionDetail } from "../api";
 import { StatusBadge } from "../components/StatusBadge";
@@ -227,12 +227,25 @@ function SessionRow({ name, label: labelOverride }: { name: string; label?: stri
   const openTerminalFrame = useStore((s) => s.openTerminalFrame);
   const statuses = useStore((s) => s.terminalStatuses);
   const frames = useStore((s) => s.frames);
+  const killSession = useStore((s) => s.killSession);
 
   const pretty = prettySession(name);
   const label = labelOverride ?? pretty.label;
   // When shown as a group member the label is the disambiguating tag → mono.
   const mono = labelOverride !== undefined ? true : pretty.mono;
   const tag = labelOverride !== undefined ? null : pretty.tag;
+
+  const onKill = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const shown = pretty.tag ? `${pretty.label}-${pretty.tag}` : pretty.label;
+    if (
+      window.confirm(
+        `Delete session "${shown}"?\n\nThis terminates its agent(s) and removes the tmux session. This can't be undone.`,
+      )
+    ) {
+      killSession(name);
+    }
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -252,27 +265,37 @@ function SessionRow({ name, label: labelOverride }: { name: string; label?: stri
 
   return (
     <div>
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-1.5 rounded px-2 py-1.5 text-left hover:bg-ink-700/50"
-      >
-        {open ? (
-          <ChevronDown size={13} className="shrink-0 text-zinc-600" />
-        ) : (
-          <ChevronRight size={13} className="shrink-0 text-zinc-600" />
-        )}
-        <span
-          className={`truncate text-xs ${mono ? "font-mono text-zinc-400" : "text-zinc-200"}`}
-          title={name}
+      <div className="group/row flex items-center rounded hover:bg-ink-700/50">
+        <button
+          onClick={() => setOpen((v) => !v)}
+          className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left"
         >
-          {label}
-        </span>
-        {tag && (
-          <span className="shrink-0 font-mono text-[10px] text-zinc-600">
-            {tag}
+          {open ? (
+            <ChevronDown size={13} className="shrink-0 text-zinc-600" />
+          ) : (
+            <ChevronRight size={13} className="shrink-0 text-zinc-600" />
+          )}
+          <span
+            className={`truncate text-xs ${mono ? "font-mono text-zinc-400" : "text-zinc-200"}`}
+            title={name}
+          >
+            {label}
           </span>
-        )}
-      </button>
+          {tag && (
+            <span className="shrink-0 font-mono text-[10px] text-zinc-600">
+              {tag}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={onKill}
+          aria-label="Delete session"
+          title="Delete session (terminates its agents)"
+          className="mr-1 shrink-0 rounded p-1 text-zinc-600 opacity-0 transition-opacity hover:text-red-300 group-hover/row:opacity-100"
+        >
+          <Trash2 size={12} />
+        </button>
+      </div>
       {open && detail && (
         <div className="flex flex-col gap-0.5 pb-1 pl-[26px] pr-1">
           {detail.terminals.length === 0 && (
