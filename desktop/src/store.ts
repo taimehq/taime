@@ -314,8 +314,9 @@ export const useStore = create<Store>((set, get) => ({
     // No session endpoint returns per-terminal status, so fan out: list each
     // session's terminals, then fetch each terminal's status, and bucket. Failed
     // sessions are simply omitted from the rebuilt map (stale row clears).
-    const next: Record<string, SessionStatusRollup> = {};
-    await Promise.all(
+    // TODO: useTerminalReconcile also getSession()s these every 10s — a shared
+    // pass could halve the calls, but the two loops schedule independently today.
+    const results = await Promise.all(
       sessions.map(async (sess) => {
         try {
           const detail = await api.getSession(sess.name);
@@ -351,12 +352,19 @@ export const useStore = create<Store>((set, get) => ({
                 break;
             }
           }
-          next[sess.name] = roll;
+          return [sess.name, roll] as const;
         } catch {
-          /* skip unreachable session */
+          return null; // skip unreachable session
         }
       }),
     );
+    // Assign in `sessions` order (NOT Promise-resolution order) so the rebuilt
+    // map has deterministic key order — otherwise JSON.stringify in jsonEqual
+    // sees a different string each tick for identical content and set() churns.
+    const next: Record<string, SessionStatusRollup> = {};
+    for (const entry of results) {
+      if (entry) next[entry[0]] = entry[1];
+    }
     if (!jsonEqual(get().sessionStatusRollup, next)) {
       set({ sessionStatusRollup: next });
     }
@@ -423,19 +431,36 @@ export const useStore = create<Store>((set, get) => ({
         );
       }
       // Resolve the placeholder to the real terminal.
-      set((s) => ({
-        frames: s.frames.map((f) =>
-          f.key === key
-            ? {
-                ...f,
-                terminalId: terminal.id,
-                sessionName: terminal.session_name,
-                agentProfile: terminal.agent_profile,
-                pending: false,
-              }
-            : f,
-        ),
-      }));
+      set((s) => {
+        // A reconcile tick may have opened a frame for this terminal while
+        // addTerminal was in flight: the placeholder's terminalId was null, so
+        // the reconciler couldn't see the collision and openTerminalFrame's
+        // existing-check couldn't either. If a frame now holds the resolved id,
+        // drop our placeholder and keep that one — strictly one frame per id.
+        const dup = s.frames.find(
+          (f) => f.key !== key && f.terminalId === terminal.id,
+        );
+        if (dup) {
+          const frames = s.frames.filter((f) => f.key !== key);
+          return {
+            frames,
+            activeFrameKey: s.activeFrameKey === key ? dup.key : s.activeFrameKey,
+          };
+        }
+        return {
+          frames: s.frames.map((f) =>
+            f.key === key
+              ? {
+                  ...f,
+                  terminalId: terminal.id,
+                  sessionName: terminal.session_name,
+                  agentProfile: terminal.agent_profile,
+                  pending: false,
+                }
+              : f,
+          ),
+        };
+      });
       get().showSnackbar({
         type: "success",
         message: `${provider} launched`,

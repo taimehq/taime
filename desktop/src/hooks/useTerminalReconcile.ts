@@ -8,6 +8,23 @@ const RECONCILE_INTERVAL = 10000;
 const MAX_SURFACED_PER_TICK = 6;
 
 /**
+ * All terminalIds currently represented by a frame — the dedupe keys for
+ * reconciliation. This INCLUDES rust_pty frames: a Rust-PTY agent's frame
+ * carries its provisioned worktree terminalId, so keying on it here prevents
+ * reconcile from opening a second (CAO) frame for the same id. (In practice a
+ * provisioned rust_pty id has no tmux pane, so getSession never lists it — see
+ * the terminal listing in api/main.py — but excluding it explicitly is robust
+ * against that ever changing.)
+ */
+function shownTerminalIds(
+  state: ReturnType<typeof useStore.getState>,
+): Set<string> {
+  return new Set(
+    state.frames.map((f) => f.terminalId).filter(Boolean) as string[],
+  );
+}
+
+/**
  * Surface spawned worker agents in the shell grid.
  *
  * Frames are otherwise only created by explicit user actions (launchAgent /
@@ -24,6 +41,16 @@ export function useTerminalReconcile() {
 
     const tick = async () => {
       const state = useStore.getState();
+      // Sessions with an in-flight optimistic placeholder (terminalId still
+      // null): skip them entirely this tick. The backend terminal may already
+      // exist while launchAgent's addTerminal await is pending, and opening it
+      // here would race launchAgent into two frames for the same id. (launchAgent
+      // also dedupes on resolve as a backstop.)
+      const pendingSessions = new Set(
+        state.frames
+          .filter((f) => f.pending && !!f.sessionName)
+          .map((f) => f.sessionName as string),
+      );
       // Strictly scope to sessions that already have an open frame, so we never
       // auto-open every backend session — only reveal workers within the
       // sessions the user is actively working in.
@@ -34,16 +61,12 @@ export function useTerminalReconcile() {
               f.transport !== "rust_pty" &&
               !f.pending &&
               !!f.terminalId &&
-              !!f.sessionName,
+              !!f.sessionName &&
+              !pendingSessions.has(f.sessionName),
           )
           .map((f) => f.sessionName as string),
       );
       if (activeSessions.size === 0) return;
-
-      const shownTerminalIds = new Set(
-        state.frames.map((f) => f.terminalId).filter(Boolean) as string[],
-      );
-      const dismissed = state.dismissedTerminalIds;
 
       const toOpen: {
         terminalId: string;
@@ -56,8 +79,12 @@ export function useTerminalReconcile() {
         try {
           const detail = await api.getSession(sessionName);
           if (!alive) return;
+          // Re-read live state per session: frames/dismissals can change across
+          // the awaits above.
+          const live = useStore.getState();
+          const shown = shownTerminalIds(live);
           for (const t of detail.terminals) {
-            if (shownTerminalIds.has(t.id) || dismissed.has(t.id)) continue;
+            if (shown.has(t.id) || live.dismissedTerminalIds.has(t.id)) continue;
             toOpen.push({
               terminalId: t.id,
               provider: t.provider,
@@ -72,11 +99,20 @@ export function useTerminalReconcile() {
 
       if (!alive || toOpen.length === 0) return;
 
-      const open = useStore.getState().openTerminalFrame;
       const showSnackbar = useStore.getState().showSnackbar;
       const capped = toOpen.slice(0, MAX_SURFACED_PER_TICK);
-      for (const t of capped) open(t);
+      let surfaced = 0;
+      for (const t of capped) {
+        // Re-check immediately before opening: a frame may have been closed
+        // (→ dismissed) or another tick may have opened this id mid-loop.
+        const live = useStore.getState();
+        if (shownTerminalIds(live).has(t.terminalId)) continue;
+        if (live.dismissedTerminalIds.has(t.terminalId)) continue;
+        live.openTerminalFrame(t);
+        surfaced++;
+      }
 
+      if (surfaced === 0) return;
       if (toOpen.length > MAX_SURFACED_PER_TICK) {
         showSnackbar({
           type: "info",
@@ -86,9 +122,9 @@ export function useTerminalReconcile() {
         showSnackbar({
           type: "info",
           message:
-            capped.length === 1
+            surfaced === 1
               ? "1 new agent surfaced"
-              : `${capped.length} new agents surfaced`,
+              : `${surfaced} new agents surfaced`,
         });
       }
     };
