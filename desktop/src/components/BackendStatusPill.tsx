@@ -1,7 +1,7 @@
 import type { BackendState } from "../backend";
 
 const DOT: Record<BackendState["status"], string> = {
-  healthy: "bg-teal-400",
+  healthy: "bg-emerald-400",
   starting: "bg-amber animate-pulse",
   restarting: "bg-amber animate-pulse",
   external: "bg-amber animate-pulse",

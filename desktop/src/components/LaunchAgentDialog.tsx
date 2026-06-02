@@ -237,7 +237,7 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
           <button
             onClick={submit}
             disabled={!selected || busy}
-            className="rounded-lg bg-teal px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-teal-400 disabled:opacity-50"
+            className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-primary-hover disabled:opacity-50"
           >
             Launch
           </button>
