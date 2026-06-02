@@ -195,38 +195,45 @@ pub fn start(app: &AppHandle, cfg: ResolvedConfig) -> SupervisorHandle {
 
             // Managed mode.
 
-            // Adopt an already-running healthy backend rather than fighting over
-            // the port. We only spawn our own child when nothing healthy is here.
-            let have_child = { child.lock().unwrap().is_some() };
-            if !adopted && !have_child && is_healthy(&client, &cfg.api_url).await {
-                adopted = true;
-                let snap = publish(
-                    "healthy",
-                    "Adopted a backend already running on this port",
-                    None,
-                );
-                if snap.status != last_emitted {
-                    last_emitted = snap.status.clone();
-                    let _ = app.emit("backend://status", snap);
-                }
-            }
-            if adopted {
-                if is_healthy(&client, &cfg.api_url).await {
-                    tokio::time::sleep(HEALTH_POLL).await;
-                    continue;
-                }
-                // The adopted backend vanished — take ownership by spawning.
-                adopted = false;
-            }
-
-            // Ensure a live child exists.
-            let needs_spawn = {
+            // Reap an exited child so a dead handle never masquerades as "we own
+            // a live backend" — otherwise a child that died (e.g. failed to bind
+            // because an external cao-server holds the port) would trap us in a
+            // respawn loop and permanently disable adoption below.
+            {
                 let mut g = child.lock().unwrap();
-                match g.as_mut() {
-                    None => true,
-                    Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+                if let Some(c) = g.as_mut() {
+                    if matches!(c.try_wait(), Ok(Some(_))) {
+                        *g = None;
+                    }
                 }
-            };
+            }
+            let have_live_child = { child.lock().unwrap().is_some() };
+
+            // Adopt an already-running healthy backend rather than fighting over
+            // the port. Re-checked every time we lack a live child (not just once
+            // at boot), so a single transient health miss can't strand us spawning
+            // duplicates against a port an external cao-server already owns.
+            if !have_live_child && is_healthy(&client, &cfg.api_url).await {
+                if !adopted {
+                    adopted = true;
+                    let snap = publish(
+                        "healthy",
+                        "Adopted a backend already running on this port",
+                        None,
+                    );
+                    if snap.status != last_emitted {
+                        last_emitted = snap.status.clone();
+                        let _ = app.emit("backend://status", snap);
+                    }
+                }
+                tokio::time::sleep(HEALTH_POLL).await;
+                continue;
+            }
+            // We either own a live child or nothing healthy holds the port.
+            adopted = false;
+
+            // Ensure a live child exists (the handle is None once reaped above).
+            let needs_spawn = { child.lock().unwrap().is_none() };
 
             if needs_spawn {
                 let had_child = { child.lock().unwrap().is_some() };
