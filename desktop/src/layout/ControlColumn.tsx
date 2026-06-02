@@ -287,6 +287,7 @@ function SessionRow({ name, label: labelOverride }: { name: string; label?: stri
             </span>
           )}
         </button>
+        <SessionRollup name={name} />
         <button
           onClick={onKill}
           aria-label="Delete session"
@@ -330,6 +331,47 @@ function SessionRow({ name, label: labelOverride }: { name: string; label?: stri
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * At-a-glance status for a collapsed session row: a single dominant-state dot
+ * (needs-you and error take priority over working/done) plus subtle counts for
+ * each non-idle state and the agent total. Renders nothing until the rollup has
+ * been polled. Colors mirror StatusBadge so the sidebar reads consistently.
+ */
+function SessionRollup({ name }: { name: string }) {
+  const roll = useStore((s) => s.sessionStatusRollup[name]);
+  if (!roll || roll.total === 0) return null;
+
+  const dot =
+    roll.needsYou > 0
+      ? "bg-amber animate-pulse"
+      : roll.error > 0
+        ? "bg-red-500"
+        : roll.working > 0
+          ? "bg-teal-400 animate-pulse"
+          : roll.done > 0
+            ? "bg-emerald-400"
+            : "bg-zinc-600";
+
+  const counts = [
+    { n: roll.needsYou, cls: "text-amber" },
+    { n: roll.error, cls: "text-red-400" },
+    { n: roll.working, cls: "text-teal-400" },
+    { n: roll.done, cls: "text-emerald-400" },
+  ].filter((c) => c.n > 0);
+
+  return (
+    <span className="flex shrink-0 items-center gap-1 pr-1 text-[10px] text-zinc-500">
+      <span className={`h-1.5 w-1.5 rounded-full ${dot}`} />
+      {counts.map((c, i) => (
+        <span key={i} className={c.cls}>
+          {c.n}
+        </span>
+      ))}
+      <span className="text-zinc-600">· {roll.total}</span>
+    </span>
   );
 }
 

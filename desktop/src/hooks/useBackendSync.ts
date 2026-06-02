@@ -8,21 +8,28 @@ import { useStore } from "../store";
  * self-reported status (which is unavailable when running outside the webview).
  *
  *  - sessions list (10s)  → pipeline overview + connectivity probe
+ *  - session status rollups (10s) → collapsed-row at-a-glance status
  *  - terminal statuses (3s) for frames currently open (no-ops when none)
  */
 export function useBackendSync() {
   const fetchSessions = useStore((s) => s.fetchSessions);
   const refreshStatuses = useStore((s) => s.refreshStatuses);
+  const refreshSessionRollups = useStore((s) => s.refreshSessionRollups);
 
   useEffect(() => {
     let alive = true;
 
-    fetchSessions();
+    // Rollups read the session list, so refresh sessions first each tick.
+    const syncSessions = async () => {
+      if (!alive) return;
+      await fetchSessions();
+      if (alive) refreshSessionRollups();
+    };
+
+    syncSessions();
     refreshStatuses();
 
-    const sessTimer = setInterval(() => {
-      if (alive) fetchSessions();
-    }, 10000);
+    const sessTimer = setInterval(syncSessions, 10000);
     const statusTimer = setInterval(() => {
       if (alive) refreshStatuses();
     }, 3000);
@@ -32,5 +39,5 @@ export function useBackendSync() {
       clearInterval(sessTimer);
       clearInterval(statusTimer);
     };
-  }, [fetchSessions, refreshStatuses]);
+  }, [fetchSessions, refreshStatuses, refreshSessionRollups]);
 }
