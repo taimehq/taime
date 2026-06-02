@@ -130,6 +130,8 @@ interface Store {
   fetchSessions: () => Promise<void>;
   selectSessionDetail: (name: string | null) => Promise<void>;
   refreshStatuses: () => Promise<void>;
+  /** Delete a CAO session (terminates its tmux + agents) and close its frames. */
+  killSession: (name: string) => Promise<void>;
 
   // grid actions
   launchAgent: (
@@ -273,6 +275,21 @@ export const useStore = create<Store>((set, get) => ({
         }
       }),
     );
+  },
+
+  killSession: async (name) => {
+    // Close any open frames for this session first (UI only); the delete below
+    // is what actually terminates the tmux session + its agents on the backend.
+    const victims = get().frames.filter((f) => f.sessionName === name);
+    for (const f of victims) await get().closeFrame(f.key);
+    try {
+      await api.deleteSession(name);
+      get().showSnackbar({ type: "info", message: `Removed session ${name}` });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      get().showSnackbar({ type: "error", message: `Couldn't remove ${name}: ${msg}` });
+    }
+    await get().fetchSessions();
   },
 
   launchAgent: async (provider, agentProfile, opts) => {
