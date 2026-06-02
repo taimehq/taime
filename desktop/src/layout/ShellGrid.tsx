@@ -2,6 +2,7 @@ import { useStore, type Frame } from "../store";
 import { TerminalView } from "../components/TerminalView";
 import { TerminalViewRustPty } from "../components/TerminalViewRustPty";
 import { StatusBadge } from "../components/StatusBadge";
+import { prettySessionText } from "../lib/sessionName";
 import { useFsWatch } from "../hooks/useFsWatch";
 import { Loader2, X, TerminalSquare, Power } from "lucide-react";
 
@@ -67,6 +68,14 @@ function FrameCell({ frame }: { frame: Frame }) {
   const active = activeFrameKey === frame.key;
   const title =
     TARGET_NAME[frame.provider] ?? frame.provider.replace(/_/g, " ");
+  // Agent role (profile) — shown when it's a meaningful, non-default role.
+  const role =
+    frame.agentProfile && frame.agentProfile !== "default"
+      ? frame.agentProfile.replace(/_/g, " ")
+      : null;
+  const sessionLabel = frame.sessionName
+    ? prettySessionText(frame.sessionName)
+    : null;
   // Key the frame for drag-and-drop hit-testing (file/screenshot drop → path).
   const termKey = isRustPty ? frame.ptySessionId : frame.terminalId;
 
@@ -80,12 +89,26 @@ function FrameCell({ frame }: { frame: Frame }) {
     >
       <header className="flex h-8 shrink-0 items-center justify-between border-b border-ink-600 bg-ink-800 px-3">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-xs font-medium text-zinc-200">
+          <span className="shrink-0 text-xs font-medium text-zinc-200">
             {title}
           </span>
-          {frame.terminalId && (
-            <span className="truncate font-mono text-[10px] text-zinc-600">
-              {frame.terminalId.slice(0, 8)}
+          {role && (
+            <span className="shrink-0 text-[11px] text-zinc-400">· {role}</span>
+          )}
+          {frame.model && (
+            <span
+              className="shrink-0 rounded bg-ink-600 px-1.5 text-[10px] font-medium text-zinc-300"
+              title="Model (from the agent's startup banner)"
+            >
+              {frame.model}
+            </span>
+          )}
+          {sessionLabel && (
+            <span
+              className="truncate font-mono text-[10px] text-zinc-600"
+              title={`session ${frame.sessionName}`}
+            >
+              {sessionLabel}
             </span>
           )}
           {isRustPty && (
@@ -134,7 +157,7 @@ function FrameCell({ frame }: { frame: Frame }) {
 
       <div className="min-h-0 flex-1">
         {isRustPty ? (
-          <TerminalViewRustPty sessionId={frame.ptySessionId!} />
+          <TerminalViewRustPty sessionId={frame.ptySessionId!} frameKey={frame.key} />
         ) : frame.pending || !frame.terminalId ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-zinc-500">
             <Loader2 size={20} className="animate-spin text-teal-400" />
@@ -144,7 +167,7 @@ function FrameCell({ frame }: { frame: Frame }) {
             </span>
           </div>
         ) : (
-          <TerminalView terminalId={frame.terminalId} />
+          <TerminalView terminalId={frame.terminalId} frameKey={frame.key} />
         )}
       </div>
     </div>

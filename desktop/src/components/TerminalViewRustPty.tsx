@@ -13,10 +13,13 @@ import {
 } from "../pty";
 import { wireClipboard } from "../lib/terminalClipboard";
 import { registerTerminalInput } from "../lib/terminalInput";
+import { makeModelSniffer } from "../lib/parseModel";
 import { useStore } from "../store";
 
 interface Props {
   sessionId: string;
+  /** Frame id — used to attribute the parsed model back to this frame. */
+  frameKey: string;
   onConnectionChange?: (state: "open" | "closed") => void;
 }
 
@@ -47,7 +50,11 @@ const THEME = {
  * to replay; live output flows after. Unmount = `close_view` (the agent keeps
  * running); explicit kill is separate.
  */
-export function TerminalViewRustPty({ sessionId, onConnectionChange }: Props) {
+export function TerminalViewRustPty({
+  sessionId,
+  frameKey,
+  onConnectionChange,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -97,6 +104,11 @@ export function TerminalViewRustPty({ sessionId, onConnectionChange }: Props) {
     // Cross-platform copy/paste (shared across transports).
     const cleanupClipboard = wireClipboard(term, el);
 
+    // Sniff the running model from the agent's startup banner (best-effort).
+    const sniffModel = makeModelSniffer((m) =>
+      useStore.getState().setFrameModel(frameKey, m),
+    );
+
     // Register an input writer so dropped file/screenshot paths can be typed in.
     const unregisterInput = registerTerminalInput(sessionId, (text) => {
       ptyWrite(sessionId, text);
@@ -120,7 +132,10 @@ export function TerminalViewRustPty({ sessionId, onConnectionChange }: Props) {
     (async () => {
       // Subscribe first (session is detached → no events yet, so no dup).
       unlistenData = await onPtyData(sessionId, (bytes) => {
-        if (alive) term.write(bytes);
+        if (alive) {
+          term.write(bytes);
+          sniffModel(bytes);
+        }
       });
       unlistenExit = await onPtyExit(sessionId, () => {
         if (alive) term.write("\r\n\x1b[33m[process exited]\x1b[0m\r\n");
@@ -151,7 +166,7 @@ export function TerminalViewRustPty({ sessionId, onConnectionChange }: Props) {
       ptyCloseView(sessionId);
       term.dispose();
     };
-  }, [sessionId, onConnectionChange]);
+  }, [sessionId, frameKey, onConnectionChange]);
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-ink-900">
