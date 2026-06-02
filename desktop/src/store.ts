@@ -13,10 +13,25 @@ import {
   addRecent,
 } from "./lib/recentProjects";
 import { makeSessionName } from "./lib/sessionName";
+import {
+  loadTerminalFontSize,
+  saveTerminalFontSize,
+  clampTerminalFontSize,
+  TERMINAL_FONT_SIZE_DEFAULT,
+  loadSidebarWidth,
+  saveSidebarWidth,
+  clampSidebarWidth,
+  loadSidebarCollapsed,
+  saveSidebarCollapsed,
+} from "./lib/preferences";
 import { ptySpawnClaude, ptyKill, ptyCloseView } from "./pty";
 
 /** Which transport carries a frame's terminal I/O. */
 export type TerminalTransport = "cao_ws" | "rust_pty";
+
+/** Shell-grid layout: an auto-grid of all frames, or one focused frame with a
+ *  tab strip of the rest. A view flag only — frames remain the source of truth. */
+export type LayoutMode = "grid" | "focus";
 
 /** Re-render guard: only update when data actually changed. */
 function jsonEqual(a: unknown, b: unknown): boolean {
@@ -124,6 +139,8 @@ interface Store {
   // UI / grid
   frames: Frame[];
   activeFrameKey: string | null;
+  /** Shell-grid layout: auto-grid vs single focused frame + tab strip. */
+  layoutMode: LayoutMode;
   /** Known Rust-PTY agents keyed by ptySessionId — survives frame close so a
    * detached (still-running) agent can be listed + reopened (close ≠ kill). */
   rustPtySessions: Record<string, RustPtyMeta>;
@@ -141,7 +158,21 @@ interface Store {
   diffTerminalId: string | null;
   /** When true, the activity-graph overlay is open. */
   graphOpen: boolean;
+  /** When true, the command palette (Cmd+K) overlay is open. */
+  commandPaletteOpen: boolean;
+  /** When true, the launch-agent dialog is open. Store-owned so both the
+   *  sidebar button and the command palette can open it. */
+  launchOpen: boolean;
   snackbar: Snackbar | null;
+
+  // preferences (persisted via lib/preferences.ts)
+  /** xterm font size for ALL terminal frames (Cmd ±/0). Terminal-only — the
+   *  Monaco diff viewer keeps its own sizing. */
+  terminalFontSize: number;
+  /** Left sidebar width in px (drag-resizable, persisted + clamped). */
+  sidebarWidth: number;
+  /** When true, the sidebar is collapsed to a thin rail (Cmd+\). */
+  sidebarCollapsed: boolean;
 
   // backend sync
   setConnected: (connected: boolean) => void;
@@ -190,6 +221,17 @@ interface Store {
   openDiff: (terminalId: string) => void;
   closeDiff: () => void;
   setGraphOpen: (open: boolean) => void;
+  setCommandPaletteOpen: (open: boolean) => void;
+  setLaunchOpen: (open: boolean) => void;
+  setLayoutMode: (mode: LayoutMode) => void;
+  toggleLayoutMode: () => void;
+
+  // preferences
+  setTerminalFontSize: (size: number) => void;
+  adjustTerminalFontSize: (delta: number) => void;
+  resetTerminalFontSize: () => void;
+  setSidebarWidth: (px: number) => void;
+  toggleSidebar: () => void;
 
   // dirty state
   setDirty: (terminalId: string, dirty: DirtyState) => void;
@@ -215,8 +257,13 @@ export const useStore = create<Store>((set, get) => ({
   recentProjects: loadRecentProjects(),
   isolationEnabled: true,
 
+  terminalFontSize: loadTerminalFontSize(),
+  sidebarWidth: loadSidebarWidth(),
+  sidebarCollapsed: loadSidebarCollapsed(),
+
   frames: [],
   activeFrameKey: null,
+  layoutMode: "grid",
   rustPtySessions: {},
   dirty: {},
   timeline: {},
@@ -225,6 +272,8 @@ export const useStore = create<Store>((set, get) => ({
   pendingSwitchKey: null,
   diffTerminalId: null,
   graphOpen: false,
+  commandPaletteOpen: false,
+  launchOpen: false,
   snackbar: null,
 
   setConnected: (connected) => {
@@ -709,6 +758,10 @@ export const useStore = create<Store>((set, get) => ({
 
   setActiveFrameGuarded: (key) => {
     const s = get();
+    // The guard owns the invariant: while a switch is pending review, ignore
+    // further switch requests so a second keystroke/click cannot silently
+    // retarget the open guard modal.
+    if (s.pendingSwitchKey) return;
     if (key === s.activeFrameKey) return;
     const current = s.frames.find((f) => f.key === s.activeFrameKey);
     const curDirty = current?.terminalId
@@ -747,6 +800,34 @@ export const useStore = create<Store>((set, get) => ({
   openDiff: (terminalId) => set({ diffTerminalId: terminalId }),
   closeDiff: () => set({ diffTerminalId: null }),
   setGraphOpen: (graphOpen) => set({ graphOpen }),
+  setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
+  setLaunchOpen: (launchOpen) => set({ launchOpen }),
+  setLayoutMode: (layoutMode) => set({ layoutMode }),
+  toggleLayoutMode: () =>
+    set((s) => ({ layoutMode: s.layoutMode === "grid" ? "focus" : "grid" })),
+
+  setTerminalFontSize: (size) => {
+    const next = clampTerminalFontSize(size);
+    if (next === get().terminalFontSize) return;
+    saveTerminalFontSize(next);
+    set({ terminalFontSize: next });
+  },
+  adjustTerminalFontSize: (delta) =>
+    get().setTerminalFontSize(get().terminalFontSize + delta),
+  resetTerminalFontSize: () =>
+    get().setTerminalFontSize(TERMINAL_FONT_SIZE_DEFAULT),
+
+  setSidebarWidth: (px) => {
+    const next = clampSidebarWidth(px);
+    if (next === get().sidebarWidth) return;
+    saveSidebarWidth(next);
+    set({ sidebarWidth: next });
+  },
+  toggleSidebar: () => {
+    const next = !get().sidebarCollapsed;
+    saveSidebarCollapsed(next);
+    set({ sidebarCollapsed: next });
+  },
 
   setTerminalStatus: (id, status) =>
     set((s) => {

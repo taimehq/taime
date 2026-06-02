@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import {
   ptyWrite,
@@ -15,6 +16,8 @@ import { wireClipboard } from "../lib/terminalClipboard";
 import { registerTerminalInput } from "../lib/terminalInput";
 import { makeModelSniffer } from "../lib/parseModel";
 import { useStore } from "../store";
+import { useTerminalFind } from "../hooks/useTerminalFind";
+import { TerminalFindBar } from "./TerminalFindBar";
 
 interface Props {
   sessionId: string;
@@ -56,6 +59,20 @@ export function TerminalViewRustPty({
   onConnectionChange,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Held so the font-zoom effect can mutate the live terminal without tearing
+  // it down. `applyResize` re-reports rows/cols after a size change.
+  const termRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+  const applyResizeRef = useRef<() => void>(() => {});
+  const fontSize = useStore((s) => s.terminalFontSize);
+  const {
+    searchRef,
+    queryRef,
+    open: findOpen,
+    setOpen: setFindOpen,
+    results,
+    setResults,
+  } = useTerminalFind(frameKey);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -70,7 +87,9 @@ export function TerminalViewRustPty({
 
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 13,
+      // Initial size only — read non-reactively; live changes via the zoom
+      // effect below so this mount effect isn't keyed on font size.
+      fontSize: useStore.getState().terminalFontSize,
       fontFamily:
         "ui-monospace, 'JetBrains Mono', SFMono-Regular, Menlo, Monaco, monospace",
       scrollback: 10000,
@@ -85,6 +104,9 @@ export function TerminalViewRustPty({
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
     term.open(el);
+    termRef.current = term;
+    fitRef.current = fitAddon;
+    applyResizeRef.current = () => ptyResize(sessionId, term.rows, term.cols);
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => webgl.dispose());
@@ -92,6 +114,14 @@ export function TerminalViewRustPty({
     } catch {
       /* canvas/dom fallback */
     }
+
+    // Find-in-terminal (Cmd+F). Decorations drive the match-count readout.
+    const search = new SearchAddon();
+    term.loadAddon(search);
+    searchRef.current = search;
+    const offResults = search.onDidChangeResults((r) =>
+      setResults({ index: r.resultIndex, count: r.resultCount }),
+    );
 
     const safeFit = () => {
       try {
@@ -164,13 +194,39 @@ export function TerminalViewRustPty({
       unlistenExit?.();
       // Closing the view detaches — it does NOT kill the agent.
       ptyCloseView(sessionId);
+      offResults.dispose();
+      searchRef.current = null;
+      termRef.current = null;
+      fitRef.current = null;
       term.dispose();
     };
   }, [sessionId, frameKey, onConnectionChange]);
 
+  // Apply font-zoom (Cmd ±/0) to the live terminal without recreating it.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || term.options.fontSize === fontSize) return;
+    term.options.fontSize = fontSize;
+    try {
+      fitRef.current?.fit();
+    } catch {
+      /* not measurable yet */
+    }
+    term.refresh(0, term.rows - 1);
+    applyResizeRef.current();
+  }, [fontSize]);
+
   return (
     <div className="relative h-full w-full overflow-hidden bg-ink-900">
       <div ref={containerRef} className="absolute inset-1.5" />
+      {findOpen && (
+        <TerminalFindBar
+          searchRef={searchRef}
+          queryRef={queryRef}
+          results={results}
+          onClose={() => setFindOpen(false)}
+        />
+      )}
     </div>
   );
 }
