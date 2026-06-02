@@ -45,6 +45,27 @@ export function wireClipboard(term: Terminal, el: HTMLElement): () => void {
   };
   el.addEventListener("paste", onPaste);
 
+  // Right-click: own the gesture so the native webview/OS context menu never
+  // appears. (It diverged across transports — the CAO/tmux view showed the
+  // system menu AND a second app menu — and a terminal shouldn't surface
+  // Reload/Inspect/Services anyway.) Terminal-native behavior instead: copy the
+  // current selection if there is one, otherwise paste the clipboard. Shared
+  // here so both transports are identical.
+  const onContextMenu = (e: MouseEvent) => {
+    e.preventDefault();
+    const sel = term.getSelection();
+    if (sel) {
+      navigator.clipboard.writeText(sel).catch(() => {});
+      term.clearSelection();
+    } else {
+      navigator.clipboard
+        .readText()
+        .then((t) => t && term.paste(t))
+        .catch(() => {});
+    }
+  };
+  el.addEventListener("contextmenu", onContextMenu);
+
   term.attachCustomKeyEventHandler((e) => {
     if (e.type !== "keydown") return true;
     const key = e.key.toLowerCase();
@@ -83,5 +104,8 @@ export function wireClipboard(term: Terminal, el: HTMLElement): () => void {
     return true;
   });
 
-  return () => el.removeEventListener("paste", onPaste);
+  return () => {
+    el.removeEventListener("paste", onPaste);
+    el.removeEventListener("contextmenu", onContextMenu);
+  };
 }
