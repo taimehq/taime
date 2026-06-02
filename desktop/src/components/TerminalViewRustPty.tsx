@@ -69,7 +69,10 @@ export function TerminalViewRustPty({ sessionId, onConnectionChange }: Props) {
       scrollback: 10000,
       allowProposedApi: true,
       macOptionClickForcesSelection: true,
-      rightClickSelectsWord: true,
+      // Right-click is owned by wireClipboard (copy selection, else paste) — do
+      // NOT let xterm grab a word on right-click, or it would clobber the
+      // selection and turn every right-click into a copy instead of a paste.
+      rightClickSelectsWord: false,
       theme: THEME,
     });
     const fitAddon = new FitAddon();

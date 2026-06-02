@@ -62,7 +62,10 @@ export function TerminalView({
       // tracking on — Option-drag (macOS) or Shift-drag forces local selection,
       // so copy works in the CAO/tmux terminal too. Right-click selects a word.
       macOptionClickForcesSelection: true,
-      rightClickSelectsWord: true,
+      // Right-click is owned by wireClipboard (copy selection, else paste) — do
+      // NOT let xterm grab a word on right-click, or it would clobber the
+      // selection and turn every right-click into a copy instead of a paste.
+      rightClickSelectsWord: false,
       theme: THEME,
     });
 
