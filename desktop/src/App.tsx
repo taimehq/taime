@@ -72,7 +72,7 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col bg-ink-900 text-zinc-200">
-      <TitleBar backend={backend} cfg={cfg} onOpenGraph={() => setGraphOpen(true)} />
+      <TitleBar backend={backend} onOpenGraph={() => setGraphOpen(true)} />
       <div className="flex min-h-0 flex-1">
         <ControlColumn onLaunch={() => setLaunchOpen(true)} />
         <main className="min-h-0 flex-1 p-2">
@@ -92,26 +92,16 @@ export default function App() {
 
 function TitleBar({
   backend,
-  cfg,
   onOpenGraph,
 }: {
   backend: BackendState;
-  cfg: ResolvedConfig | null;
   onOpenGraph: () => void;
 }) {
   return (
-    <header className="titlebar-drag flex h-12 shrink-0 items-center justify-between border-b border-ink-600 bg-ink-800 px-4">
-      <div className="flex items-baseline gap-2.5">
-        <span className="text-sm font-semibold lowercase tracking-tight text-zinc-100">
-          taime
-        </span>
-        <span className="text-xs text-zinc-600">orchestrator</span>
-        {cfg && (
-          <span className="font-mono text-[10px] text-zinc-700">
-            {cfg.apiUrl}
-          </span>
-        )}
-      </div>
+    <header className="titlebar-drag flex h-12 shrink-0 items-center justify-between border-b border-ink-600 bg-ink-800 pl-[100px] pr-4">
+      <span className="text-[15px] font-semibold lowercase leading-none tracking-tight text-zinc-100">
+        taime
+      </span>
       <div className="flex items-center gap-3">
         <button
           onClick={onOpenGraph}

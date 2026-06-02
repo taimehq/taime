@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { X, Users, Bot } from "lucide-react";
 import { api, type ProviderInfo, type AgentProfileInfo } from "../api";
 import { useStore } from "../store";
-import { prettySession } from "../lib/sessionName";
+import { prettySessionText } from "../lib/sessionName";
 
 /** Canonical target providers, in display order, with friendly labels. */
 const TARGETS: Record<string, { name: string; vendor: string }> = {
@@ -213,7 +213,7 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
               <option value="">New session</option>
               {sessions.map((s) => (
                 <option key={s.name} value={s.name}>
-                  Add to {prettySession(s.name)}
+                  Add to {prettySessionText(s.name)}
                 </option>
               ))}
             </select>
