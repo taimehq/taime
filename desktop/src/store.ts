@@ -255,7 +255,12 @@ export const useStore = create<Store>((set, get) => ({
 
   refreshStatuses: async () => {
     const ids = get()
-      .frames.map((f) => f.terminalId)
+      // Rust-PTY frames carry a CAO terminalId only for the attribution surface
+      // (it's a provisioned worktree id, not a tmux terminal). Their lifecycle
+      // comes from ptyList via useRustPtyReconcile — polling CAO /terminals/{id}
+      // for them just 404s every tick. Skip them here.
+      .frames.filter((f) => !f.ptySessionId)
+      .map((f) => f.terminalId)
       .filter((x): x is string => !!x);
     if (ids.length === 0) return;
     await Promise.all(
