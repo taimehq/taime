@@ -142,6 +142,10 @@ pub async fn handle(stream: UnixStream, manager: Arc<Manager>, token: String) {
                     });
                 send(&out_tx, &ServerMsg::McpResponse { req_id, json: resp }).await;
             }
+            ClientMsg::GetGraph { req_id } => {
+                let json = manager.activity_graph_json();
+                send(&out_tx, &ServerMsg::Graph { req_id, json }).await;
+            }
             ClientMsg::List { req_id } => {
                 send(&out_tx, &ServerMsg::Sessions { req_id, sessions: manager.list() }).await
             }

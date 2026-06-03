@@ -111,6 +111,17 @@ fn default_agent_spec(
     }
 }
 
+/// The daemon-side activity graph (agents + inter-agent assign/handoff/message
+/// edges), read from the durable store (Phase 6). Complete even with the UI
+/// closed; the frontend route switch to this lands with the diff move.
+#[tauri::command]
+pub async fn daemon_activity_graph(
+    daemon: State<'_, DaemonClient>,
+) -> Result<serde_json::Value, String> {
+    let json = daemon.activity_graph().await?;
+    serde_json::from_str(&json).map_err(|e| format!("parse graph: {e}"))
+}
+
 /// Enqueue an inbox message for a live daemon agent (Phase 5 message bus) — the
 /// ops/app entry; the daemon delivers it into the receiver's stdin when idle.
 #[tauri::command]
