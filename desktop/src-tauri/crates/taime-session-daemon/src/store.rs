@@ -305,6 +305,47 @@ impl Store {
         Ok(())
     }
 
+    /// Agents for the activity graph: `(attribution_key, provider, status)` from
+    /// the recorded sessions (Phase 6). Sessions without an attribution key are
+    /// keyed by their pty id.
+    pub fn graph_agents(&self) -> rusqlite::Result<Vec<(String, Option<String>, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(attribution_key, pty_session_id), provider, status \
+             FROM daemon_sessions ORDER BY created_at_unix DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Inter-agent edges for the activity graph: `(kind, source, target)` from the
+    /// recorded send_message/handoff/assign events (Phase 6), oldest first.
+    pub fn activity_edges(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, terminal_id, target_terminal_id FROM taime_activity_events \
+             WHERE target_terminal_id IS NOT NULL ORDER BY ts ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The worktree path for an attribution key (for daemon-side diff, Phase 6).
+    #[allow(dead_code)] // consumed when the diff route moves daemon-side.
+    pub fn worktree_path(&self, terminal_key: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT worktree_path FROM taime_worktrees WHERE terminal_id = ?1",
+            rusqlite::params![terminal_key],
+            |r| r.get(0),
+        )
+        .optional()
+    }
+
     /// All recorded sessions, newest first (history / detached-panel backfill).
     #[allow(dead_code)] // consumed by the Phase-6 history/route layer.
     pub fn list_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {

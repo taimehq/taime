@@ -153,6 +153,23 @@ impl DaemonClient {
         }
     }
 
+    /// The daemon-side activity graph (agents + inter-agent edges) as a JSON
+    /// string. Connect-only: returns an empty graph (without spawning a daemon)
+    /// when none is running.
+    pub async fn activity_graph(&self) -> Result<String, String> {
+        let mut conn = match self.try_connect_handshake().await? {
+            Some(c) => c,
+            None => return Ok(r#"{"agents":[],"edges":[]}"#.to_string()),
+        };
+        let req_id = self.next_req();
+        send(&mut conn, &ClientMsg::GetGraph { req_id }).await?;
+        match read_server(&mut conn).await? {
+            ServerMsg::Graph { json, .. } => Ok(json),
+            ServerMsg::Error { message } => Err(message),
+            other => Err(format!("unexpected graph reply: {other:?}")),
+        }
+    }
+
     /// Enqueue an inbox message for a live agent (Phase 5 message bus). The
     /// daemon delivers it into the receiver's stdin when it next goes idle.
     /// Returns the monotonic inbox id.

@@ -99,6 +99,18 @@ export async function daemonProvisionWorktree(
   });
 }
 
+/** The daemon-side activity graph (Phase 6): agents + inter-agent edges
+ *  (assign/handoff/message), read from the durable store — complete even with the
+ *  UI closed. The frontend route switch to this lands with the diff move. */
+export interface DaemonActivityGraph {
+  agents: { id: string; provider: string | null; status: string | null }[];
+  edges: { kind: string; source: string; target: string }[];
+}
+
+export async function daemonActivityGraph(): Promise<DaemonActivityGraph> {
+  return invoke<DaemonActivityGraph>("daemon_activity_graph");
+}
+
 /** Enqueue an inbox message for a live daemon agent (Phase 5 message bus). The
  *  daemon delivers it into the receiver's stdin when it next goes idle. `receiver`
  *  is the agent's attribution id; returns the monotonic inbox id. */

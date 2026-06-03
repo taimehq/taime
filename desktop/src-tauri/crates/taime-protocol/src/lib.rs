@@ -42,9 +42,10 @@ pub const MAGIC: u32 = 0x7461_696d;
 /// v4: added `SendMessage`/`MessageQueued` (Phase 5 inbox message bus).
 /// v5: added `McpRequest`/`McpResponse` + `AgentSpawnSpec.inject_orchestration`
 ///     (Phase 5 daemon-hosted MCP transport).
+/// v6: added `GetGraph`/`Graph` (Phase 6 daemon-side activity graph).
 /// Postcard is positional, so these are wire-layout changes — a stale older
 /// daemon is rejected at handshake and the app falls back rather than misparsing.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Feature flags negotiated in the handshake (`capabilities` bitset). Reserving
 /// the bits now keeps app-update-while-old-daemon-running safe.
@@ -226,6 +227,9 @@ pub enum ClientMsg {
     /// caller's identity from it (authenticated `from`, not a client field) and
     /// dispatches `json` to the in-process MCP tool layer. Replies `McpResponse`.
     McpRequest { req_id: u64, token: String, json: String },
+    /// Fetch the daemon-side activity graph (agents + inter-agent edges) as JSON
+    /// (Phase 6). Read from the durable store, so it's complete even UI-closed.
+    GetGraph { req_id: u64 },
     /// Enumerate sessions. `req_id` correlates the `Sessions` reply.
     List { req_id: u64 },
     /// Bind THIS connection to stream `session_id`'s output. Carries the client's
@@ -288,6 +292,9 @@ pub enum ServerMsg {
     MessageQueued { req_id: u64, id: i64 },
     /// Reply to `McpRequest`: the MCP JSON-RPC response (empty for a notification).
     McpResponse { req_id: u64, json: String },
+    /// Reply to `GetGraph`: the activity graph as a JSON string
+    /// (`{agents:[…], edges:[…]}`).
+    Graph { req_id: u64, json: String },
     /// Handoff step 2: the grid is snapshotted at `seq_n`. A `T_REPAINT` frame
     /// (carrying the same `seq_n`) follows immediately, then `T_DATA` frames with
     /// `start_offset >= seq_n`.

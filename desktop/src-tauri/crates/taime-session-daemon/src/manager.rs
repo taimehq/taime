@@ -274,6 +274,28 @@ impl Manager {
         }
     }
 
+    /// The activity graph as JSON (Phase 6): agents (from the recorded sessions)
+    /// + inter-agent edges (the send_message/handoff/assign events). Read from the
+    /// durable store, so it reflects the full history even with the UI closed.
+    pub fn activity_graph_json(&self) -> String {
+        let Some(store) = &self.store else {
+            return r#"{"agents":[],"edges":[]}"#.to_string();
+        };
+        let agents: Vec<serde_json::Value> = store
+            .graph_agents()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, provider, status)| serde_json::json!({ "id": id, "provider": provider, "status": status }))
+            .collect();
+        let edges: Vec<serde_json::Value> = store
+            .activity_edges()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(kind, source, target)| serde_json::json!({ "kind": kind, "source": source, "target": target }))
+            .collect();
+        serde_json::json!({ "agents": agents, "edges": edges }).to_string()
+    }
+
     /// Broadcast a message to every live agent except the sender. Returns the
     /// count enqueued.
     pub fn broadcast(&self, sender: &str, body: &str) -> usize {
@@ -460,5 +482,32 @@ mod tests {
         // The frame is visually distinguishable from agent output.
         assert!(out.contains("--- MESSAGE FROM term-a ---"));
         assert!(out.contains("--- END MESSAGE ---"));
+    }
+
+    #[test]
+    fn activity_graph_includes_agents_and_edges() {
+        let store = crate::store::Store::open_at(std::path::Path::new(":memory:")).unwrap();
+        store
+            .record_session(&SessionRow {
+                pty_session_id: "pty-0".into(),
+                provider: Some("claude_code".into()),
+                attribution_key: Some("a".into()),
+                cwd: None,
+                program: "claude".into(),
+                created_at_unix: 1,
+                status: "running".into(),
+            })
+            .unwrap();
+        store.record_activity_edge("e1", "assign", "a", "b", 2).unwrap();
+
+        let mgr = Manager::for_test(Some(store));
+        let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json()).unwrap();
+        assert_eq!(v["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(v["agents"][0]["id"], "a");
+        assert_eq!(v["agents"][0]["provider"], "claude_code");
+        assert_eq!(v["edges"].as_array().unwrap().len(), 1);
+        assert_eq!(v["edges"][0]["kind"], "assign");
+        assert_eq!(v["edges"][0]["source"], "a");
+        assert_eq!(v["edges"][0]["target"], "b");
     }
 }
