@@ -153,11 +153,41 @@ straddling frame: `bytes[(seq_n - start)..]`. This is the half-open form of the 
   replay, boundary-trim, backpressure) + `tsc` + frontend build. ✅
 - **Step 1:** `docs/spikes/step1-dtach-survival.sh` proves master-outside-app
   survival. ✅ (superseded by Step 2's daemon).
-- **Step 2:** protocol (6 tests) + daemon (15 unit) + a **headless end-to-end
+- **Step 2:** protocol (6 tests) + daemon (17 unit) + a **headless end-to-end
   integration test over a real Unix socket** (2 tests: full lifecycle
-  handshake→spawn→attach handoff→I/O echo→list→kill→exit, and bad-token reject).
-  ✅ The app↔daemon bridge is the same protocol the integration test exercises;
-  the only unverified seam is the GUI (needs interactive `tauri dev`).
+  handshake→spawn→**resize-on-attach**→I/O echo→list→kill→exit, and bad-token
+  reject). ✅ The app↔daemon bridge is the same protocol the integration test
+  exercises; the only unverified seam is the GUI (needs interactive `tauri dev`).
+
+## Post-review closing actions (addressed)
+
+- **Resize-first handoff:** `Attach` now carries the client's `rows`/`cols`; the
+  daemon resizes the PTY + emulator **before** snapshotting, so the grid repaint
+  reflects the real viewport, not the spawn-time 24×80 (handoff step 1). The
+  frontend fits xterm one layout frame before attaching. Integration test attaches
+  at 30×100 over a 24×80 spawn and asserts `AttachOk` reflects 30×100.
+- **Crash-relaunch auto-adopt:** `daemonList()` is **connect-only** (never spawns
+  a daemon) and now returns full `SessionSummary`. `useRustPtyReconcile` enumerates
+  on boot and calls `adoptDaemonSession` for each survivor, so agents that outlived
+  an app crash appear in the detached-agents panel and reopen on the daemon
+  transport — no user action. `kill` is likewise connect-only (won't boot a daemon
+  to kill an already-gone session).
+- **App-driven attribution checkpoint:** the frontend fires `daemon_checkpoint`
+  ("submit") on Enter for daemon frames — the plan's strongest, spoof-proof
+  boundary signal (alt-screen TUIs like `claude` emit no OSC 133). The daemon
+  guards empty turns, so spurious Enters are harmless.
+
+## Remaining follow-ons (substrate complete, loop not yet closed)
+
+- **fs_watch ↔ turn correlation:** the daemon emits `TurnInfo` with empty
+  `fs_dirty_paths` by design (the app owns `fs_watch`); correlating dirty events to
+  turns by time window and surfacing them in the activity graph is the remaining
+  attribution-UI work. Turn events already land in the store (`frameTurns`).
+- **Production rollout / packaging:** the daemon launch is intentionally
+  `import.meta.env.DEV`-gated while it matures toward CAO parity (per the plan's
+  per-CLI retirement), and bundling is deferred (see "Build, run & packaging" —
+  declaring the release daemon as a `bundle.resource` breaks `cargo build` until
+  it's built, and a real `tauri build` + signing run is needed to validate).
 
 ## Compile-time-verify items (flagged low-confidence in research)
 
