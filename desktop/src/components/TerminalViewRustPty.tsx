@@ -3,15 +3,9 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { SearchAddon } from "@xterm/addon-search";
+import type { Channel } from "@tauri-apps/api/core";
 import "@xterm/xterm/css/xterm.css";
-import {
-  ptyWrite,
-  ptyResize,
-  ptyReattachView,
-  ptyCloseView,
-  onPtyData,
-  onPtyExit,
-} from "../pty";
+import { transportFor, type PtyBackend } from "../pty";
 import { wireClipboard } from "../lib/terminalClipboard";
 import { registerTerminalInput } from "../lib/terminalInput";
 import { makeModelSniffer } from "../lib/parseModel";
@@ -23,6 +17,8 @@ interface Props {
   sessionId: string;
   /** Frame id — used to attribute the parsed model back to this frame. */
   frameKey: string;
+  /** Which backend owns the PTY: the in-app manager or the detached daemon. */
+  backend?: PtyBackend;
   onConnectionChange?: (state: "open" | "closed") => void;
 }
 
@@ -45,17 +41,21 @@ const THEME = {
 
 /**
  * Terminal view for the Rust-owned PTY transport (Claude path). Same xterm UX
- * as the CAO `TerminalView`; only the transport differs — Tauri events in,
- * `pty_write`/`pty_resize` out.
+ * as the CAO `TerminalView`; only the transport differs — raw bytes in over a
+ * binary `Channel`, `pty_write`/`pty_resize` out.
  *
- * Mount protocol (no gap, no duplicate): subscribe FIRST while the session is
- * detached, THEN reattach — which atomically attaches + returns the scrollback
- * to replay; live output flows after. Unmount = `close_view` (the agent keeps
+ * Mount protocol (no gap, no duplicate): `pty_attach` atomically registers the
+ * channel sink + replays the (boundary-bounded) scrollback as the first message
+ * under the same lock the reader emits under; live output flows after. The
+ * channel ref is held for the view's lifetime (GC of it would silently stop
+ * output). Each processed chunk advances a byte counter that is acked back
+ * (batched per frame) for backpressure. Unmount = `close_view` (the agent keeps
  * running); explicit kill is separate.
  */
 export function TerminalViewRustPty({
   sessionId,
   frameKey,
+  backend = "inapp",
   onConnectionChange,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -64,6 +64,8 @@ export function TerminalViewRustPty({
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const applyResizeRef = useRef<() => void>(() => {});
+  // Held so the channel's onmessage isn't GC'd while the view is mounted.
+  const channelRef = useRef<Channel<unknown> | null>(null);
   const fontSize = useStore((s) => s.terminalFontSize);
   const {
     searchRef,
@@ -78,12 +80,28 @@ export function TerminalViewRustPty({
     const el = containerRef.current;
     if (!el) return;
 
+    // Bind to the in-app PTY manager or the detached daemon, transparently.
+    const tx = transportFor(backend);
+
     let alive = true;
-    let unlistenData: (() => void) | undefined;
-    let unlistenExit: (() => void) | undefined;
     let resizeObserver: ResizeObserver | null = null;
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     let rafId = 0;
+    // Backpressure (Step 0b): track bytes xterm has *processed* (write-callback)
+    // and ack the high-water offset back to Rust, batched once per frame.
+    let processedBytes = 0;
+    let ackedBytes = 0;
+    let ackScheduled = false;
+    const scheduleAck = () => {
+      if (ackScheduled || !alive) return;
+      ackScheduled = true;
+      requestAnimationFrame(() => {
+        ackScheduled = false;
+        if (!alive || processedBytes === ackedBytes) return;
+        ackedBytes = processedBytes;
+        tx.ack(sessionId, ackedBytes);
+      });
+    };
 
     const term = new Terminal({
       cursorBlink: true,
@@ -106,7 +124,7 @@ export function TerminalViewRustPty({
     term.open(el);
     termRef.current = term;
     fitRef.current = fitAddon;
-    applyResizeRef.current = () => ptyResize(sessionId, term.rows, term.cols);
+    applyResizeRef.current = () => tx.resize(sessionId, term.rows, term.cols);
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => webgl.dispose());
@@ -141,18 +159,18 @@ export function TerminalViewRustPty({
 
     // Register an input writer so dropped file/screenshot paths can be typed in.
     const unregisterInput = registerTerminalInput(sessionId, (text) => {
-      ptyWrite(sessionId, text);
+      tx.write(sessionId, text);
     });
 
     term.onData((data) => {
-      ptyWrite(sessionId, data);
+      tx.write(sessionId, data);
     });
 
     resizeObserver = new ResizeObserver(() => {
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
         safeFit();
-        ptyResize(sessionId, term.rows, term.cols);
+        tx.resize(sessionId, term.rows, term.cols);
       }, 50);
     });
     resizeObserver.observe(el);
@@ -160,27 +178,41 @@ export function TerminalViewRustPty({
     term.focus();
 
     (async () => {
-      // Subscribe first (session is detached → no events yet, so no dup).
-      unlistenData = await onPtyData(sessionId, (bytes) => {
-        if (alive) {
-          term.write(bytes);
+      // Attach: registers the channel sink + replays scrollback as the first
+      // message, then streams live output — all under one lock (no gap/dup).
+      const ch = await tx.attach(
+        sessionId,
+        (bytes) => {
+          if (!alive) return;
+          // Ack on the write-callback (chunk parsed/processed by xterm), which is
+          // the true in-flight measure — not "delivered to the channel".
+          term.write(bytes, () => {
+            processedBytes += bytes.length;
+            scheduleAck();
+          });
           sniffModel(bytes);
-        }
-      });
-      unlistenExit = await onPtyExit(sessionId, () => {
-        if (alive) term.write("\r\n\x1b[33m[process exited]\x1b[0m\r\n");
-        // Reflect lifecycle: the agent's process is gone (running → exited).
-        useStore.getState().markRustPtyExited(sessionId);
-        onConnectionChange?.("closed");
-      });
-      // Reattach: atomically attaches + returns scrollback to replay.
-      const replay = await ptyReattachView(sessionId);
-      if (!alive) return;
-      if (replay.length) term.write(replay);
+        },
+        () => {
+          if (alive) term.write("\r\n\x1b[33m[process exited]\x1b[0m\r\n");
+          // Reflect lifecycle: the agent's process is gone (running → exited).
+          useStore.getState().markRustPtyExited(sessionId);
+          onConnectionChange?.("closed");
+        },
+        // Attribution turn boundaries (daemon transport only) → store.
+        (turn) => useStore.getState().recordTurn(frameKey, turn),
+      );
+      if (!alive) {
+        // Unmounted while the attach was in flight: detach so we don't leave a
+        // phantom attachment with no acker (which would stall the agent at the
+        // backpressure watermark).
+        tx.closeView(sessionId);
+        return;
+      }
+      channelRef.current = ch as Channel<unknown> | null;
       onConnectionChange?.("open");
       // Nudge a redraw so a reattached TUI repaints cleanly at the current size.
       safeFit();
-      ptyResize(sessionId, term.rows, term.cols);
+      tx.resize(sessionId, term.rows, term.cols);
     })();
 
     return () => {
@@ -190,17 +222,17 @@ export function TerminalViewRustPty({
       resizeObserver?.disconnect();
       cleanupClipboard();
       unregisterInput();
-      unlistenData?.();
-      unlistenExit?.();
+      // Drop the channel ref (its onmessage stops); detach keeps the agent alive.
+      channelRef.current = null;
       // Closing the view detaches — it does NOT kill the agent.
-      ptyCloseView(sessionId);
+      tx.closeView(sessionId);
       offResults.dispose();
       searchRef.current = null;
       termRef.current = null;
       fitRef.current = null;
       term.dispose();
     };
-  }, [sessionId, frameKey, onConnectionChange]);
+  }, [sessionId, frameKey, backend, onConnectionChange]);
 
   // Apply font-zoom (Cmd ±/0) to the live terminal without recreating it.
   useEffect(() => {

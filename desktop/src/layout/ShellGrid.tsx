@@ -1,4 +1,4 @@
-import { useStore, type Frame } from "../store";
+import { useStore, isRustPtyTransport, type Frame } from "../store";
 import { TerminalView } from "../components/TerminalView";
 import { TerminalViewRustPty } from "../components/TerminalViewRustPty";
 import { StatusBadge, statusDotClass } from "../components/StatusBadge";
@@ -177,7 +177,7 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
     frame.terminalId ? s.dirty[frame.terminalId] : undefined,
   );
 
-  const isRustPty = frame.transport === "rust_pty" && !!frame.ptySessionId;
+  const isRustPty = isRustPtyTransport(frame.transport) && !!frame.ptySessionId;
 
   // Watch this terminal's working dir while the frame is mounted (CAO path).
   useFsWatch(frame.terminalId);
@@ -289,7 +289,11 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
 
       <div className="min-h-0 flex-1">
         {isRustPty ? (
-          <TerminalViewRustPty sessionId={frame.ptySessionId!} frameKey={frame.key} />
+          <TerminalViewRustPty
+            sessionId={frame.ptySessionId!}
+            frameKey={frame.key}
+            backend={frame.transport === "daemon" ? "daemon" : "inapp"}
+          />
         ) : frame.pending || !frame.terminalId ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-zinc-500">
             <Loader2 size={20} className="animate-spin text-teal-400" />

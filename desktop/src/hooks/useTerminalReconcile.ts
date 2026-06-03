@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { api } from "../api";
-import { useStore } from "../store";
+import { useStore, isRustPtyTransport } from "../store";
 
 /** How often to reconcile a session's terminal list against the open frames. */
 const RECONCILE_INTERVAL = 10000;
@@ -58,7 +58,7 @@ export function useTerminalReconcile() {
         state.frames
           .filter(
             (f) =>
-              f.transport !== "rust_pty" &&
+              !isRustPtyTransport(f.transport) &&
               !f.pending &&
               !!f.terminalId &&
               !!f.sessionName &&
