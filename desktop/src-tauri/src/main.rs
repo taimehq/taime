@@ -6,12 +6,10 @@ mod commands;
 mod config;
 mod daemon;
 mod fs_watch;
-mod pty;
 
 use backend::SupervisorHandle;
 use daemon::DaemonClient;
 use fs_watch::FsWatchState;
-use pty::PtyManager;
 use tauri::{Manager, RunEvent};
 
 /// Shared application state managed by Tauri.
@@ -22,7 +20,6 @@ pub struct AppStateHandle {
 #[cfg(unix)]
 mod signals {
     use crate::backend::SupervisorHandle;
-    use crate::pty::PtyManager;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -34,17 +31,16 @@ mod signals {
     }
 
     /// Install SIGTERM/SIGINT handlers + a watcher thread that performs the
-    /// (non-signal-safe) graceful child shutdown and exits. This makes
-    /// `kill`/Ctrl-C clean up the managed backend AND any Rust-owned PTYs, not
-    /// just window-close.
-    pub fn install(supervisor: SupervisorHandle, pty: PtyManager) {
+    /// (non-signal-safe) graceful managed-backend shutdown and exits, so
+    /// `kill`/Ctrl-C cleans up the CAO backend, not just window-close. The
+    /// session daemon is detached on purpose and is NOT shut down here.
+    pub fn install(supervisor: SupervisorHandle) {
         unsafe {
             libc::signal(libc::SIGTERM, handle as libc::sighandler_t);
             libc::signal(libc::SIGINT, handle as libc::sighandler_t);
         }
         std::thread::spawn(move || loop {
             if SIGNALLED.load(Ordering::SeqCst) {
-                pty.shutdown_all();
                 supervisor.shutdown();
                 std::process::exit(0);
             }
@@ -72,19 +68,13 @@ fn main() {
         .setup(move |app| {
             let supervisor = backend::start(&app.handle(), resolved.clone());
 
-            // Rust-owned PTY manager. Output is delivered as raw bytes through a
-            // per-session binary `Channel` registered by `pty_attach` (no base64,
-            // no global event) — see commands.rs.
-            let pty = PtyManager::new();
-
             #[cfg(unix)]
-            signals::install(supervisor.clone(), pty.clone());
+            signals::install(supervisor.clone());
             app.manage(AppStateHandle { supervisor });
             app.manage(FsWatchState::new());
-            app.manage(pty);
-            // App-side client to the detached session daemon (Step 2). Resolved
-            // next to the app exe (dev) or in Resources (bundle); spawned lazily
-            // on first daemon-backed launch.
+            // App-side client to the detached session daemon — the one Rust PTY
+            // path for Claude. Resolved next to the app exe (dev) or in Resources
+            // (bundle); the daemon is spawned lazily on first launch.
             app.manage(DaemonClient::new(daemon::resolve_daemon_bin()));
             Ok(())
         })
@@ -95,14 +85,6 @@ fn main() {
             commands::watch_terminal,
             commands::unwatch_terminal,
             commands::clear_dirty,
-            commands::pty_spawn_claude,
-            commands::pty_write,
-            commands::pty_resize,
-            commands::pty_close_view,
-            commands::pty_attach,
-            commands::pty_ack,
-            commands::pty_kill,
-            commands::pty_list,
             commands::daemon_spawn_claude,
             commands::daemon_attach,
             commands::daemon_write,
@@ -112,16 +94,15 @@ fn main() {
             commands::daemon_close_view,
             commands::daemon_kill,
             commands::daemon_list,
+            commands::daemon_available,
             commands::set_clipboard_image_from_path
         ])
         .build(tauri::generate_context!())
         .expect("error while building Taime")
         .run(|app_handle, event| {
-            // On exit, kill Rust-owned PTYs and stop the managed backend child.
+            // On exit, stop the managed CAO backend child. The session daemon is
+            // detached on purpose (it must outlive the app), so it is NOT killed.
             if let RunEvent::ExitRequested { .. } = event {
-                if let Some(pty) = app_handle.try_state::<PtyManager>() {
-                    pty.shutdown_all();
-                }
                 if let Some(state) = app_handle.try_state::<AppStateHandle>() {
                     state.supervisor.shutdown();
                 }

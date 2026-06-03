@@ -1,14 +1,11 @@
 //! Tauri IPC commands — the Rust↔React bridge.
 
-use std::sync::Arc;
-
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, State};
 
 use crate::backend::BackendState;
 use crate::config::ResolvedConfig;
 use crate::fs_watch::FsWatchState;
-use crate::pty::{PtyEvent, PtyManager, SessionInfo, SessionSink};
 use crate::AppStateHandle;
 
 /// Frontend calls this on boot to discover where the backend lives.
@@ -58,12 +55,16 @@ pub fn clear_dirty(fs: State<'_, FsWatchState>, terminal_id: String) {
 }
 
 // ---------------------------------------------------------------------------
-// Rust-owned PTY (Claude path). Output streams as RAW BYTES over a per-session
-// binary `Channel<InvokeResponseBody>` (no base64, no JSON number-arrays): data
-// chunks arrive as `InvokeResponseBody::Raw` (ArrayBuffer on the JS side); a
-// process-exit notice arrives as a small `InvokeResponseBody::Json` control
-// object on the same ordered channel. CAO/tmux remains the default + fallback.
+// Claude terminal transport: the detached `taime-session-daemon` (the ONE Rust
+// PTY path). The daemon owns the PTY + an authoritative wezterm-term grid and
+// survives app crashes; output streams as RAW BYTES over a per-session binary
+// `Channel<InvokeResponseBody>` (no base64). The app's `DaemonClient` bridges the
+// socket to the per-session channel. CAO/tmux remains for the other CLIs and as
+// the launch-failure fallback for Claude until the daemon ships bundled.
 // ---------------------------------------------------------------------------
+
+use crate::daemon::DaemonClient;
+use taime_protocol::{SessionSummary, SpawnSpec};
 
 /// Resolve the claude binary: prefer the known install, else rely on PATH.
 fn claude_binary() -> String {
@@ -76,118 +77,11 @@ fn claude_binary() -> String {
     "claude".to_string()
 }
 
-#[tauri::command]
-pub fn pty_spawn_claude(
-    pty: State<'_, PtyManager>,
-    cwd: Option<String>,
-    rows: Option<u16>,
-    cols: Option<u16>,
-    permission_mode: Option<String>,
-) -> Result<String, String> {
-    // Permission mode mirrors CAO's _build_claude_command: a caller-supplied
-    // `--permission-mode <mode>` (e.g. "default", "acceptEdits", "plan") when
-    // given, else the bypass default ("bypass permissions on" — no per-tool
-    // prompts) that the rest of Taime/CAO uses for unattended orchestration.
-    // SECURITY: bypass runs tools without prompts; it's the deliberate model
-    // for driving real CLIs in the user's workspace, and is overridable here
-    // rather than hardcoded. The recurring "Yes, I accept" dialog is suppressed
-    // by skipDangerousModePermissionPrompt in ~/.claude/settings.json (written
-    // by CAO; not touched here, so the user can still revoke bypass there).
-    let args: Vec<String> = match permission_mode {
-        Some(mode) if !mode.is_empty() => vec!["--permission-mode".to_string(), mode],
-        _ => vec!["--dangerously-skip-permissions".to_string()],
-    };
-    pty.spawn(
-        &claude_binary(),
-        &args,
-        cwd.as_deref(),
-        &[],
-        rows.unwrap_or(24),
-        cols.unwrap_or(80),
-    )
-}
-
-#[tauri::command]
-pub fn pty_write(
-    pty: State<'_, PtyManager>,
-    session_id: String,
-    data: String,
-) -> Result<(), String> {
-    pty.write_input(&session_id, data.as_bytes())
-}
-
-#[tauri::command]
-pub fn pty_resize(
-    pty: State<'_, PtyManager>,
-    session_id: String,
-    rows: u16,
-    cols: u16,
-) -> Result<(), String> {
-    pty.resize(&session_id, rows, cols)
-}
-
-/// Detach the view (does NOT kill the process).
-#[tauri::command]
-pub fn pty_close_view(pty: State<'_, PtyManager>, session_id: String) {
-    pty.close_view(&session_id);
-}
-
-/// Attach a view to a session. `on_data` is a per-session binary channel: the
-/// retained scrollback replays as the first `Raw` message, then live output
-/// streams as `Raw` chunks; a process exit arrives as a `Json` control object
-/// `{ "type": "exit", "code": <i32|null> }` on the same channel. Using
-/// `Channel<InvokeResponseBody>` + `Raw` is what forces the efficient ArrayBuffer
-/// path — a `Channel<&[u8]>`/`Channel<Vec<u8>>` would serialize to a JSON
-/// number-array instead. `send` errors (webview gone) detach the session.
-#[tauri::command]
-pub fn pty_attach(
-    pty: State<'_, PtyManager>,
-    session_id: String,
-    on_data: Channel<InvokeResponseBody>,
-) -> Result<(), String> {
-    let sink: SessionSink = Arc::new(move |ev| match ev {
-        PtyEvent::Data(bytes) => {
-            let _ = on_data.send(InvokeResponseBody::Raw(bytes));
-        }
-        PtyEvent::Exit(code) => {
-            let payload = serde_json::json!({ "type": "exit", "code": code }).to_string();
-            let _ = on_data.send(InvokeResponseBody::Json(payload));
-        }
-    });
-    pty.attach(&session_id, sink)
-}
-
-/// Backpressure ack: the highest byte offset the client has *processed* (xterm's
-/// `write(data, cb)` callback fired), batched ~once per frame on the JS side.
-/// The manager pauses reading the PTY master when sent−acked exceeds the high
-/// watermark, resuming below the low watermark.
-#[tauri::command]
-pub fn pty_ack(pty: State<'_, PtyManager>, session_id: String, offset: u64) {
-    pty.ack(&session_id, offset);
-}
-
-/// Explicitly terminate the process.
-#[tauri::command]
-pub fn pty_kill(pty: State<'_, PtyManager>, session_id: String) {
-    pty.kill_session(&session_id);
-}
-
-#[tauri::command]
-pub fn pty_list(pty: State<'_, PtyManager>) -> Vec<SessionInfo> {
-    pty.list_sessions()
-}
-
-// ---------------------------------------------------------------------------
-// Session daemon (Step 2). Same binary `Channel` transport as the in-app path,
-// but the bytes originate in the detached `taime-session-daemon` (which owns the
-// PTY + an authoritative wezterm-term grid and survives app crashes). The app's
-// `DaemonClient` bridges the socket to the per-session channel.
-// ---------------------------------------------------------------------------
-
-use crate::daemon::DaemonClient;
-use taime_protocol::{SessionSummary, SpawnSpec};
-
-/// Claude argv, shared with the in-app path (see `pty_spawn_claude`).
+/// Permission mode mirrors CAO's `_build_claude_command`: a caller-supplied
+/// `--permission-mode <mode>` when given, else the bypass default ("bypass
+/// permissions on" — no per-tool prompts) that Taime/CAO uses for unattended
+/// orchestration. SECURITY: bypass runs tools without prompts; it's the
+/// deliberate model for driving real CLIs in the workspace, overridable here.
 fn claude_args(permission_mode: Option<String>) -> Vec<String> {
     match permission_mode {
         Some(mode) if !mode.is_empty() => vec!["--permission-mode".to_string(), mode],
@@ -285,6 +179,15 @@ pub async fn daemon_kill(daemon: State<'_, DaemonClient>, session_id: String) ->
 #[tauri::command]
 pub async fn daemon_list(daemon: State<'_, DaemonClient>) -> Result<Vec<SessionSummary>, String> {
     daemon.list().await
+}
+
+/// Whether the daemon transport is usable: the daemon binary is resolvable
+/// (so we can spawn it) or one is already running. The frontend uses this to
+/// route Claude through the daemon when available, falling back to CAO when not
+/// (e.g. an unbundled build) — so Claude launches never hard-fail.
+#[tauri::command]
+pub async fn daemon_available(daemon: State<'_, DaemonClient>) -> Result<bool, String> {
+    Ok(daemon.available().await)
 }
 
 /// Load an image FILE into the macOS system clipboard (as image data), so a
