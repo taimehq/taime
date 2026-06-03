@@ -177,6 +177,21 @@ straddling frame: `bytes[(seq_n - start)..]`. This is the half-open form of the 
   boundary signal (alt-screen TUIs like `claude` emit no OSC 133). The daemon
   guards empty turns, so spurious Enters are harmless.
 
+## Transport consolidation (one Rust PTY path)
+
+The interim **in-app `PtyManager`** (`src-tauri/src/pty.rs`, Step 0a/0b) has been
+**removed**. It was a stepping stone — own the PTY in-process, kill base64 — that
+the daemon strictly supersedes (same binary `Channel` transport, plus crash
+survival + the authoritative grid). There is now exactly one Rust PTY path: the
+detached daemon. `portable-pty` is no longer an app-crate dependency (only the
+daemon uses it).
+
+Launch routing: the single "Launch agent" dialog routes **Claude → daemon** when
+`daemon_available()` (binary resolvable or already running), **falling back to
+CAO** on failure / unbundled builds; the other CLIs always use CAO. The two
+dev-only "Rust PTY"/"Daemon" buttons are gone. So Claude defaults to the Rust
+daemon with no separate entry point, and never hard-fails.
+
 ## Remaining follow-ons (substrate complete, loop not yet closed)
 
 - **fs_watch ↔ turn correlation:** the daemon emits `TurnInfo` with empty
