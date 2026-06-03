@@ -15,6 +15,18 @@ export function useRustPtyReconcile() {
     if (!inTauri()) return;
     let alive = true;
 
+    // Boot adoption (crash recovery): enumerate the daemon's surviving sessions
+    // and populate the registry so they appear in the detached-agents panel and
+    // can be reopened with the daemon transport — no user action needed. Runs
+    // regardless of the (initially empty) store; daemonList() returns [] without
+    // spawning a daemon when none is running.
+    (async () => {
+      const sessions = await daemonList();
+      if (!alive) return;
+      const adopt = useStore.getState().adoptDaemonSession;
+      for (const s of sessions) adopt(s);
+    })();
+
     const tick = async () => {
       const meta = useStore.getState().rustPtySessions;
       const ids = Object.keys(meta);

@@ -32,6 +32,7 @@ import {
   daemonKill,
   daemonCloseView,
   type TurnEvent,
+  type DaemonSessionSummary,
 } from "./pty";
 
 /** Which transport carries a frame's terminal I/O.
@@ -229,6 +230,9 @@ interface Store {
   reopenRustPty: (ptySessionId: string) => void;
   /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
   markRustPtyExited: (ptySessionId: string) => void;
+  /** Adopt a daemon session discovered at boot (crash survival): populate the
+   *  registry so it appears in the detached panel and can be reopened. */
+  adoptDaemonSession: (summary: DaemonSessionSummary) => void;
   /** Record a daemon-emitted attribution turn boundary against a frame. */
   recordTurn: (frameKey: string, turn: TurnEvent) => void;
   /** Explicitly terminate a Rust-PTY agent (distinct from closing its frame). */
@@ -727,6 +731,23 @@ export const useStore = create<Store>((set, get) => ({
           [ptySessionId]: { ...m, status: "exited" },
         },
       };
+    }),
+
+  adoptDaemonSession: (summary) =>
+    set((s) => {
+      // Don't clobber a session we already track (this run or a prior adopt).
+      if (s.rustPtySessions[summary.id]) return s;
+      const meta: RustPtyMeta = {
+        ptySessionId: summary.id,
+        terminalId: summary.attribution_key ?? "",
+        provider: "claude_code",
+        branch: null,
+        cwd: summary.cwd || null,
+        startedAt: summary.created_at_unix ? summary.created_at_unix * 1000 : Date.now(),
+        status: summary.alive ? "running" : "exited",
+        transport: "daemon",
+      };
+      return { rustPtySessions: { ...s.rustPtySessions, [summary.id]: meta } };
     }),
 
   recordTurn: (frameKey, turn) =>

@@ -164,6 +164,9 @@ export function TerminalViewRustPty({
 
     term.onData((data) => {
       tx.write(sessionId, data);
+      // Strongest attribution signal: the user submitted a command (Enter). The
+      // daemon coalesces/guards empty turns, so spurious Enters are harmless.
+      if (data.includes("\r")) tx.checkpoint?.(sessionId, "submit");
     });
 
     resizeObserver = new ResizeObserver(() => {
@@ -178,10 +181,18 @@ export function TerminalViewRustPty({
     term.focus();
 
     (async () => {
-      // Attach: registers the channel sink + replays scrollback as the first
-      // message, then streams live output — all under one lock (no gap/dup).
+      // Resize FIRST (handoff step 1): let one layout frame settle, fit xterm to
+      // the container, then attach with the REAL viewport size so the daemon's
+      // grid repaint matches it (not the spawn-time 24x80).
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      if (!alive) return;
+      safeFit();
+      // Attach: registers the channel sink + replays scrollback (in-app) or sends
+      // the grid repaint at the attach size (daemon), then streams live output.
       const ch = await tx.attach(
         sessionId,
+        term.rows,
+        term.cols,
         (bytes) => {
           if (!alive) return;
           // Ack on the write-callback (chunk parsed/processed by xterm), which is
