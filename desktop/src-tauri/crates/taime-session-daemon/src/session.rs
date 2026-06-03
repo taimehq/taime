@@ -400,6 +400,16 @@ impl Session {
         self.inner.attribution_key.clone()
     }
 
+    /// The provider id (`assign` inherits the parent's provider for its worker).
+    pub fn provider(&self) -> Option<String> {
+        self.inner.provider.clone()
+    }
+
+    /// The session's working directory (the worktree root `assign` forks from).
+    pub fn cwd(&self) -> String {
+        self.inner.cwd.clone()
+    }
+
     pub fn summary(&self) -> SessionSummary {
         let st = self.inner.state.lock().unwrap();
         // A dead session reports no live status so the app's exit handling

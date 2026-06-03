@@ -130,6 +130,18 @@ pub async fn handle(stream: UnixStream, manager: Arc<Manager>, token: String) {
                     Err(e) => send(&out_tx, &ServerMsg::Error { message: e }).await,
                 }
             }
+            ClientMsg::McpRequest { req_id, token, json } => {
+                // assign() shells out to git (worktree) — keep it off the async
+                // worker. The dispatcher authenticates the caller from `token`.
+                let mgr = manager.clone();
+                let resp = tokio::task::spawn_blocking(move || mgr.handle_mcp(&token, &json))
+                    .await
+                    .unwrap_or_else(|_| {
+                        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal error"}}"#
+                            .to_string()
+                    });
+                send(&out_tx, &ServerMsg::McpResponse { req_id, json: resp }).await;
+            }
             ClientMsg::List { req_id } => {
                 send(&out_tx, &ServerMsg::Sessions { req_id, sessions: manager.list() }).await
             }

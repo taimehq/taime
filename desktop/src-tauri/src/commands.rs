@@ -105,6 +105,9 @@ fn default_agent_spec(
         attribution_key,
         seed_prompt: None,
         env: vec![],
+        // Plain interactive agents don't get the orchestration tools (matches
+        // CAO); a supervisor launch would set this true.
+        inject_orchestration: false,
     }
 }
 
