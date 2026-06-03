@@ -1,6 +1,12 @@
 # Taime Terminal Architecture — Plan of Record
 
-**Status:** agreed direction; not yet started.
+**Status:** implemented on branch `taime/terminal-daemon-architecture` (Steps 0a,
+0b, 1, and 2; Step 2.5 SCM_RIGHTS reserved-not-built; Step 3 renderer deferred per
+plan). See [`terminal-daemon-implementation-notes.md`](./terminal-daemon-implementation-notes.md)
+for the research-backed implementation decisions, the **one deviation** (control
+messages use **postcard**, not bincode — bincode 3.0 is a non-compiling stub and
+all versions are RUSTSEC-flagged; the serde message shapes are unchanged), the
+half-open `seq_n` offset convention, and the verification status.
 **Revision (2026-06-02):** incorporated architecture review — handoff protocol,
 backpressure, daemon lifecycle/security, scoped reattach claim, OSC-as-one-signal.
 **Revision 2 (2026-06-02):** operational hardening — protocol versioning + daemon
