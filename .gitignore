@@ -29,4 +29,7 @@ desktop/src-tauri/target/
 loop-*.png
 ws-*.png
 taime-*.png
-desktop/src-tauri/binaries/
+# Daemon staging dir: ignore the staged binary, keep the dir (.gitkeep) so the
+# tauri-build resource check passes for bare `cargo build`.
+desktop/src-tauri/binaries/*
+!desktop/src-tauri/binaries/.gitkeep
