@@ -20,7 +20,7 @@ use futures::{SinkExt, StreamExt};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use taime_protocol::{
     cap, decode_server, encode_client, parse_frame, paths, AgentSpawnSpec, ClientMsg, Frame,
-    ServerMsg, MAGIC, MAX_FRAME_LEN, PROTOCOL_VERSION,
+    ServerMsg, WorktreeInfo, MAGIC, MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Mutex};
@@ -127,6 +127,29 @@ impl DaemonClient {
         match UnixStream::connect(&self.socket).await {
             Ok(stream) => self.handshake(framed(stream)).await.map(Some),
             Err(_) => Ok(None),
+        }
+    }
+
+    /// Provision (or resolve) an isolated git worktree for an agent (Phase 3):
+    /// the daemon mints the attribution key, runs `git worktree`, persists the
+    /// row, and returns the worktree info (or shared-mode fallback).
+    pub async fn provision_worktree(
+        &self,
+        project_root: String,
+        provider: String,
+        isolate: bool,
+    ) -> Result<WorktreeInfo, String> {
+        let req_id = self.next_req();
+        let mut conn = self.connect_handshake().await?;
+        send(
+            &mut conn,
+            &ClientMsg::ProvisionWorktree { req_id, project_root, provider, isolate },
+        )
+        .await?;
+        match read_server(&mut conn).await? {
+            ServerMsg::Worktree { info, .. } => Ok(info),
+            ServerMsg::Error { message } => Err(message),
+            other => Err(format!("unexpected worktree reply: {other:?}")),
         }
     }
 

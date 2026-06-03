@@ -38,9 +38,10 @@ pub const MAGIC: u32 = 0x7461_696d;
 /// sessions (List + Kill) rather than killed.
 ///
 /// v2: `SessionSummary` gained `provider` + `status` (Phase 4 status inference).
-/// Postcard is positional, so this is a wire-layout change — a stale v1 daemon is
-/// rejected at handshake and the app falls back rather than misparsing.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// v3: added `ProvisionWorktree`/`Worktree` (Phase 3 daemon-owned worktrees).
+/// Postcard is positional, so these are wire-layout changes — a stale older
+/// daemon is rejected at handshake and the app falls back rather than misparsing.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Feature flags negotiated in the handshake (`capabilities` bitset). Reserving
 /// the bits now keeps app-update-while-old-daemon-running safe.
@@ -163,6 +164,23 @@ pub struct AgentSpawnSpec {
     pub env: Vec<(String, String)>,
 }
 
+/// Result of provisioning (or resolving) an isolated agent worktree — the
+/// daemon-owned port of CAO's `WorktreeInfo` (Phase 3). `terminal_key` is the
+/// attribution key (CAO terminal id); the app keys dirty/diff/graph on it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    pub terminal_key: String,
+    pub project_root: String,
+    pub repo_root: Option<String>,
+    pub worktree_path: String,
+    pub branch: Option<String>,
+    pub base_sha: Option<String>,
+    /// `"worktree"` (isolated + provable attribution) or `"shared"` (fallback for
+    /// a non-git root / git failure — heuristic attribution).
+    pub mode: String,
+    pub error: Option<String>,
+}
+
 /// App → daemon. The first message on every connection MUST be `Hello`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
@@ -182,6 +200,10 @@ pub enum ClientMsg {
     /// provider registry builds the command + injects MCP. `req_id` correlates
     /// the `Spawned` reply. This is the Phase-1 all-CLI spawn path.
     SpawnAgent { req_id: u64, spec: AgentSpawnSpec },
+    /// Provision (or resolve) an isolated git worktree for an agent (Phase 3).
+    /// The daemon mints the attribution key, runs `git worktree`, persists the
+    /// row, and replies `Worktree`. `isolate=false` (or a non-git root) ⇒ shared.
+    ProvisionWorktree { req_id: u64, project_root: String, provider: String, isolate: bool },
     /// Enumerate sessions. `req_id` correlates the `Sessions` reply.
     List { req_id: u64 },
     /// Bind THIS connection to stream `session_id`'s output. Carries the client's
@@ -237,6 +259,9 @@ pub enum ServerMsg {
     HelloRejected { reason: String },
     Spawned { req_id: u64, session_id: String },
     Sessions { req_id: u64, sessions: Vec<SessionSummary> },
+    /// Reply to `ProvisionWorktree`. `info.error` is set (and `mode="shared"`)
+    /// when isolation fell back; the app uses the cwd/key regardless.
+    Worktree { req_id: u64, info: WorktreeInfo },
     /// Handoff step 2: the grid is snapshotted at `seq_n`. A `T_REPAINT` frame
     /// (carrying the same `seq_n`) follows immediately, then `T_DATA` frames with
     /// `start_offset >= seq_n`.
@@ -539,6 +564,47 @@ mod tests {
                     assert_eq!(spec.profile.model.as_deref(), Some("gpt-5"));
                     assert_eq!(spec.profile.mcp_servers.len(), 1);
                     assert_eq!(spec.attribution_key.as_deref(), Some("term-abc"));
+                }
+                other => panic!("wrong msg {other:?}"),
+            },
+            other => panic!("expected Control, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provision_worktree_roundtrips_both_ways() {
+        let req = ClientMsg::ProvisionWorktree {
+            req_id: 3,
+            project_root: "/p".into(),
+            provider: "claude_code".into(),
+            isolate: true,
+        };
+        match parse_frame(BytesMut::from(&encode_client(&req).unwrap()[..])).unwrap() {
+            Frame::Control(b) => match decode_client(&b).unwrap() {
+                ClientMsg::ProvisionWorktree { req_id, isolate, .. } => {
+                    assert_eq!((req_id, isolate), (3, true))
+                }
+                other => panic!("wrong msg {other:?}"),
+            },
+            other => panic!("expected Control, got {other:?}"),
+        }
+
+        let info = WorktreeInfo {
+            terminal_key: "abc12345".into(),
+            project_root: "/p".into(),
+            repo_root: Some("/p".into()),
+            worktree_path: "/wt".into(),
+            branch: Some("taime/claude_code-abc12345".into()),
+            base_sha: Some("deadbeef".into()),
+            mode: "worktree".into(),
+            error: None,
+        };
+        let reply = ServerMsg::Worktree { req_id: 3, info: info.clone() };
+        match parse_frame(BytesMut::from(&encode_server(&reply).unwrap()[..])).unwrap() {
+            Frame::Control(b) => match decode_server(&b).unwrap() {
+                ServerMsg::Worktree { req_id, info: got } => {
+                    assert_eq!(req_id, 3);
+                    assert_eq!(got, info);
                 }
                 other => panic!("wrong msg {other:?}"),
             },

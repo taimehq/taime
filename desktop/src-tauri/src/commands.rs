@@ -64,7 +64,20 @@ pub fn clear_dirty(fs: State<'_, FsWatchState>, terminal_id: String) {
 // ---------------------------------------------------------------------------
 
 use crate::daemon::DaemonClient;
-use taime_protocol::{AgentProfile, AgentSpawnSpec, SessionSummary};
+use taime_protocol::{AgentProfile, AgentSpawnSpec, SessionSummary, WorktreeInfo};
+
+/// Provision (or resolve) an isolated git worktree for a daemon agent (Phase 3) —
+/// the daemon-owned replacement for CAO's `/worktrees/provision`. Returns the
+/// worktree info (snake_case fields, incl. `terminal_key` = attribution id).
+#[tauri::command]
+pub async fn daemon_provision_worktree(
+    daemon: State<'_, DaemonClient>,
+    project_root: String,
+    provider: String,
+    isolate: bool,
+) -> Result<WorktreeInfo, String> {
+    daemon.provision_worktree(project_root, provider, isolate).await
+}
 
 /// A high-level spawn for ANY provider through the daemon's registry (Phase 1).
 /// The daemon owns the launch recipe + MCP injection; the app just names the

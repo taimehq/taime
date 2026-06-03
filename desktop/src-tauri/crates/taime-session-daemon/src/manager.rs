@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use taime_protocol::{AgentSpawnSpec, SessionSummary, SpawnSpec};
+use taime_protocol::{AgentSpawnSpec, SessionSummary, SpawnSpec, WorktreeInfo};
 
 use crate::providers::Registry;
 use crate::session::Session;
@@ -115,6 +115,26 @@ impl Manager {
         }
         self.touch();
         Ok(id)
+    }
+
+    /// Provision (or resolve) an isolated git worktree for a new agent (Phase 3).
+    /// The daemon mints the attribution key, runs `git worktree`, and persists the
+    /// `taime_worktrees` row. Shells out to git — call from a blocking context.
+    pub fn provision_worktree(
+        &self,
+        project_root: String,
+        provider: String,
+        isolate: bool,
+    ) -> WorktreeInfo {
+        let terminal_key = format!("{:08x}", rand::random::<u32>());
+        let info = crate::worktree::provision(&project_root, &provider, isolate, &terminal_key);
+        if let Some(store) = &self.store {
+            if let Err(e) = store.upsert_worktree(&info, &provider, now_unix()) {
+                eprintln!("[taime-daemon] persist worktree {terminal_key} failed: {e}");
+            }
+        }
+        self.touch();
+        info
     }
 
     pub fn get(&self, id: &str) -> Option<Session> {
