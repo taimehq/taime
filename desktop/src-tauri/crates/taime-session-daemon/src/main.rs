@@ -11,6 +11,7 @@ mod conn;
 mod emulator;
 mod listener;
 mod manager;
+mod mcp;
 mod providers;
 mod repaint;
 mod runtime;

@@ -268,6 +268,28 @@ impl Manager {
 }
 
 #[cfg(test)]
+impl Manager {
+    /// Construct a manager with an injected store (so tests don't touch the real
+    /// app-data DB). Empty session map + the built-in provider registry.
+    pub fn for_test(store: Option<Store>) -> Self {
+        Manager {
+            sessions: Mutex::new(HashMap::new()),
+            session_counter: AtomicU64::new(0),
+            conn_counter: AtomicU64::new(0),
+            active_conns: AtomicU64::new(0),
+            last_activity: Mutex::new(Instant::now()),
+            registry: Registry::load(),
+            store,
+        }
+    }
+
+    /// The durable store (test inspection).
+    pub fn store(&self) -> Option<&Store> {
+        self.store.as_ref()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
