@@ -29,3 +29,4 @@ desktop/src-tauri/target/
 loop-*.png
 ws-*.png
 taime-*.png
+desktop/src-tauri/binaries/

@@ -46,9 +46,9 @@ function providerFromProgram(program: string): string {
   return "claude_code";
 }
 
-/** Which transport carries a frame's terminal I/O.
- *  - `cao_ws` — CAO/tmux/WebSocket (the other CLIs; Claude fallback).
- *  - `daemon` — the detached session daemon (the Rust PTY path; survives crashes). */
+/** Which transport carries a frame's terminal I/O. Only `daemon` exists now (the
+ *  detached session daemon / Rust PTY path; survives crashes). `cao_ws` is a
+ *  retired legacy variant kept so older persisted state still parses. */
 export type TerminalTransport = "cao_ws" | "daemon";
 
 /** Frame transports that render in the xterm daemon view (vs the CAO WebSocket
@@ -218,7 +218,8 @@ interface Store {
   refreshStatuses: () => Promise<void>;
   /** Poll per-session terminal statuses and rebuild the collapsed-row rollups. */
   refreshSessionRollups: () => Promise<void>;
-  /** Delete a CAO session (terminates its tmux + agents) and close its frames. */
+  /** Legacy session-removal hook (no daemon equivalent — agents are standalone);
+   *  kept for the pipeline UI's empty session list. */
   killSession: (name: string) => Promise<void>;
 
   // grid actions
@@ -234,9 +235,9 @@ interface Store {
     sessionName?: string | null;
   }) => void;
   /** Launch a provider on the detached session daemon (the Rust PTY path; survives
-   *  app crashes) via its registry adapter. Returns true on success so the caller
-   *  can fall back to CAO. */
-  launchAgentDaemon: (provider: string) => Promise<boolean>;
+   *  app crashes). `orchestrate` injects the daemon's MCP tools so the agent can
+   *  assign/handoff to others. Returns true on success. */
+  launchAgentDaemon: (provider: string, orchestrate?: boolean) => Promise<boolean>;
   /** Reopen a detached (still-running) Rust-PTY agent in a new frame. */
   reopenRustPty: (ptySessionId: string) => void;
   /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
@@ -479,21 +480,18 @@ export const useStore = create<Store>((set, get) => ({
     await get().fetchSessions();
   },
 
-  launchAgent: async (provider, _agentProfile, _opts) => {
+  launchAgent: async (provider, agentProfile, _opts) => {
     // Daemon-only after the CAO/tmux removal: every supported CLI launches on the
-    // detached session daemon (the Rust PTY path), in its own worktree, with the
-    // default profile. (Non-default profiles + session grouping return with the
-    // daemon profile store — a follow-up.)
+    // detached session daemon (the Rust PTY path), in its own worktree. The
+    // "orchestrator" role injects the daemon's MCP tools so the agent can
+    // assign/handoff to other agents; "default" is a plain agent. (A full daemon
+    // profile store — richer roles + tool restrictions — is a follow-up.)
     if (!DAEMON_PROVIDERS.has(provider)) {
       get().showSnackbar({ type: "error", message: `Unknown provider ${provider}` });
       return;
     }
-    if (!(await get().launchAgentDaemon(provider))) {
-      get().showSnackbar({
-        type: "error",
-        message: `Launch failed — the session daemon isn't available`,
-      });
-    }
+    // launchAgentDaemon reports its own (real) error on failure.
+    await get().launchAgentDaemon(provider, agentProfile === "orchestrator");
   },
 
   openTerminalFrame: ({ terminalId, provider, agentProfile, sessionName }) => {
@@ -530,20 +528,13 @@ export const useStore = create<Store>((set, get) => ({
     }));
   },
 
-  launchAgentDaemon: async (provider) => {
+  launchAgentDaemon: async (provider, orchestrate = false) => {
     const dir = get().workspaceDir;
     try {
-      // Same attribution surface as CAO: provision a worktree first so
-      // dirty/diff/timeline/graph key off this terminalId, and pass it to the
-      // daemon as the attribution_key so turn events carry it.
-      //
-      // NOTE(phase3): the daemon can now provision worktrees itself
-      // (daemonProvisionWorktree → git worktree in Rust + app-data persistence),
-      // and Phase-5 headless `assign` uses that path internally. The interactive
-      // launch still goes through CAO here, because CAO-backed diff/graph
-      // (api.getTerminalDiff/getGraph) need CAO to hold the worktree record;
-      // the frontend switches to daemonProvisionWorktree in Phase 6, together
-      // with the diff/graph move daemon-side (else diff would break in between).
+      // Provision a daemon-owned worktree first (git worktree in Rust, persisted
+      // to the app-data store) so dirty/diff/graph key off this terminalId, and
+      // pass it to the daemon as the attribution_key so turn events carry it.
+      // `api.provisionWorktree` routes to the daemon (daemonProvisionWorktree).
       let terminalId: string | null = null;
       let cwd = dir;
       let branch: string | null = null;
@@ -557,7 +548,7 @@ export const useStore = create<Store>((set, get) => ({
         cwd = wt.worktree_path;
         branch = wt.branch;
       }
-      const sessionId = await daemonSpawnAgent(provider, cwd, 24, 80, terminalId);
+      const sessionId = await daemonSpawnAgent(provider, cwd, 24, 80, terminalId, null, orchestrate);
       const key = nextKey();
       set((s) => ({
         frames: [
@@ -592,13 +583,18 @@ export const useStore = create<Store>((set, get) => ({
       }));
       get().showSnackbar({
         type: "success",
-        message: `${providerTitle(provider)} launched (daemon)`,
+        message: `${providerTitle(provider)} launched`,
       });
       return true;
     } catch (e) {
-      // Signal failure so launchAgent can fall back to CAO (e.g. daemon binary
-      // not present in an unbundled build).
-      console.warn("[taime] daemon launch failed; falling back to CAO", e);
+      // Surface the REAL error (provision/spawn failure) — the daemon is the only
+      // backend now, so there's no silent fallback.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn("[taime] daemon launch failed", e);
+      get().showSnackbar({
+        type: "error",
+        message: `Launch failed: ${msg}`,
+      });
       return false;
     }
   },

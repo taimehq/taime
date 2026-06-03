@@ -2,10 +2,10 @@
 //!
 //! Design (terminal ↔ working-dir mapping): React owns frame lifecycle and the
 //! terminal ids. When a frame opens, React resolves the terminal's working
-//! directory (`GET /terminals/{id}/working-directory`) and calls `watch_terminal`.
-//! We keep:
+//! directory (the daemon worktree) and calls `watch_terminal`. We keep:
 //!   * `terminals: terminal_id -> canonical_dir`
 //!   * `watchers: canonical_dir -> WatchEntry` (one OS watcher per distinct dir)
+//!
 //! A filesystem event resolves path -> owning watched dir -> the terminal(s) on
 //! that dir, and we emit `terminal://{id}/fs-dirty` per affected terminal.
 //!

@@ -19,9 +19,18 @@ fn main() {
             app.manage(FsWatchState::new());
             // App-side client to the detached session daemon — the one (and only)
             // backend now. Resolved next to the app exe (dev) or in Resources
-            // (bundle); the daemon is spawned lazily on first use and OUTLIVES the
-            // app (it is not a supervised sidecar — nothing to shut down on exit).
+            // (bundle); the daemon OUTLIVES the app (not a supervised sidecar —
+            // nothing to shut down on exit).
             app.manage(DaemonClient::new(daemon::resolve_daemon_bin()));
+            // Warm it up in the background so the workspace probe / list / graph
+            // reads work on the first paint instead of returning empty until the
+            // first launch spawns the daemon.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(client) = handle.try_state::<DaemonClient>() {
+                    client.warm_up().await;
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -9,13 +9,11 @@
 //! authenticated session, never a client field** (closing CAO's `sender_id`
 //! spoof).
 //!
-//! What remains (the per-agent transport) is wiring THIS dispatcher to each agent:
-//! a tiny stdio shim bridging the CLI's MCP client to the daemon (or loopback
-//! HTTP+SSE + per-agent token), injected via the Phase-1 per-provider MCP config.
-//! That transport + the live MCP handshake against a real CLI is the remaining
-//! Phase-5 integration — hence this module is unit-tested here but not yet
-//! mounted on a socket.
-#![allow(dead_code)]
+//! The transport is wired: the `--mcp-stdio` shim (see `main::run_mcp_shim`)
+//! bridges each CLI's MCP client to the daemon's control socket, the per-agent
+//! token is injected via the Phase-1 per-provider MCP config, and
+//! `Manager::handle_mcp` resolves the caller from the token and dispatches here.
+//! The remaining validation is a live MCP handshake against a real CLI.
 
 use serde_json::{json, Value};
 

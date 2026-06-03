@@ -75,6 +75,16 @@ impl DaemonClient {
         self.daemon_bin.is_some() || UnixStream::connect(&self.socket).await.is_ok()
     }
 
+    /// Best-effort startup warm-up: ensure a daemon is running (spawn it if
+    /// needed) so connect-only reads (workspace probe, list, graph) succeed
+    /// immediately instead of returning their empty fallback before the first
+    /// launch. Errors are ignored — the lazy path still spawns on first real use.
+    pub async fn warm_up(&self) {
+        if let Err(e) = self.ensure_running().await {
+            eprintln!("[taime] daemon warm-up skipped: {e}");
+        }
+    }
+
     /// Ensure a daemon is reachable: adopt a running one, else spawn it detached.
     async fn ensure_running(&self) -> Result<(), String> {
         if UnixStream::connect(&self.socket).await.is_ok() {
@@ -450,19 +460,19 @@ fn spawn_detached(daemon_bin: &Path, socket: &Path) -> std::io::Result<u32> {
     Ok(pid)
 }
 
-/// Resolve the daemon binary: prefer a sibling of the app executable (dev +
-/// next-to-exe bundles), else `None` (caller surfaces "not found").
+/// Resolve the daemon binary across dev + bundle layouts: a sibling of the app
+/// exe (dev `target/<profile>/`, and macOS `.app/Contents/MacOS/`), or the
+/// macOS bundle Resources dir (`bundle.resources` may flatten or nest under
+/// `binaries/`). `None` → the caller surfaces "session daemon binary not found".
 pub fn resolve_daemon_bin() -> Option<PathBuf> {
+    const BIN: &str = "taime-session-daemon";
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let candidate = dir.join("taime-session-daemon");
-    if candidate.exists() {
-        return Some(candidate);
+    let mut candidates = vec![dir.join(BIN)];
+    if let Some(contents) = dir.parent() {
+        let res = contents.join("Resources");
+        candidates.push(res.join(BIN));
+        candidates.push(res.join("binaries").join(BIN));
     }
-    // Bundled macOS apps: the binary may live in ../Resources.
-    let resources = dir.parent().map(|p| p.join("Resources").join("taime-session-daemon"));
-    match resources {
-        Some(p) if p.exists() => Some(p),
-        _ => None,
-    }
+    candidates.into_iter().find(|p| p.exists())
 }

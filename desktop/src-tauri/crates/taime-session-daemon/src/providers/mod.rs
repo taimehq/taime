@@ -58,8 +58,10 @@ pub struct DaemonSessionSpec {
 }
 
 /// A spawn-time side effect to undo when the session exits. Data-driven (not
-/// closures) so it is `Send` + unit-testable.
+/// closures) so it is `Send` + unit-testable. (Variants intentionally share the
+/// `Remove*` prefix — they are all teardown removals.)
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum CleanupAction {
     /// Delete a temp file written at spawn (e.g. a temp MCP config json). Not yet
     /// constructed (Claude injects MCP inline); reserved for the temp-file

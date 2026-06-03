@@ -60,6 +60,7 @@ export async function daemonSpawnAgent(
   cols: number,
   attributionKey: string | null,
   model: string | null = null,
+  injectOrchestration = false,
 ): Promise<string> {
   return invoke<string>("daemon_spawn_agent", {
     provider,
@@ -69,6 +70,7 @@ export async function daemonSpawnAgent(
     model: model ?? null,
     permissionMode: null,
     attributionKey: attributionKey ?? null,
+    injectOrchestration,
   });
 }
 

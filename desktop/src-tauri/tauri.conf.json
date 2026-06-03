@@ -6,7 +6,7 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "cargo build --manifest-path src-tauri/Cargo.toml -p taime-session-daemon && pnpm dev",
     "beforeBuildCommand": "pnpm build"
   },
   "app": {

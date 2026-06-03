@@ -44,6 +44,36 @@ fn gen_id() -> String {
     format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>())
 }
 
+/// Whether a provider binary is resolvable (PATH + the known install locations
+/// the adapters check). Best-effort; uses the daemon's inherited env.
+fn binary_installed(binary: &str) -> bool {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    // Known per-CLI install locations the adapters resolve explicitly.
+    if let Some(h) = &home {
+        let known: &[&str] = match binary {
+            "claude" => &[".local/bin/claude"],
+            "grok" => &[".grok/bin/grok"],
+            _ => &[],
+        };
+        for rel in known {
+            if h.join(rel).exists() {
+                return true;
+            }
+        }
+    }
+    if binary.contains('/') {
+        return std::path::Path::new(binary).exists();
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if dir.join(binary).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The delimited stdin payload for an inbox delivery — a clear visual frame so
 /// the user can tell orchestrator injection from agent output (the plan's
 /// delivery format). Pure + testable.
@@ -106,8 +136,8 @@ impl Manager {
     }
 
     /// Spawn a high-level agent request: the registry builds the provider command
-    /// + MCP injection, then we spawn it like any other session (the Phase-1
-    /// all-CLI path). The session carries the MCP cleanup + provider id.
+    /// and MCP injection, then we spawn it like any other session. The session
+    /// carries the MCP cleanup and provider id.
     pub fn spawn_agent(&self, mut spec: AgentSpawnSpec) -> Result<String, String> {
         // Phase-5 transport: an orchestration-enabled agent gets the daemon's own
         // MCP endpoint injected (the stdio shim = this binary `--mcp-stdio`),
@@ -274,8 +304,8 @@ impl Manager {
         }
     }
 
-    /// The activity graph as JSON (Phase 6): agents (from the recorded sessions)
-    /// + inter-agent edges (the send_message/handoff/assign events). Read from the
+    /// The activity graph as JSON: agents (from the recorded sessions) plus the
+    /// inter-agent edges (send_message/handoff/assign events). Read from the
     /// durable store, so it reflects the full history even with the UI closed.
     pub fn activity_graph_json(&self) -> String {
         let Some(store) = &self.store else {
@@ -345,6 +375,7 @@ impl Manager {
             "attribution" => self.attribution_json(tk),
             "sessions" => "[]".to_string(),
             "session_detail" => r#"{"session":null,"terminals":[]}"#.to_string(),
+            "providers" => Self::providers_json(),
             "graph" => self.activity_graph_json(),
             other => serde_json::json!({ "error": format!("unknown query {other}") }).to_string(),
         }
@@ -370,6 +401,25 @@ impl Manager {
             .map(|(path, terms)| serde_json::json!({ "path": path, "terminals": terms.into_iter().collect::<Vec<_>>() }))
             .collect();
         serde_json::json!(contention).to_string()
+    }
+
+    /// The 4 supported providers with an accurate `installed` flag (binary
+    /// resolvable in the daemon's env), so the launcher doesn't offer a CLI that
+    /// will fail at spawn.
+    fn providers_json() -> String {
+        let providers = [
+            ("claude_code", "claude"),
+            ("codex", "codex"),
+            ("gemini_cli", "gemini"),
+            ("grok_cli", "grok"),
+        ];
+        let list: Vec<serde_json::Value> = providers
+            .iter()
+            .map(|(name, bin)| {
+                serde_json::json!({ "name": name, "binary": bin, "installed": binary_installed(bin) })
+            })
+            .collect();
+        serde_json::json!(list).to_string()
     }
 
     fn worktree_json(&self, tk: &str) -> String {
