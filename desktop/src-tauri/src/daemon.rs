@@ -68,6 +68,13 @@ impl DaemonClient {
         self.req_counter.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Whether the daemon transport is usable: we can spawn one (binary resolved)
+    /// or one is already running. Used by the frontend to route Claude to the
+    /// daemon when present and fall back to CAO otherwise.
+    pub async fn available(&self) -> bool {
+        self.daemon_bin.is_some() || UnixStream::connect(&self.socket).await.is_ok()
+    }
+
     /// Ensure a daemon is reachable: adopt a running one, else spawn it detached.
     async fn ensure_running(&self) -> Result<(), String> {
         if UnixStream::connect(&self.socket).await.is_ok() {
