@@ -21,10 +21,8 @@ desktop/src-tauri/target/
 # Local tooling state
 .claude/scheduled_tasks.lock
 
-# backend/cao is its own git repo (your CAO fork). It is committed there, not
 # in this parent repo. (Convert to a submodule/subtree later if you want it
 # referenced from here.)
-backend/cao/
 
 # Playwright/test artifacts
 .playwright-mcp/

@@ -99,6 +99,27 @@ export async function daemonProvisionWorktree(
   });
 }
 
+/** Generic daemon query RPC (Phase 6 route layer): the daemon-backed replacement
+ *  for the CAO REST surface. `fallback` (a JSON string) is returned outside Tauri
+ *  or when no daemon is running, so callers always get a well-typed value. */
+export async function daemonQuery<T>(
+  kind: string,
+  args: Record<string, unknown>,
+  fallback: T,
+): Promise<T> {
+  if (!inTauri()) return fallback;
+  try {
+    return await invoke<T>("daemon_query", {
+      kind,
+      args,
+      fallback: JSON.stringify(fallback),
+    });
+  } catch (e) {
+    console.warn(`[taime] daemon_query ${kind} failed`, e);
+    return fallback;
+  }
+}
+
 /** The daemon-side activity graph (Phase 6): agents + inter-agent edges
  *  (assign/handoff/message), read from the durable store — complete even with the
  *  UI closed. The frontend route switch to this lands with the diff move. */

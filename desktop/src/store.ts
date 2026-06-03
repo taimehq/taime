@@ -3,7 +3,6 @@ import {
   api,
   type Session,
   type SessionDetail,
-  type Terminal,
 } from "./api";
 import {
   loadRecentProjects,
@@ -12,7 +11,6 @@ import {
   saveWorkspaceDir,
   addRecent,
 } from "./lib/recentProjects";
-import { makeSessionName } from "./lib/sessionName";
 import {
   loadTerminalFontSize,
   saveTerminalFontSize,
@@ -28,7 +26,6 @@ import {
   daemonSpawnAgent,
   daemonKill,
   daemonCloseView,
-  daemonAvailable,
   type TurnEvent,
   type DaemonSessionSummary,
 } from "./pty";
@@ -482,118 +479,19 @@ export const useStore = create<Store>((set, get) => ({
     await get().fetchSessions();
   },
 
-  launchAgent: async (provider, agentProfile, opts) => {
-    // Any supported CLI runs on the detached session daemon (the Rust PTY path)
-    // when it's available, falling back to CAO/tmux on failure or when the daemon
-    // isn't present (e.g. an unbundled build). The daemon launches the DEFAULT
-    // profile; non-default profiles and adding-to-a-session still go through CAO
-    // until the daemon learns them.
-    if (
-      DAEMON_PROVIDERS.has(provider) &&
-      agentProfile === "default" &&
-      !opts?.sessionName &&
-      (await daemonAvailable())
-    ) {
-      if (await get().launchAgentDaemon(provider)) return;
-      // else: fall through to the CAO launch below
+  launchAgent: async (provider, _agentProfile, _opts) => {
+    // Daemon-only after the CAO/tmux removal: every supported CLI launches on the
+    // detached session daemon (the Rust PTY path), in its own worktree, with the
+    // default profile. (Non-default profiles + session grouping return with the
+    // daemon profile store — a follow-up.)
+    if (!DAEMON_PROVIDERS.has(provider)) {
+      get().showSnackbar({ type: "error", message: `Unknown provider ${provider}` });
+      return;
     }
-
-    // Optimistic: show a pending frame immediately.
-    const key = nextKey();
-    const placeholder: Frame = {
-      key,
-      terminalId: null,
-      provider,
-      agentProfile,
-      sessionName: opts?.sessionName ?? null,
-      pending: true,
-    };
-    set((s) => ({
-      frames: [...s.frames, placeholder],
-      activeFrameKey: key,
-    }));
-
-    const projectRoot = opts?.workingDirectory ?? get().workspaceDir ?? undefined;
-    // Request worktree isolation when enabled and we have a project root; the
-    // backend transparently falls back to the shared dir for non-git projects.
-    const isolate = get().isolationEnabled && !!projectRoot;
-    const isolation = { isolate, projectRoot };
-    // When isolating, the backend resolves the worktree path itself, so we don't
-    // also pin working_directory; in shared mode it uses project_root as the cwd.
-    const workingDirectory = isolate ? undefined : projectRoot;
-    try {
-      let terminal: Terminal;
-      if (opts?.sessionName) {
-        terminal = await api.addTerminal(
-          opts.sessionName,
-          provider,
-          agentProfile,
-          workingDirectory,
-          isolation,
-        );
-      } else {
-        // Name new sessions after the project folder so the pipeline reads
-        // "myproject-a1b2" instead of an opaque "cao-cea61400" hash.
-        terminal = await api.createSession(
-          provider,
-          agentProfile,
-          makeSessionName(projectRoot),
-          workingDirectory,
-          isolation,
-        );
-      }
-      // Resolve the placeholder to the real terminal.
-      set((s) => {
-        // A reconcile tick may have opened a frame for this terminal while
-        // addTerminal was in flight: the placeholder's terminalId was null, so
-        // the reconciler couldn't see the collision and openTerminalFrame's
-        // existing-check couldn't either. If a frame now holds the resolved id,
-        // drop our placeholder and keep that one — strictly one frame per id.
-        const dup = s.frames.find(
-          (f) => f.key !== key && f.terminalId === terminal.id,
-        );
-        if (dup) {
-          const frames = s.frames.filter((f) => f.key !== key);
-          return {
-            frames,
-            activeFrameKey: s.activeFrameKey === key ? dup.key : s.activeFrameKey,
-          };
-        }
-        return {
-          frames: s.frames.map((f) =>
-            f.key === key
-              ? {
-                  ...f,
-                  terminalId: terminal.id,
-                  sessionName: terminal.session_name,
-                  agentProfile: terminal.agent_profile,
-                  pending: false,
-                }
-              : f,
-          ),
-        };
-      });
-      get().showSnackbar({
-        type: "success",
-        message: `${provider} launched`,
-      });
-      await get().fetchSessions();
-    } catch (e) {
-      // Rollback: drop the placeholder, surface the error.
-      const msg = e instanceof Error ? e.message : "launch failed";
-      set((s) => {
-        const frames = s.frames.filter((f) => f.key !== key);
-        return {
-          frames,
-          activeFrameKey:
-            s.activeFrameKey === key
-              ? (frames[frames.length - 1]?.key ?? null)
-              : s.activeFrameKey,
-        };
-      });
+    if (!(await get().launchAgentDaemon(provider))) {
       get().showSnackbar({
         type: "error",
-        message: `Launch failed: ${msg}`,
+        message: `Launch failed — the session daemon isn't available`,
       });
     }
   },
