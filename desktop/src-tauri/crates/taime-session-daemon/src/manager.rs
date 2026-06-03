@@ -7,12 +7,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use taime_protocol::{AgentSpawnSpec, SessionSummary, SpawnSpec};
 
 use crate::providers::Registry;
 use crate::session::Session;
+use crate::store::{SessionRow, Store};
 
 pub struct Manager {
     sessions: Mutex<HashMap<String, Session>>,
@@ -23,6 +24,13 @@ pub struct Manager {
     /// Provider adapter registry (Phase 1): builds the launch command + MCP
     /// injection for high-level `SpawnAgent` requests.
     registry: Registry,
+    /// Durable orchestration store (Phase 3). `None` if the DB couldn't open —
+    /// persistence is best-effort and never blocks spawning.
+    store: Option<Store>,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 impl Default for Manager {
@@ -33,6 +41,13 @@ impl Default for Manager {
 
 impl Manager {
     pub fn new() -> Self {
+        let store = match Store::open() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("[taime-daemon] persistence disabled (store open failed): {e}");
+                None
+            }
+        };
         Manager {
             sessions: Mutex::new(HashMap::new()),
             session_counter: AtomicU64::new(0),
@@ -40,6 +55,7 @@ impl Manager {
             active_conns: AtomicU64::new(0),
             last_activity: Mutex::new(Instant::now()),
             registry: Registry::load(),
+            store,
         }
     }
 
@@ -78,8 +94,25 @@ impl Manager {
         // The adapter (status inference) travels with the session.
         let adapter = self.registry.adapter(&spec.provider);
         let id = format!("pty-{:x}", self.session_counter.fetch_add(1, Ordering::SeqCst));
+        let program = prepared.spec.prog.clone();
         let session = Session::spawn_prepared(id.clone(), prepared, adapter)?;
         self.sessions.lock().unwrap().insert(id.clone(), session);
+        // Durable record (best-effort): the agent existed, with its provider +
+        // attribution key + cwd, for history / Phase-6 attribution.
+        if let Some(store) = &self.store {
+            let row = SessionRow {
+                pty_session_id: id.clone(),
+                provider: Some(spec.provider.clone()),
+                attribution_key: spec.attribution_key.clone(),
+                cwd: spec.cwd.clone(),
+                program,
+                created_at_unix: now_unix(),
+                status: "running".to_string(),
+            };
+            if let Err(e) = store.record_session(&row) {
+                eprintln!("[taime-daemon] persist session {id} failed: {e}");
+            }
+        }
         self.touch();
         Ok(id)
     }
@@ -96,6 +129,11 @@ impl Manager {
         let session = self.sessions.lock().unwrap().remove(id);
         if let Some(s) = session {
             s.kill();
+            // Removed from the live map, so gc_tick won't see it die — record the
+            // exit here.
+            if let Some(store) = &self.store {
+                let _ = store.set_session_status(id, "exited");
+            }
         }
         self.touch();
     }
@@ -111,7 +149,7 @@ impl Manager {
     /// quiet-window attribution check, and returns `true` when the daemon should
     /// shut down (no sessions + no connected client + idle past `idle_grace`).
     pub fn gc_tick(&self, quiet_threshold: Duration, idle_grace: Duration) -> bool {
-        // Reap only DEAD sessions.
+        // Reap only DEAD sessions; record their exit in the durable store.
         {
             let mut map = self.sessions.lock().unwrap();
             let dead: Vec<String> = map
@@ -121,6 +159,9 @@ impl Manager {
                 .collect();
             for k in dead {
                 map.remove(&k);
+                if let Some(store) = &self.store {
+                    let _ = store.set_session_status(&k, "exited");
+                }
             }
         }
         // Quiet-window attribution boundaries for live sessions.
