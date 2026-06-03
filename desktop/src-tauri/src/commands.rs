@@ -5,6 +5,48 @@ use tauri::{AppHandle, State};
 
 use crate::fs_watch::FsWatchState;
 
+/// Probe a candidate project dir for the workspace picker. Done **app-side** (a
+/// direct git read) rather than via the daemon, so the badge resolves on first
+/// paint regardless of whether the daemon has warmed up yet (no boot race, no
+/// "missing" flash).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkspaceInfo {
+    path: String,
+    exists: bool,
+    is_git: bool,
+    repo_root: Option<String>,
+    branch: Option<String>,
+    head_short: Option<String>,
+}
+
+fn git_probe(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").current_dir(cwd).args(args).output().ok()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    } else {
+        None
+    }
+}
+
+#[tauri::command]
+pub fn workspace_info(path: String) -> WorkspaceInfo {
+    let p = std::path::Path::new(&path);
+    if !p.is_dir() {
+        return WorkspaceInfo { path, exists: false, is_git: false, repo_root: None, branch: None, head_short: None };
+    }
+    let repo_root = git_probe(p, &["rev-parse", "--show-toplevel"]);
+    WorkspaceInfo {
+        is_git: repo_root.is_some(),
+        branch: git_probe(p, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        head_short: git_probe(p, &["rev-parse", "--short", "HEAD"]),
+        repo_root,
+        exists: true,
+        path,
+    }
+}
+
 /// Start watching `dir` for the given terminal; dirty-state events are emitted
 /// as `terminal://{id}/fs-dirty`.
 #[tauri::command]

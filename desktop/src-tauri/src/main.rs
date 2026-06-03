@@ -34,6 +34,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::workspace_info,
             commands::watch_terminal,
             commands::unwatch_terminal,
             commands::clear_dirty,
