@@ -206,11 +206,38 @@ export async function daemonKill(sessionId: string): Promise<void> {
   }
 }
 
-/** Liveness list from the detached daemon (its own session registry). */
-export async function daemonList(): Promise<{ id: string; alive: boolean }[]> {
+/** App-driven attribution checkpoint (strongest boundary signal) for a daemon
+ *  session — e.g. when the user submits a command. */
+export async function daemonCheckpoint(sessionId: string, cause: string): Promise<void> {
+  if (!inTauri()) return;
+  try {
+    await invoke("daemon_checkpoint", { sessionId, cause });
+  } catch {
+    /* ignore */
+  }
+}
+
+/** A session enumerated from the daemon's own registry (for discovery/adoption
+ * after an app crash, and for liveness). Matches the daemon's `SessionSummary`. */
+export interface DaemonSessionSummary {
+  id: string;
+  cwd: string;
+  program: string;
+  alive: boolean;
+  attached: boolean;
+  rows: number;
+  cols: number;
+  created_at_unix: number;
+  attribution_key: string | null;
+  protocol_version: number;
+}
+
+/** Enumerate the detached daemon's sessions. Returns [] (without spawning a
+ *  daemon) when none is running — safe to call on every boot. */
+export async function daemonList(): Promise<DaemonSessionSummary[]> {
   if (!inTauri()) return [];
   try {
-    return await invoke<{ id: string; alive: boolean }[]>("daemon_list");
+    return await invoke<DaemonSessionSummary[]>("daemon_list");
   } catch {
     return [];
   }
@@ -223,6 +250,8 @@ export async function daemonList(): Promise<{ id: string; alive: boolean }[]> {
  */
 export async function daemonAttach(
   sessionId: string,
+  rows: number,
+  cols: number,
   onBytes: (bytes: Uint8Array) => void,
   onExit: (code: number | null) => void,
   onTurn?: (turn: TurnEvent) => void,
@@ -243,7 +272,9 @@ export async function daemonAttach(
     }
   };
   try {
-    await invoke("daemon_attach", { sessionId, onData });
+    // rows/cols let the daemon resize the PTY + emulator BEFORE the grid
+    // repaint, so the repaint matches the real viewport (handoff step 1).
+    await invoke("daemon_attach", { sessionId, rows, cols, onData });
     return onData;
   } catch (e) {
     console.warn("[taime] daemon_attach failed", e);
@@ -258,6 +289,8 @@ export type PtyBackend = "inapp" | "daemon";
 export interface PtyTransport {
   attach: (
     sessionId: string,
+    rows: number,
+    cols: number,
     onBytes: (bytes: Uint8Array) => void,
     onExit: (code: number | null) => void,
     onTurn?: (turn: TurnEvent) => void,
@@ -266,12 +299,16 @@ export interface PtyTransport {
   resize: (sessionId: string, rows: number, cols: number) => Promise<void>;
   ack: (sessionId: string, offset: number) => Promise<void>;
   closeView: (sessionId: string) => Promise<void>;
+  /** Optional: app-driven attribution checkpoint (daemon transport only). */
+  checkpoint?: (sessionId: string, cause: string) => Promise<void>;
 }
 
 const inAppTransport: PtyTransport = {
-  // The in-app PtyManager emits no turn events (attribution lives in the daemon);
-  // ignore onTurn.
-  attach: (sessionId, onBytes, onExit) => ptyAttach(sessionId, onBytes, onExit),
+  // The in-app PtyManager replays a raw byte buffer (no size-generated repaint)
+  // and emits no turn events, so it ignores rows/cols/onTurn here; its own
+  // post-attach resize drives the agent's redraw.
+  attach: (sessionId, _rows, _cols, onBytes, onExit) =>
+    ptyAttach(sessionId, onBytes, onExit),
   write: ptyWrite,
   resize: ptyResize,
   ack: ptyAck,
@@ -279,12 +316,13 @@ const inAppTransport: PtyTransport = {
 };
 
 const daemonTransportImpl: PtyTransport = {
-  attach: (sessionId, onBytes, onExit, onTurn) =>
-    daemonAttach(sessionId, onBytes, onExit, onTurn),
+  attach: (sessionId, rows, cols, onBytes, onExit, onTurn) =>
+    daemonAttach(sessionId, rows, cols, onBytes, onExit, onTurn),
   write: daemonWrite,
   resize: daemonResize,
   ack: daemonAck,
   closeView: daemonCloseView,
+  checkpoint: daemonCheckpoint,
 };
 
 export function transportFor(backend: PtyBackend): PtyTransport {
