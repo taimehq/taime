@@ -75,7 +75,7 @@ Grounded in `backend/cao/src/cli_agent_orchestrator` + the `api.ts` contract:
 ```
 ┌──────────────────────────  taime-session-daemon (Rust, detached, persistent) ───────────────────────────┐
 │  PTY + wezterm-term/session   │ session+worktree+provider/profile registry │ status inference (grid/OSC) │
-│  fs-watch + attribution turns │ persistence store (SQLite/postcard in run/) │ message bus + inbox+deliver │
+│  fs-watch + attribution turns │ persistence store (app-data SQLite/rusqlite) │ message bus + inbox+deliver│
 │         ▲ control/data socket (app)                              ▲ MCP endpoint (agents)                  │
 └─────────┼────────────────────────────────────────────────────── │ ───────────────────────────────────-─┘
           │ Tauri commands  (terminal/session/diff/graph/status…)  │
