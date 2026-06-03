@@ -28,7 +28,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use taime_protocol::{encode_data, encode_repaint, encode_server, ServerMsg, SessionSummary, SpawnSpec};
+use taime_protocol::{
+    encode_data, encode_repaint, encode_server, AgentStatus, ServerMsg, SessionSummary, SpawnSpec,
+};
 use tokio::sync::mpsc;
 
 use crate::attribution::Attribution;
@@ -371,19 +373,38 @@ impl Session {
         !self.inner.dead.load(Ordering::SeqCst)
     }
 
+    /// Infer the live status via the provider adapter + grid snapshot (Phase 4).
+    /// `None` for a low-level spawn (no adapter) or a dead session. Caller holds
+    /// the state lock.
+    fn infer_status(&self, st: &SessionState) -> Option<AgentStatus> {
+        if !self.is_alive() {
+            return None;
+        }
+        self.inner.adapter.as_ref().map(|a| {
+            let lines = emulator::snapshot_visible_text(&st.term);
+            a.status(&GridView::new(&lines))
+        })
+    }
+
+    /// Whether the agent is ready to receive an injected message: IDLE or
+    /// COMPLETED (the idle-gated delivery property — never mid-turn; matches
+    /// CAO's `check_and_send_pending_messages`).
+    pub fn is_ready_for_delivery(&self) -> bool {
+        let st = self.inner.state.lock().unwrap();
+        matches!(self.infer_status(&st), Some(AgentStatus::Idle | AgentStatus::Completed))
+    }
+
+    /// The attribution key (CAO terminal id) this session was spawned with — the
+    /// inbox addresses messages to it.
+    pub fn attribution_key(&self) -> Option<String> {
+        self.inner.attribution_key.clone()
+    }
+
     pub fn summary(&self) -> SessionSummary {
         let st = self.inner.state.lock().unwrap();
-        // Infer status from the live grid via the provider adapter (Phase 4). A
-        // dead session is COMPLETED/Error-agnostic here — report no live status so
-        // the app's exit handling (daemon_list `alive=false`) drives the badge.
-        let status = if self.is_alive() {
-            self.inner.adapter.as_ref().map(|a| {
-                let lines = emulator::snapshot_visible_text(&st.term);
-                a.status(&GridView::new(&lines))
-            })
-        } else {
-            None
-        };
+        // A dead session reports no live status so the app's exit handling
+        // (daemon_list `alive=false`) drives the badge.
+        let status = self.infer_status(&st);
         SessionSummary {
             id: self.inner.id.clone(),
             cwd: self.inner.cwd.clone(),

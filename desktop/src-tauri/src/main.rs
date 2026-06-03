@@ -87,6 +87,7 @@ fn main() {
             commands::clear_dirty,
             commands::daemon_spawn_agent,
             commands::daemon_provision_worktree,
+            commands::daemon_send_message,
             commands::daemon_attach,
             commands::daemon_write,
             commands::daemon_resize,

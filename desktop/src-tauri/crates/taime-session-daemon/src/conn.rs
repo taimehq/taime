@@ -124,6 +124,12 @@ pub async fn handle(stream: UnixStream, manager: Arc<Manager>, token: String) {
                     }
                 }
             }
+            ClientMsg::SendMessage { req_id, sender, receiver, message } => {
+                match manager.enqueue_message(sender, receiver, message) {
+                    Ok(id) => send(&out_tx, &ServerMsg::MessageQueued { req_id, id }).await,
+                    Err(e) => send(&out_tx, &ServerMsg::Error { message: e }).await,
+                }
+            }
             ClientMsg::List { req_id } => {
                 send(&out_tx, &ServerMsg::Sessions { req_id, sessions: manager.list() }).await
             }

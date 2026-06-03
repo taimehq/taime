@@ -153,6 +153,25 @@ impl DaemonClient {
         }
     }
 
+    /// Enqueue an inbox message for a live agent (Phase 5 message bus). The
+    /// daemon delivers it into the receiver's stdin when it next goes idle.
+    /// Returns the monotonic inbox id.
+    pub async fn send_message(
+        &self,
+        sender: String,
+        receiver: String,
+        message: String,
+    ) -> Result<i64, String> {
+        let req_id = self.next_req();
+        let mut conn = self.connect_handshake().await?;
+        send(&mut conn, &ClientMsg::SendMessage { req_id, sender, receiver, message }).await?;
+        match read_server(&mut conn).await? {
+            ServerMsg::MessageQueued { id, .. } => Ok(id),
+            ServerMsg::Error { message } => Err(message),
+            other => Err(format!("unexpected send reply: {other:?}")),
+        }
+    }
+
     /// High-level agent spawn: the daemon's provider registry builds the command
     /// + MCP injection (the Phase-1 all-CLI path). Returns the session id.
     pub async fn spawn_agent(&self, spec: AgentSpawnSpec) -> Result<String, String> {

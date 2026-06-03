@@ -99,6 +99,17 @@ export async function daemonProvisionWorktree(
   });
 }
 
+/** Enqueue an inbox message for a live daemon agent (Phase 5 message bus). The
+ *  daemon delivers it into the receiver's stdin when it next goes idle. `receiver`
+ *  is the agent's attribution id; returns the monotonic inbox id. */
+export async function daemonSendMessage(
+  sender: string,
+  receiver: string,
+  message: string,
+): Promise<number> {
+  return invoke<number>("daemon_send_message", { sender, receiver, message });
+}
+
 export async function daemonWrite(sessionId: string, data: string): Promise<void> {
   if (!inTauri()) return;
   try {

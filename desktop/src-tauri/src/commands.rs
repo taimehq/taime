@@ -108,6 +108,18 @@ fn default_agent_spec(
     }
 }
 
+/// Enqueue an inbox message for a live daemon agent (Phase 5 message bus) — the
+/// ops/app entry; the daemon delivers it into the receiver's stdin when idle.
+#[tauri::command]
+pub async fn daemon_send_message(
+    daemon: State<'_, DaemonClient>,
+    sender: String,
+    receiver: String,
+    message: String,
+) -> Result<i64, String> {
+    daemon.send_message(sender, receiver, message).await
+}
+
 /// Launch any supported CLI (`claude_code`/`codex`/`gemini_cli`/`grok_cli`) via
 /// the daemon's provider registry with the default (unrestricted) profile.
 #[tauri::command]
