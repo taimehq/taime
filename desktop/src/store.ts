@@ -25,25 +25,23 @@ import {
   saveSidebarCollapsed,
 } from "./lib/preferences";
 import {
-  ptySpawnClaude,
-  ptyKill,
-  ptyCloseView,
   daemonSpawnClaude,
   daemonKill,
   daemonCloseView,
+  daemonAvailable,
   type TurnEvent,
   type DaemonSessionSummary,
 } from "./pty";
 
 /** Which transport carries a frame's terminal I/O.
- *  - `cao_ws`   — CAO/tmux/WebSocket (legacy default).
- *  - `rust_pty` — in-app Rust PtyManager (Step 0).
- *  - `daemon`   — detached session daemon that survives app crashes (Step 2). */
-export type TerminalTransport = "cao_ws" | "rust_pty" | "daemon";
+ *  - `cao_ws` — CAO/tmux/WebSocket (the other CLIs; Claude fallback).
+ *  - `daemon` — the detached session daemon (the Rust PTY path; survives crashes). */
+export type TerminalTransport = "cao_ws" | "daemon";
 
-/** Frame transports that render in the xterm Rust-PTY view. */
-export function isRustPtyTransport(t: TerminalTransport | undefined): boolean {
-  return t === "rust_pty" || t === "daemon";
+/** Frame transports that render in the xterm daemon view (vs the CAO WebSocket
+ *  terminal). */
+export function isDaemonTransport(t: TerminalTransport | undefined): boolean {
+  return t === "daemon";
 }
 
 /** Shell-grid layout: an auto-grid of all frames, or one focused frame with a
@@ -76,7 +74,7 @@ export interface Frame {
   error?: string;
   /** Transport for this frame's terminal (default cao_ws). */
   transport?: TerminalTransport;
-  /** Rust PTY session id (when transport === "rust_pty"). */
+  /** Daemon session id (when transport === "daemon"). */
   ptySessionId?: string;
   /** Model label parsed from the agent's startup banner (best-effort). */
   model?: string;
@@ -99,8 +97,8 @@ export interface RustPtyMeta {
   startedAt: number;
   /** Lifecycle: "running" (reattachable) or "exited" (process gone; dismiss only). */
   status: RustPtyStatus;
-  /** Which backend/transport owns the session (used on reopen to pick the right attach path). */
-  transport?: "rust_pty" | "daemon";
+  /** The owning transport — always the daemon now (kept for forward-compat). */
+  transport?: "daemon";
 }
 
 /** Dirty-state surfaced by the Rust file watcher (step 4). */
@@ -222,10 +220,9 @@ interface Store {
     agentProfile?: string | null;
     sessionName?: string | null;
   }) => void;
-  /** Launch Claude on the Rust-owned PTY transport (CAO path untouched). */
-  launchClaudeRustPty: () => Promise<void>;
-  /** Launch Claude on the detached session daemon (survives app crashes). */
-  launchClaudeDaemon: () => Promise<void>;
+  /** Launch Claude on the detached session daemon (the Rust PTY path; survives
+   *  app crashes). Returns true on success so the caller can fall back to CAO. */
+  launchClaudeDaemon: () => Promise<boolean>;
   /** Reopen a detached (still-running) Rust-PTY agent in a new frame. */
   reopenRustPty: (ptySessionId: string) => void;
   /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
@@ -366,9 +363,9 @@ export const useStore = create<Store>((set, get) => ({
 
   refreshStatuses: async () => {
     const ids = get()
-      // Rust-PTY frames carry a CAO terminalId only for the attribution surface
+      // Daemon frames carry a CAO terminalId only for the attribution surface
       // (it's a provisioned worktree id, not a tmux terminal). Their lifecycle
-      // comes from ptyList via useRustPtyReconcile — polling CAO /terminals/{id}
+      // comes from daemon_list via useRustPtyReconcile — polling CAO /terminals/{id}
       // for them just 404s every tick. Skip them here.
       .frames.filter((f) => !f.ptySessionId)
       .map((f) => f.terminalId)
@@ -469,6 +466,16 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   launchAgent: async (provider, agentProfile, opts) => {
+    // Claude runs on the detached session daemon (the Rust PTY path) when it's
+    // available, falling back to CAO/tmux on failure or when the daemon isn't
+    // present (e.g. an unbundled build). The other CLIs always use CAO. (The
+    // daemon path currently launches the default Claude profile; per-profile /
+    // session launches still go through CAO until the daemon learns them.)
+    if (provider === "claude_code" && !opts?.sessionName && (await daemonAvailable())) {
+      if (await get().launchClaudeDaemon()) return;
+      // else: fall through to the CAO launch below
+    }
+
     // Optimistic: show a pending frame immediately.
     const key = nextKey();
     const placeholder: Frame = {
@@ -603,71 +610,13 @@ export const useStore = create<Store>((set, get) => ({
     }));
   },
 
-  launchClaudeRustPty: async () => {
-    const dir = get().workspaceDir;
-    try {
-      // Provision a worktree FIRST so the Rust-PTY agent gets the same
-      // attribution surface (dirty/diff/timeline/graph) as a CAO terminal —
-      // all of which key off this terminalId. Claude runs in the worktree path.
-      let terminalId: string | null = null;
-      let cwd = dir;
-      let branch: string | null = null;
-      if (dir) {
-        const wt = await api.provisionWorktree({
-          project_root: dir,
-          provider: "claude_code",
-          isolate: get().isolationEnabled,
-        });
-        terminalId = wt.terminal_id;
-        cwd = wt.worktree_path;
-        branch = wt.branch;
-      }
-      const sessionId = await ptySpawnClaude(cwd, 24, 80);
-      const key = nextKey();
-      set((s) => ({
-        frames: [
-          ...s.frames,
-          {
-            key,
-            terminalId, // = provisioned worktree id → attribution lights up
-            provider: "claude_code",
-            agentProfile: null,
-            sessionName: null,
-            pending: false,
-            transport: "rust_pty",
-            ptySessionId: sessionId,
-          },
-        ],
-        activeFrameKey: key,
-        rustPtySessions: terminalId
-          ? {
-              ...s.rustPtySessions,
-              [sessionId]: {
-                ptySessionId: sessionId,
-                terminalId,
-                provider: "claude_code",
-                branch,
-                cwd,
-                startedAt: Date.now(),
-                status: "running",
-                transport: "rust_pty",
-              },
-            }
-          : s.rustPtySessions,
-      }));
-      get().showSnackbar({ type: "success", message: "Claude launched (Rust PTY)" });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      get().showSnackbar({ type: "error", message: `Rust PTY launch failed: ${msg}` });
-    }
-  },
-
   launchClaudeDaemon: async () => {
     const dir = get().workspaceDir;
     try {
-      // Same attribution surface as the other transports: provision a worktree
-      // first so dirty/diff/timeline/graph key off this terminalId. We also pass
-      // it to the daemon as the attribution_key so turn events carry it.
+      // Same attribution surface as CAO: provision a worktree first so
+      // dirty/diff/timeline/graph key off this terminalId, and pass it to the
+      // daemon as the attribution_key so turn events carry it. (Worktree
+      // provisioning still uses the CAO backend — orchestration stays in CAO.)
       let terminalId: string | null = null;
       let cwd = dir;
       let branch: string | null = null;
@@ -715,9 +664,12 @@ export const useStore = create<Store>((set, get) => ({
           : s.rustPtySessions,
       }));
       get().showSnackbar({ type: "success", message: "Claude launched (daemon)" });
+      return true;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      get().showSnackbar({ type: "error", message: `Daemon launch failed: ${msg}` });
+      // Signal failure so launchAgent can fall back to CAO (e.g. daemon binary
+      // not present in an unbundled build).
+      console.warn("[taime] daemon launch failed; falling back to CAO", e);
+      return false;
     }
   },
 
@@ -778,7 +730,7 @@ export const useStore = create<Store>((set, get) => ({
           pending: false,
           // Reattach via the backend that owns the session (daemon vs in-app),
           // or the in-app default for pre-existing records without a transport.
-          transport: meta.transport === "daemon" ? "daemon" : "rust_pty",
+          transport: "daemon",
           ptySessionId,
         },
       ],
@@ -789,7 +741,7 @@ export const useStore = create<Store>((set, get) => ({
   killRustPty: async (key) => {
     const frame = get().frames.find((f) => f.key === key);
     const sid = frame?.ptySessionId;
-    if (sid) await (frame?.transport === "daemon" ? daemonKill(sid) : ptyKill(sid));
+    if (sid) await daemonKill(sid);
     set((s) => {
       const frames = s.frames.filter((f) => f.key !== key);
       const rustPtySessions = { ...s.rustPtySessions };
@@ -804,11 +756,8 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   forgetRustPty: async (ptySessionId) => {
-    // Route the kill to the owning backend only (avoids spawning the daemon just
-    // to kill an in-app session). Safe even if the session already exited.
-    const meta = get().rustPtySessions[ptySessionId];
-    if (meta?.transport === "daemon") await daemonKill(ptySessionId);
-    else await ptyKill(ptySessionId);
+    // Connect-only; safe even if the session already exited (won't spawn a daemon).
+    await daemonKill(ptySessionId);
     set((s) => {
       const rustPtySessions = { ...s.rustPtySessions };
       delete rustPtySessions[ptySessionId];
@@ -825,7 +774,7 @@ export const useStore = create<Store>((set, get) => ({
       // immediately reopen them. Rust-PTY frames are excluded — they have their
       // own detached-agent lifecycle (close detaches, doesn't kill).
       const dismissedTerminalIds =
-        frame && !isRustPtyTransport(frame.transport) && frame.terminalId
+        frame && !isDaemonTransport(frame.transport) && frame.terminalId
           ? new Set(s.dismissedTerminalIds).add(frame.terminalId)
           : s.dismissedTerminalIds;
       return {
@@ -837,12 +786,10 @@ export const useStore = create<Store>((set, get) => ({
             : s.activeFrameKey,
       };
     });
-    // Rust-PTY / daemon: detach the view but KEEP the agent running + its
-    // registry entry, so it shows up under "detached" and can be reopened.
-    if (isRustPtyTransport(frame?.transport) && frame?.ptySessionId) {
-      await (frame.transport === "daemon"
-        ? daemonCloseView(frame.ptySessionId)
-        : ptyCloseView(frame.ptySessionId));
+    // Daemon: detach the view but KEEP the agent running (it survives even an
+    // app crash) + its registry entry, so it shows under "detached" and reopens.
+    if (isDaemonTransport(frame?.transport) && frame?.ptySessionId) {
+      await daemonCloseView(frame.ptySessionId);
     }
     // Best-effort clear dirty marker for the closed terminal.
     if (frame?.terminalId) get().clearDirty(frame.terminalId);
