@@ -150,6 +150,9 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
           className="mb-1.5 w-full rounded-lg border border-ink-500 bg-ink-700 px-3 py-2 text-sm text-zinc-200"
         >
           <option value="default">default — plain agent (no orchestration)</option>
+          <option value="orchestrator">
+            orchestrator — can assign / handoff to other agents
+          </option>
           {profiles.some(isSupervisor) && (
             <optgroup label="Supervisors (orchestrate other agents)">
               {profiles.filter(isSupervisor).map((p) => (
@@ -175,9 +178,20 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
           {profile === "default" ? (
             <p className="text-[11px] leading-relaxed text-zinc-500">
               A standalone agent. It won&apos;t spawn or coordinate other agents.
-              Pick a <span className="text-zinc-300">supervisor</span> profile to
-              orchestrate a team.
+              Pick <span className="text-zinc-300">orchestrator</span> to let it
+              assign work to a team.
             </p>
+          ) : profile === "orchestrator" ? (
+            <div className="flex items-start gap-2">
+              <Users size={13} className="mt-0.5 shrink-0 text-teal-400" />
+              <p className="text-[11px] leading-relaxed text-zinc-400">
+                Gets the daemon&apos;s MCP tools (<span className="text-zinc-300">list_agents</span>,{" "}
+                <span className="text-zinc-300">send_message</span>,{" "}
+                <span className="text-zinc-300">handoff</span>,{" "}
+                <span className="text-zinc-300">assign</span>) so it can spawn and
+                coordinate other agents.
+              </p>
+            </div>
           ) : (
             <div className="flex items-start gap-2">
               {profileIsSupervisor ? (

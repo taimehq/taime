@@ -89,13 +89,11 @@ export function ActivityGraph() {
   );
 
   const load = useCallback(async () => {
-    if (!session) {
-      setGraph(null);
-      return;
-    }
+    // The daemon graph is global (all agents + inter-agent edges); the `session`
+    // is just a cosmetic label, so load regardless of whether a frame has one.
     setLoading(true);
     try {
-      setGraph(await api.getGraph(session));
+      setGraph(await api.getGraph(session ?? ""));
     } catch {
       setGraph(null);
     } finally {
@@ -137,9 +135,9 @@ export function ActivityGraph() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto p-4">
-        {!session && (
+        {graph && graph.agents.length === 0 && graph.edges.length === 0 && (
           <p className="text-sm text-zinc-500">
-            Launch an agent to start building the activity graph.
+            No agent activity yet. Launch an agent to start building the activity graph.
           </p>
         )}
 

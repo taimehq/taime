@@ -57,6 +57,7 @@ pub async fn daemon_provision_worktree(
 /// A high-level spawn for ANY provider through the daemon's registry (Phase 1).
 /// The daemon owns the launch recipe + MCP injection; the app just names the
 /// provider + default profile. `model`/`permission_mode` flow into the profile.
+#[allow(clippy::too_many_arguments)]
 fn default_agent_spec(
     provider: String,
     cwd: Option<String>,
@@ -65,6 +66,7 @@ fn default_agent_spec(
     attribution_key: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    inject_orchestration: bool,
 ) -> AgentSpawnSpec {
     AgentSpawnSpec {
         provider,
@@ -80,9 +82,9 @@ fn default_agent_spec(
         attribution_key,
         seed_prompt: None,
         env: vec![],
-        // Plain interactive agents don't get the orchestration tools (matches
-        // CAO); a supervisor launch would set this true.
-        inject_orchestration: false,
+        // Plain agents don't get the orchestration tools; an "orchestrator" launch
+        // sets this so the agent can call list_agents/send_message/handoff/assign.
+        inject_orchestration,
     }
 }
 
@@ -126,6 +128,7 @@ pub async fn daemon_send_message(
 
 /// Launch any supported CLI (`claude_code`/`codex`/`gemini_cli`/`grok_cli`) via
 /// the daemon's provider registry with the default (unrestricted) profile.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn daemon_spawn_agent(
     daemon: State<'_, DaemonClient>,
@@ -136,8 +139,18 @@ pub async fn daemon_spawn_agent(
     model: Option<String>,
     permission_mode: Option<String>,
     attribution_key: Option<String>,
+    inject_orchestration: Option<bool>,
 ) -> Result<String, String> {
-    let spec = default_agent_spec(provider, cwd, rows, cols, attribution_key, model, permission_mode);
+    let spec = default_agent_spec(
+        provider,
+        cwd,
+        rows,
+        cols,
+        attribution_key,
+        model,
+        permission_mode,
+        inject_orchestration.unwrap_or(false),
+    );
     daemon.spawn_agent(spec).await
 }
 

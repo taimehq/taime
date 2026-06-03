@@ -196,9 +196,10 @@ const PROVIDERS: ProviderInfo[] = [
 export const api = {
   health: async (): Promise<HealthInfo> => ({ status: "ok", service: "taime-session-daemon" }),
 
-  /** The daemon's provider registry (the 4 CLIs). Profiles aren't yet a daemon
+  /** The daemon's provider registry (the 4 CLIs) with an accurate `installed`
+   *  flag (binary resolvable in the daemon's env). Profiles aren't yet a daemon
    *  store — the launcher uses the default profile. */
-  listProviders: async (): Promise<ProviderInfo[]> => PROVIDERS,
+  listProviders: () => daemonQuery<ProviderInfo[]>("providers", {}, PROVIDERS),
   listProfiles: async (): Promise<AgentProfileInfo[]> => [],
 
   getWorkspaceInfo: (path: string) =>

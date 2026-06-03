@@ -38,12 +38,32 @@ durable inter-agent edges instead of CAO plugin events.
   worktree provisioning** flips to `daemonProvisionWorktree` (diff + worktree move
   together). Done as part of the Phase-7 cut-over.
 
-## Remaining Phase-6 follow-ups (additive, not regressions)
+## What "daemon-side attribution" means here (honest scope)
 
-- **fs-watch into the daemon** for attribution while the UI is closed: the app
-  watcher (`useFsWatch`) still runs (UI subscriber); moving the watcher core into
-  the daemon to record fs-events durably is the additive next step (the daemon
-  already provisions the worktrees it would watch). `postFsEvents` is now a no-op.
-- **Per-hunk authorship** awaits turn persistence (the daemon's turn boundaries
-  recorded to `taime_agent_turns`); `attribution` currently returns an empty
-  team/files map and the UI falls back to an ungrouped file list.
+The plan's Phase-6 bullet said *"move fs-watching into the daemon."* That is **not**
+what was delivered, and the language overstated it. What's actually true:
+
+- **The attribution OUTPUTS work with the UI closed**, because the daemon computes
+  them on demand from **git + the stored worktrees/edges**: `terminal_diff`,
+  `file_diffs`, `hunked_diff`, `contention` (git across a session's worktrees), and
+  the activity `graph` (assign/handoff/message edges persisted by Phase 5). None of
+  these need a running UI or live fs-events — git is the source of truth at query
+  time, and the worktree rows + edges are durable.
+- **The live fs-event SUBSTRATE did NOT move.** `fs_watch.rs` + `useFsWatch` +
+  `watch_terminal`/`unwatch_terminal` are still app-side and mount per *visible*
+  frame, driving the real-time **dirty badge** only. `postFsEvents` is a no-op (the
+  daemon doesn't ingest a live event stream), and daemon turns still emit
+  `fs_dirty_paths: []`. So the per-file change **timeline** for a *headless* agent
+  isn't captured — only its final git diff is.
+- **Rich per-hunk authorship is not delivered:** `attribution` returns an empty
+  team/files map (the UI falls back to an ungrouped file list), because it needs
+  per-turn snapshots persisted to `taime_agent_turns`, which the daemon doesn't
+  write yet.
+
+## Genuine remaining work (additive)
+
+- Extract the `fs_watch.rs` watcher core into a daemon module mounted per session
+  (recording fs-events to `taime_activity_events`), so the live change timeline +
+  dirty state survive a closed UI — Tauri becomes a pure subscriber.
+- Persist daemon turn boundaries (`taime_agent_turns`) so `attribution` can return
+  real per-hunk authorship (the diff/snapshot machinery already exists).

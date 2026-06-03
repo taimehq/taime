@@ -167,9 +167,8 @@ fn lock_settings(path: &Path) -> io::Result<SettingsLock> {
 }
 
 /// Merge an `mcpServers` map into a JSON settings file (gemini), creating the file
-/// + parent dir if needed. Returns the set of server names written (for cleanup).
-/// Existing unrelated keys are preserved. Serialized against concurrent
-/// spawns/cleanups via [`lock_settings`].
+/// and parent dir if needed. Existing unrelated keys are preserved. Serialized
+/// against concurrent spawns/cleanups via [`lock_settings`].
 pub fn merge_json_mcp_servers(
     path: &Path,
     servers: &[(String, serde_json::Value)],
