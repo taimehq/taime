@@ -105,6 +105,10 @@ pub async fn handle(stream: UnixStream, manager: Arc<Manager>, token: String) {
                 Ok(session_id) => send(&out_tx, &ServerMsg::Spawned { req_id, session_id }).await,
                 Err(e) => send(&out_tx, &ServerMsg::Error { message: e }).await,
             },
+            ClientMsg::SpawnAgent { req_id, spec } => match manager.spawn_agent(spec) {
+                Ok(session_id) => send(&out_tx, &ServerMsg::Spawned { req_id, session_id }).await,
+                Err(e) => send(&out_tx, &ServerMsg::Error { message: e }).await,
+            },
             ClientMsg::List { req_id } => {
                 send(&out_tx, &ServerMsg::Sessions { req_id, sessions: manager.list() }).await
             }

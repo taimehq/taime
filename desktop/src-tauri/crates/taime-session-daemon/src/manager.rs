@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use taime_protocol::{SessionSummary, SpawnSpec};
+use taime_protocol::{AgentSpawnSpec, SessionSummary, SpawnSpec};
 
+use crate::providers::Registry;
 use crate::session::Session;
 
 pub struct Manager {
@@ -19,6 +20,9 @@ pub struct Manager {
     conn_counter: AtomicU64,
     active_conns: AtomicU64,
     last_activity: Mutex<Instant>,
+    /// Provider adapter registry (Phase 1): builds the launch command + MCP
+    /// injection for high-level `SpawnAgent` requests.
+    registry: Registry,
 }
 
 impl Default for Manager {
@@ -35,6 +39,7 @@ impl Manager {
             conn_counter: AtomicU64::new(0),
             active_conns: AtomicU64::new(0),
             last_activity: Mutex::new(Instant::now()),
+            registry: Registry::load(),
         }
     }
 
@@ -60,6 +65,18 @@ impl Manager {
     pub fn spawn(&self, spec: SpawnSpec) -> Result<String, String> {
         let id = format!("pty-{:x}", self.session_counter.fetch_add(1, Ordering::SeqCst));
         let session = Session::spawn(id.clone(), &spec)?;
+        self.sessions.lock().unwrap().insert(id.clone(), session);
+        self.touch();
+        Ok(id)
+    }
+
+    /// Spawn a high-level agent request: the registry builds the provider command
+    /// + MCP injection, then we spawn it like any other session (the Phase-1
+    /// all-CLI path). The session carries the MCP cleanup + provider id.
+    pub fn spawn_agent(&self, spec: AgentSpawnSpec) -> Result<String, String> {
+        let prepared = self.registry.build(&spec)?;
+        let id = format!("pty-{:x}", self.session_counter.fetch_add(1, Ordering::SeqCst));
+        let session = Session::spawn_prepared(id.clone(), prepared, Some(spec.provider))?;
         self.sessions.lock().unwrap().insert(id.clone(), session);
         self.touch();
         Ok(id)

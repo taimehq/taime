@@ -4308,12 +4308,15 @@ dependencies = [
  "portable-pty",
  "postcard",
  "rand 0.8.6",
+ "regex",
  "serde",
+ "serde_json",
  "subtle",
  "taime-protocol",
  "termwiz",
  "tokio",
  "tokio-util",
+ "toml 0.8.2",
  "wezterm-term",
 ]
 

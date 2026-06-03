@@ -19,8 +19,8 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use taime_protocol::{
-    cap, decode_server, encode_client, parse_frame, paths, ClientMsg, Frame, ServerMsg, SpawnSpec,
-    MAGIC, MAX_FRAME_LEN, PROTOCOL_VERSION,
+    cap, decode_server, encode_client, parse_frame, paths, AgentSpawnSpec, ClientMsg, Frame,
+    ServerMsg, MAGIC, MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Mutex};
@@ -130,10 +130,12 @@ impl DaemonClient {
         }
     }
 
-    pub async fn spawn_session(&self, spec: SpawnSpec) -> Result<String, String> {
+    /// High-level agent spawn: the daemon's provider registry builds the command
+    /// + MCP injection (the Phase-1 all-CLI path). Returns the session id.
+    pub async fn spawn_agent(&self, spec: AgentSpawnSpec) -> Result<String, String> {
         let req_id = self.next_req();
         let mut conn = self.connect_handshake().await?;
-        send(&mut conn, &ClientMsg::Spawn { req_id, spec }).await?;
+        send(&mut conn, &ClientMsg::SpawnAgent { req_id, spec }).await?;
         match read_server(&mut conn).await? {
             ServerMsg::Spawned { session_id, .. } => Ok(session_id),
             ServerMsg::Error { message } => Err(message),

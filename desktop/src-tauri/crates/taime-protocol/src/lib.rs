@@ -94,6 +94,71 @@ pub struct SpawnSpec {
     pub attribution_key: Option<String>,
 }
 
+/// One MCP server entry the daemon should register for an agent at spawn (the
+/// per-provider injection of Phase 1). Mirrors CAO's `profile.mcpServers[name]`:
+/// the daemon stamps each server's `env` with `CAO_TERMINAL_ID = attribution_key`
+/// before injecting it per the provider's strategy (inline `--mcp-config` JSON,
+/// codex `-c mcp_servers.*` overrides, or `~/.gemini/settings.json` merge). In
+/// Phase 1 these come straight from the CAO profile ("wired to CAO's MCP for
+/// now"); Phase 5 swaps in the daemon's own endpoint without changing this shape.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// An agent profile — the CAO `agent_profile` decomposed into the data a provider
+/// adapter needs to build a capable launch command (system prompt, model,
+/// permission mode, tool restrictions, MCP servers, and the provider-specific
+/// native-agent / codex-profile escape hatches). All optional: an all-`None`
+/// profile is the "default" (unrestricted, no system prompt, no MCP) launch that
+/// matches today's `daemon_spawn_claude`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AgentProfile {
+    /// Profile name (e.g. "default", "developer"); display + log only.
+    pub name: String,
+    /// System prompt injected per provider (claude `--append-system-prompt`,
+    /// codex `developer_instructions`, gemini `GEMINI.md`). Already includes any
+    /// skill-catalog text the app appended.
+    pub system_prompt: Option<String>,
+    pub model: Option<String>,
+    /// Claude permission mode ("default"/"acceptEdits"/"plan"/"bypassPermissions");
+    /// when absent (or tools unrestricted) the provider uses its skip/yolo default.
+    pub permission_mode: Option<String>,
+    /// CAO-vocabulary allowed tools. `["*"]` or empty ⇒ unrestricted.
+    pub allowed_tools: Vec<String>,
+    /// Claude `--agent <name>` thin-wrapper (delegates config to Claude's native
+    /// agent store); when set, most other fields are ignored.
+    pub native_agent: Option<String>,
+    /// Codex `--profile <name>` (codex's own profile system).
+    pub codex_profile: Option<String>,
+    /// MCP servers to inject at spawn (see [`McpServerConfig`]).
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// High-level "launch agent X" request (the Phase-1 generalization of the
+/// Claude-only `SpawnSpec`). The daemon's provider **registry** turns this into
+/// the concrete PTY command + MCP injection — the recipe lives daemon-side so
+/// Phase-5 headless `assign` can spawn workers without the app. `attribution_key`
+/// doubles as the `CAO_TERMINAL_ID` stamped into MCP server envs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSpawnSpec {
+    /// Provider id: `claude_code` | `codex` | `gemini_cli` | `grok_cli`.
+    pub provider: String,
+    pub profile: AgentProfile,
+    pub cwd: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub attribution_key: Option<String>,
+    /// Optional first prompt to seed after the agent is ready (reserved; the app
+    /// drives initial input today). Stored for Phase-5 `assign`/`handoff` seeding.
+    pub seed_prompt: Option<String>,
+    /// Extra env overrides applied last (after the provider's own env).
+    pub env: Vec<(String, String)>,
+}
+
 /// App → daemon. The first message on every connection MUST be `Hello`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
@@ -105,8 +170,14 @@ pub enum ClientMsg {
         /// peer-uid gate). Empty string when the daemon advertised no token.
         attach_token: String,
     },
-    /// Create a session. `req_id` correlates the `Spawned` reply.
+    /// Create a session from a low-level, fully-resolved [`SpawnSpec`] (the
+    /// Claude-only Step-2 path; still used for back-compat). `req_id` correlates
+    /// the `Spawned` reply.
     Spawn { req_id: u64, spec: SpawnSpec },
+    /// Create a session from a high-level [`AgentSpawnSpec`]: the daemon's
+    /// provider registry builds the command + injects MCP. `req_id` correlates
+    /// the `Spawned` reply. This is the Phase-1 all-CLI spawn path.
+    SpawnAgent { req_id: u64, spec: AgentSpawnSpec },
     /// Enumerate sessions. `req_id` correlates the `Sessions` reply.
     List { req_id: u64 },
     /// Bind THIS connection to stream `session_id`'s output. Carries the client's
@@ -190,6 +261,23 @@ pub struct SessionSummary {
     pub attribution_key: Option<String>,
     /// Protocol version the daemon serving this session speaks (upgrade UI).
     pub protocol_version: u16,
+}
+
+/// An agent's inferred lifecycle state — CAO's `TerminalStatus`, native to the
+/// daemon. Phase 1 defines it (the provider adapters compute it from the grid);
+/// Phase 4 adds it to [`SessionSummary`] + a push event and drives the UI badge.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentStatus {
+    /// Ready for input; idle prompt visible, no active work.
+    Idle,
+    /// Actively working (spinner / streaming output).
+    Processing,
+    /// Blocked on an approval/permission prompt the user must answer.
+    WaitingUserAnswer,
+    /// Finished a turn with a response visible at the idle prompt.
+    Completed,
+    /// Error state or unreadable/empty grid.
+    Error,
 }
 
 /// Why a turn started/ended — the plural boundary signals, ranked by trust.
@@ -395,6 +483,45 @@ mod tests {
             Frame::Control(body) => match decode_server(&body).unwrap() {
                 ServerMsg::AttachOk { rows, cols, seq_n, alt_screen } => {
                     assert_eq!((rows, cols, seq_n, alt_screen), (24, 80, 1000, true));
+                }
+                other => panic!("wrong msg {other:?}"),
+            },
+            other => panic!("expected Control, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_agent_control_roundtrips() {
+        let spec = AgentSpawnSpec {
+            provider: "codex".into(),
+            profile: AgentProfile {
+                name: "default".into(),
+                model: Some("gpt-5".into()),
+                mcp_servers: vec![McpServerConfig {
+                    name: "cao".into(),
+                    command: "cao-mcp-server".into(),
+                    args: vec!["--stdio".into()],
+                    env: vec![("X".into(), "1".into())],
+                }],
+                ..Default::default()
+            },
+            cwd: Some("/tmp/wt".into()),
+            rows: 40,
+            cols: 120,
+            attribution_key: Some("term-abc".into()),
+            seed_prompt: None,
+            env: vec![],
+        };
+        let msg = ClientMsg::SpawnAgent { req_id: 9, spec };
+        let payload = encode_client(&msg).unwrap();
+        match parse_frame(BytesMut::from(&payload[..])).unwrap() {
+            Frame::Control(body) => match decode_client(&body).unwrap() {
+                ClientMsg::SpawnAgent { req_id, spec } => {
+                    assert_eq!(req_id, 9);
+                    assert_eq!(spec.provider, "codex");
+                    assert_eq!(spec.profile.model.as_deref(), Some("gpt-5"));
+                    assert_eq!(spec.profile.mcp_servers.len(), 1);
+                    assert_eq!(spec.attribution_key.as_deref(), Some("term-abc"));
                 }
                 other => panic!("wrong msg {other:?}"),
             },

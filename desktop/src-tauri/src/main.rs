@@ -85,7 +85,7 @@ fn main() {
             commands::watch_terminal,
             commands::unwatch_terminal,
             commands::clear_dirty,
-            commands::daemon_spawn_claude,
+            commands::daemon_spawn_agent,
             commands::daemon_attach,
             commands::daemon_write,
             commands::daemon_resize,

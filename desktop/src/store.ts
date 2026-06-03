@@ -25,13 +25,29 @@ import {
   saveSidebarCollapsed,
 } from "./lib/preferences";
 import {
-  daemonSpawnClaude,
+  daemonSpawnAgent,
   daemonKill,
   daemonCloseView,
   daemonAvailable,
   type TurnEvent,
   type DaemonSessionSummary,
 } from "./pty";
+import { providerTitle } from "./lib/providerLabel";
+
+/** Providers the daemon can launch directly (Phase 1 of the CAO replacement). The
+ *  default-profile launch routes here; sessions / non-default profiles still go
+ *  through CAO until the daemon learns them. */
+const DAEMON_PROVIDERS = new Set(["claude_code", "codex", "gemini_cli", "grok_cli"]);
+
+/** Best-effort provider id from a daemon session's program path (for adopting a
+ *  crash-surviving session before the daemon reports provider on the wire). */
+function providerFromProgram(program: string): string {
+  const base = program.split("/").pop() ?? program;
+  if (base.includes("codex")) return "codex";
+  if (base.includes("gemini")) return "gemini_cli";
+  if (base.includes("grok")) return "grok_cli";
+  return "claude_code";
+}
 
 /** Which transport carries a frame's terminal I/O.
  *  - `cao_ws` — CAO/tmux/WebSocket (the other CLIs; Claude fallback).
@@ -220,9 +236,10 @@ interface Store {
     agentProfile?: string | null;
     sessionName?: string | null;
   }) => void;
-  /** Launch Claude on the detached session daemon (the Rust PTY path; survives
-   *  app crashes). Returns true on success so the caller can fall back to CAO. */
-  launchClaudeDaemon: () => Promise<boolean>;
+  /** Launch a provider on the detached session daemon (the Rust PTY path; survives
+   *  app crashes) via its registry adapter. Returns true on success so the caller
+   *  can fall back to CAO. */
+  launchAgentDaemon: (provider: string) => Promise<boolean>;
   /** Reopen a detached (still-running) Rust-PTY agent in a new frame. */
   reopenRustPty: (ptySessionId: string) => void;
   /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
@@ -466,13 +483,18 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   launchAgent: async (provider, agentProfile, opts) => {
-    // Claude runs on the detached session daemon (the Rust PTY path) when it's
-    // available, falling back to CAO/tmux on failure or when the daemon isn't
-    // present (e.g. an unbundled build). The other CLIs always use CAO. (The
-    // daemon path currently launches the default Claude profile; per-profile /
-    // session launches still go through CAO until the daemon learns them.)
-    if (provider === "claude_code" && !opts?.sessionName && (await daemonAvailable())) {
-      if (await get().launchClaudeDaemon()) return;
+    // Any supported CLI runs on the detached session daemon (the Rust PTY path)
+    // when it's available, falling back to CAO/tmux on failure or when the daemon
+    // isn't present (e.g. an unbundled build). The daemon launches the DEFAULT
+    // profile; non-default profiles and adding-to-a-session still go through CAO
+    // until the daemon learns them.
+    if (
+      DAEMON_PROVIDERS.has(provider) &&
+      agentProfile === "default" &&
+      !opts?.sessionName &&
+      (await daemonAvailable())
+    ) {
+      if (await get().launchAgentDaemon(provider)) return;
       // else: fall through to the CAO launch below
     }
 
@@ -610,27 +632,28 @@ export const useStore = create<Store>((set, get) => ({
     }));
   },
 
-  launchClaudeDaemon: async () => {
+  launchAgentDaemon: async (provider) => {
     const dir = get().workspaceDir;
     try {
       // Same attribution surface as CAO: provision a worktree first so
       // dirty/diff/timeline/graph key off this terminalId, and pass it to the
       // daemon as the attribution_key so turn events carry it. (Worktree
-      // provisioning still uses the CAO backend — orchestration stays in CAO.)
+      // provisioning still uses the CAO backend — orchestration stays in CAO
+      // until Phase 3 moves it daemon-side.)
       let terminalId: string | null = null;
       let cwd = dir;
       let branch: string | null = null;
       if (dir) {
         const wt = await api.provisionWorktree({
           project_root: dir,
-          provider: "claude_code",
+          provider,
           isolate: get().isolationEnabled,
         });
         terminalId = wt.terminal_id;
         cwd = wt.worktree_path;
         branch = wt.branch;
       }
-      const sessionId = await daemonSpawnClaude(cwd, 24, 80, terminalId);
+      const sessionId = await daemonSpawnAgent(provider, cwd, 24, 80, terminalId);
       const key = nextKey();
       set((s) => ({
         frames: [
@@ -638,7 +661,7 @@ export const useStore = create<Store>((set, get) => ({
           {
             key,
             terminalId,
-            provider: "claude_code",
+            provider,
             agentProfile: null,
             sessionName: null,
             pending: false,
@@ -653,7 +676,7 @@ export const useStore = create<Store>((set, get) => ({
               [sessionId]: {
                 ptySessionId: sessionId,
                 terminalId,
-                provider: "claude_code",
+                provider,
                 branch,
                 cwd,
                 startedAt: Date.now(),
@@ -663,7 +686,10 @@ export const useStore = create<Store>((set, get) => ({
             }
           : s.rustPtySessions,
       }));
-      get().showSnackbar({ type: "success", message: "Claude launched (daemon)" });
+      get().showSnackbar({
+        type: "success",
+        message: `${providerTitle(provider)} launched (daemon)`,
+      });
       return true;
     } catch (e) {
       // Signal failure so launchAgent can fall back to CAO (e.g. daemon binary
@@ -692,7 +718,7 @@ export const useStore = create<Store>((set, get) => ({
       const meta: RustPtyMeta = {
         ptySessionId: summary.id,
         terminalId: summary.attribution_key ?? "",
-        provider: "claude_code",
+        provider: providerFromProgram(summary.program),
         branch: null,
         cwd: summary.cwd || null,
         startedAt: summary.created_at_unix ? summary.created_at_unix * 1000 : Date.now(),
