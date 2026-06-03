@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { api } from "../api";
-import { useStore, isRustPtyTransport } from "../store";
+import { useStore, isDaemonTransport } from "../store";
 
 /** How often to reconcile a session's terminal list against the open frames. */
 const RECONCILE_INTERVAL = 10000;
@@ -9,12 +9,12 @@ const MAX_SURFACED_PER_TICK = 6;
 
 /**
  * All terminalIds currently represented by a frame — the dedupe keys for
- * reconciliation. This INCLUDES rust_pty frames: a Rust-PTY agent's frame
- * carries its provisioned worktree terminalId, so keying on it here prevents
- * reconcile from opening a second (CAO) frame for the same id. (In practice a
- * provisioned rust_pty id has no tmux pane, so getSession never lists it — see
- * the terminal listing in api/main.py — but excluding it explicitly is robust
- * against that ever changing.)
+ * reconciliation. This INCLUDES daemon frames: a daemon agent's frame carries
+ * its provisioned worktree terminalId, so keying on it here prevents reconcile
+ * from opening a second (CAO) frame for the same id. (In practice a provisioned
+ * daemon id has no tmux pane, so getSession never lists it — see the terminal
+ * listing in api/main.py — but excluding it explicitly is robust against that
+ * ever changing.)
  */
 function shownTerminalIds(
   state: ReturnType<typeof useStore.getState>,
@@ -58,7 +58,7 @@ export function useTerminalReconcile() {
         state.frames
           .filter(
             (f) =>
-              !isRustPtyTransport(f.transport) &&
+              !isDaemonTransport(f.transport) &&
               !f.pending &&
               !!f.terminalId &&
               !!f.sessionName &&
