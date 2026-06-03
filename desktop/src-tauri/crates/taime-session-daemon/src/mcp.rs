@@ -47,6 +47,42 @@ pub fn tool_definitions() -> Value {
                 "required": ["to", "body"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "broadcast",
+            "description": "Send a message to every other live agent's inbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "body": { "type": "string", "description": "Message body." } },
+                "required": ["body"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "handoff",
+            "description": "Hand off to another agent with a context summary (transfers the active role; records a handoff edge).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string", "description": "Receiver agent id." },
+                    "summary": { "type": "string", "description": "Context summary for the receiver." }
+                },
+                "required": ["to", "summary"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "assign",
+            "description": "Spawn a worker sub-agent in its own worktree, seed it with a task, and get back its id. The worker reports results to you via send_message.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string", "description": "The task for the worker." },
+                    "working_directory": { "type": "string", "description": "Optional project root to fork the worker's worktree from." }
+                },
+                "required": ["message"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -109,6 +145,39 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
             match manager.enqueue_message(caller.to_string(), to.to_string(), body.to_string()) {
                 Ok(mid) => tool_ok(id, json!({ "ok": true, "message_id": mid })),
                 Err(e) => tool_err(id, &format!("send_message failed: {e}")),
+            }
+        }
+        "broadcast" => {
+            let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            if body.is_empty() {
+                return tool_err(id, "broadcast: 'body' is required");
+            }
+            let n = manager.broadcast(caller, body);
+            tool_ok(id, json!({ "ok": true, "recipients": n }))
+        }
+        "handoff" => {
+            let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+            if to.is_empty() || to == caller {
+                return tool_err(id, "handoff: a distinct 'to' is required");
+            }
+            match manager.handoff(caller, to, summary) {
+                Ok(mid) => tool_ok(id, json!({ "ok": true, "message_id": mid })),
+                Err(e) => tool_err(id, &format!("handoff failed: {e}")),
+            }
+        }
+        "assign" => {
+            let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            if message.is_empty() {
+                return tool_err(id, "assign: 'message' is required");
+            }
+            let wd = args
+                .get("working_directory")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            match manager.assign_worker(caller, message, wd) {
+                Ok(worker) => tool_ok(id, json!({ "ok": true, "worker_id": worker })),
+                Err(e) => tool_err(id, &format!("assign failed: {e}")),
             }
         }
         other => error(id, -32602, &format!("unknown tool '{other}'")),
@@ -222,6 +291,54 @@ mod tests {
             "params": { "name": "send_message", "arguments": { "body": "x" } }
         });
         assert_eq!(handle(&mgr, "term-a", &no_to)["result"]["isError"], true);
+    }
+
+    #[test]
+    fn broadcast_with_no_agents_is_zero_recipients() {
+        let mgr = manager();
+        let req = json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": { "name": "broadcast", "arguments": { "body": "standup in 5" } }
+        });
+        let resp = handle(&mgr, "term-a", &req);
+        assert_eq!(resp["result"]["isError"], false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"recipients\":0"));
+    }
+
+    #[test]
+    fn handoff_enqueues_and_is_distinct() {
+        let mgr = manager();
+        // self-handoff rejected.
+        let self_ho = json!({
+            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+            "params": { "name": "handoff", "arguments": { "to": "term-a", "summary": "x" } }
+        });
+        assert_eq!(handle(&mgr, "term-a", &self_ho)["result"]["isError"], true);
+
+        let ho = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": { "name": "handoff", "arguments": { "to": "term-b", "summary": "take the diff from here" } }
+        });
+        assert_eq!(handle(&mgr, "term-a", &ho)["result"]["isError"], false);
+        let pending = mgr.store().unwrap().pending_for("term-b", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sender_id, "term-a");
+    }
+
+    #[test]
+    fn tools_list_has_the_full_surface() {
+        let mgr = manager();
+        let resp = handle(&mgr, "term-a", &json!({"jsonrpc":"2.0","id":10,"method":"tools/list"}));
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for t in ["list_agents", "send_message", "broadcast", "handoff", "assign"] {
+            assert!(names.contains(&t), "missing tool {t}");
+        }
     }
 
     #[test]

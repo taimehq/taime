@@ -311,6 +311,7 @@ mod tests {
             attribution_key: Some("term-1".into()),
             seed_prompt: None,
             env: vec![],
+            inject_orchestration: false,
         }
     }
 

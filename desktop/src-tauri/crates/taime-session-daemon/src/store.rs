@@ -219,6 +219,26 @@ impl Store {
         Ok(())
     }
 
+    /// Record an inter-agent edge in the activity graph (`kind` ∈
+    /// send_message|handoff|assign): `source` → `target` by attribution key
+    /// (mirrors CAO's `taime_activity_events` with `target_terminal_id`).
+    pub fn record_activity_edge(
+        &self,
+        id: &str,
+        kind: &str,
+        source: &str,
+        target: &str,
+        ts_unix: u64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO taime_activity_events (id, ts, kind, terminal_id, target_terminal_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, ts_unix.to_string(), kind, source, target],
+        )?;
+        Ok(())
+    }
+
     /// All recorded sessions, newest first (history / detached-panel backfill).
     #[allow(dead_code)] // consumed by the Phase-6 history/route layer.
     pub fn list_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {

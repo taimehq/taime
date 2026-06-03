@@ -40,9 +40,11 @@ pub const MAGIC: u32 = 0x7461_696d;
 /// v2: `SessionSummary` gained `provider` + `status` (Phase 4 status inference).
 /// v3: added `ProvisionWorktree`/`Worktree` (Phase 3 daemon-owned worktrees).
 /// v4: added `SendMessage`/`MessageQueued` (Phase 5 inbox message bus).
+/// v5: added `McpRequest`/`McpResponse` + `AgentSpawnSpec.inject_orchestration`
+///     (Phase 5 daemon-hosted MCP transport).
 /// Postcard is positional, so these are wire-layout changes — a stale older
 /// daemon is rejected at handshake and the app falls back rather than misparsing.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Feature flags negotiated in the handshake (`capabilities` bitset). Reserving
 /// the bits now keeps app-update-while-old-daemon-running safe.
@@ -163,6 +165,13 @@ pub struct AgentSpawnSpec {
     pub seed_prompt: Option<String>,
     /// Extra env overrides applied last (after the provider's own env).
     pub env: Vec<(String, String)>,
+    /// Inject the daemon's own MCP endpoint (the orchestration tools:
+    /// list_agents/send_message/handoff/assign…) so this agent can drive other
+    /// agents. Default `false` so plain agents launch unchanged (matches CAO,
+    /// where only orchestration profiles get the tools); set `true` for a
+    /// supervisor. Assigned workers are always spawned with `false` (no runaway).
+    #[serde(default)]
+    pub inject_orchestration: bool,
 }
 
 /// Result of provisioning (or resolving) an isolated agent worktree — the
@@ -212,6 +221,11 @@ pub enum ClientMsg {
     /// `MessageQueued`. (`sender` is trusted same-user here; the MCP path stamps
     /// it from the authenticated session.)
     SendMessage { req_id: u64, sender: String, receiver: String, message: String },
+    /// One MCP JSON-RPC request from an agent's stdio shim (Phase 5 transport).
+    /// `token` is the per-agent token issued at spawn; the daemon resolves the
+    /// caller's identity from it (authenticated `from`, not a client field) and
+    /// dispatches `json` to the in-process MCP tool layer. Replies `McpResponse`.
+    McpRequest { req_id: u64, token: String, json: String },
     /// Enumerate sessions. `req_id` correlates the `Sessions` reply.
     List { req_id: u64 },
     /// Bind THIS connection to stream `session_id`'s output. Carries the client's
@@ -272,6 +286,8 @@ pub enum ServerMsg {
     Worktree { req_id: u64, info: WorktreeInfo },
     /// Reply to `SendMessage`: the enqueued message's monotonic inbox id.
     MessageQueued { req_id: u64, id: i64 },
+    /// Reply to `McpRequest`: the MCP JSON-RPC response (empty for a notification).
+    McpResponse { req_id: u64, json: String },
     /// Handoff step 2: the grid is snapshotted at `seq_n`. A `T_REPAINT` frame
     /// (carrying the same `seq_n`) follows immediately, then `T_DATA` frames with
     /// `start_offset >= seq_n`.
@@ -563,6 +579,7 @@ mod tests {
             attribution_key: Some("term-abc".into()),
             seed_prompt: None,
             env: vec![],
+            inject_orchestration: false,
         };
         let msg = ClientMsg::SpawnAgent { req_id: 9, spec };
         let payload = encode_client(&msg).unwrap();

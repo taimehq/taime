@@ -46,15 +46,35 @@ Crucially, `send_message`'s `from` is **stamped from the authenticated `caller`*
 are JSON-RPC errors. Unit-tested (initialize/tools-list/from-stamping/self-send
 rejection/unknown-method).
 
+## Per-agent transport + the full tool surface — built
+
+- **Stdio shim** (`taime-session-daemon --mcp-stdio`): the daemon binary doubles
+  as the per-agent MCP shim. It bridges the CLI's MCP client (newline-delimited
+  JSON-RPC on stdin/stdout, per the MCP stdio transport) to the daemon's
+  dispatcher over the control socket, authenticated by `$TAIME_MCP_TOKEN`. No
+  separate binary, no network surface.
+- **Per-agent token auth** (`McpRequest`/`McpResponse`, protocol → v5): the
+  daemon issues a 128-bit token at spawn, injects it into the agent's MCP-server
+  env (via the **Phase-1 per-provider injection** — `inject_orchestration`),
+  maps token → attribution key, and resolves the **authenticated caller** from it
+  (cleaned on exit). `conn.rs` runs `handle_mcp` in `spawn_blocking` (assign
+  shells out to git).
+- **Tools:** `list_agents`, `send_message`, `broadcast`, `handoff`, and **`assign`**
+  (`Manager::assign_worker` — provision a worktree off the parent, spawn a
+  default-profile worker with the **same provider but no orchestration tools** so
+  it can't re-`assign`, seed the task via the inbox, record the parent→child
+  `assign` edge). 8 dispatcher unit tests.
+
 ## Remaining Phase-5 work (needs a live agent to validate)
 
-- **The per-agent transport** that mounts the dispatcher: a tiny **stdio shim**
-  bridging each CLI's MCP client to the daemon (or loopback HTTP+SSE + per-agent
-  token), injected via the Phase-1 per-provider MCP config (swap the daemon's
-  endpoint in for CAO's). Validating the MCP handshake against a real CLI is why
-  this isn't mounted yet.
-- **More tools:** `broadcast`/`request`/`reply` (correlation id over the inbox),
-  `handoff` (transfer + edge).
+- **Turn it on for a supervisor:** `inject_orchestration` defaults **off** so the
+  proven plain-agent launch is untouched. Launching a supervisor through the
+  daemon with it `true` + the supervisor's resolved profile needs the deferred
+  Phase-1 *profile passing* (the app routes non-default profiles to CAO today).
+  Once on, validate the **MCP handshake against a real CLI** (the one piece that
+  genuinely needs a live agent).
+- `request`/`reply` (correlation id over the inbox) and a constrained per-worker
+  tool allow-list (richer than "no tools") + `assign` depth/fan limits.
 - **`assign`** (worker spawn): `Manager::spawn_agent` + `provision_worktree`
   already exist; `assign` adds a constrained MCP allow-list (so a worker can't
   infinitely re-`assign`), parent→child linkage, and result fan-in via `reply`.

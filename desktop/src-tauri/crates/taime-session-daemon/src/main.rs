@@ -31,6 +31,79 @@ const QUIET_WINDOW: Duration = Duration::from_millis(700);
 /// Shut down after this long with no sessions and no connected client.
 const IDLE_GRACE: Duration = Duration::from_secs(30);
 
+/// `--mcp-stdio` mode: the per-agent MCP stdio shim. Bridges the CLI's MCP client
+/// (newline-delimited JSON-RPC on stdin/stdout, per the MCP stdio transport) to
+/// the daemon's MCP dispatcher over the control socket, authenticated by
+/// `$TAIME_MCP_TOKEN`. The Phase-1 per-provider injection points the agent's MCP
+/// server command at `<this binary> --mcp-stdio`.
+fn run_mcp_shim() -> anyhow::Result<()> {
+    use bytes::BytesMut;
+    use std::io::{BufRead, Read, Write};
+    use std::os::unix::net::UnixStream;
+    use taime_protocol::{
+        cap, decode_server, encode_client, parse_frame, paths, ClientMsg, Frame, ServerMsg, MAGIC,
+        PROTOCOL_VERSION,
+    };
+
+    fn write_frame(s: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
+        s.write_all(&(payload.len() as u32).to_be_bytes())?;
+        s.write_all(payload)?;
+        s.flush()
+    }
+    fn read_frame(s: &mut UnixStream) -> std::io::Result<BytesMut> {
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len)?;
+        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+        s.read_exact(&mut buf)?;
+        Ok(BytesMut::from(&buf[..]))
+    }
+
+    let token = std::env::var("TAIME_MCP_TOKEN").unwrap_or_default();
+    let socket = paths::default_socket_path()?;
+    let mut stream = UnixStream::connect(&socket)?;
+
+    // Handshake (same posture as the app client).
+    let attach_token = std::fs::read_to_string(paths::token_path(&socket)).unwrap_or_default();
+    let hello = encode_client(&ClientMsg::Hello {
+        magic: MAGIC,
+        protocol_version: PROTOCOL_VERSION,
+        capabilities: cap::CURRENT,
+        attach_token,
+    })
+    .map_err(|e| anyhow::anyhow!("encode hello: {e}"))?;
+    write_frame(&mut stream, &hello)?;
+    let _ = read_frame(&mut stream)?; // HelloOk / HelloRejected
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let mut req_id: u64 = 1;
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let payload = encode_client(&ClientMsg::McpRequest { req_id, token: token.clone(), json: line })
+            .map_err(|e| anyhow::anyhow!("encode mcp request: {e}"))?;
+        write_frame(&mut stream, &payload)?;
+        req_id += 1;
+        // Read until the matching McpResponse arrives (no other frames on this
+        // connection — the shim never attaches a session).
+        loop {
+            let frame = read_frame(&mut stream)?;
+            if let Ok(Frame::Control(body)) = parse_frame(frame) {
+                if let Ok(ServerMsg::McpResponse { json, .. }) = decode_server(&body) {
+                    if !json.is_empty() {
+                        writeln!(stdout, "{json}")?;
+                        stdout.flush()?;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_socket_arg() -> Option<PathBuf> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -48,6 +121,12 @@ fn cleanup(paths: &Paths) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Per-agent MCP stdio shim mode (Phase 5 transport): bridge the CLI's MCP
+    // client to the daemon's tool dispatcher. Runs instead of the daemon.
+    if std::env::args().any(|a| a == "--mcp-stdio") {
+        return run_mcp_shim();
+    }
+
     let paths = match parse_socket_arg() {
         Some(p) => runtime::for_socket(p)?,
         None => runtime::default_paths()?,

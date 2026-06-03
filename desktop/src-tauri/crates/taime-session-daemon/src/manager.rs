@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use taime_protocol::{AgentSpawnSpec, SessionSummary, SpawnSpec, WorktreeInfo};
+use taime_protocol::{
+    AgentProfile, AgentSpawnSpec, McpServerConfig, SessionSummary, SpawnSpec, WorktreeInfo,
+};
 
 use crate::providers::Registry;
 use crate::session::Session;
@@ -27,10 +29,19 @@ pub struct Manager {
     /// Durable orchestration store (Phase 3). `None` if the DB couldn't open —
     /// persistence is best-effort and never blocks spawning.
     store: Option<Store>,
+    /// Per-agent MCP token → attribution key (Phase 5 transport). Issued at spawn
+    /// for orchestration-enabled agents and injected into their MCP shim's env;
+    /// the daemon resolves the authenticated caller from it. Cleaned on exit.
+    tokens: Mutex<HashMap<String, String>>,
 }
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// A 128-bit random hex id (per-agent MCP tokens + activity-event ids).
+fn gen_id() -> String {
+    format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>())
 }
 
 /// The delimited stdin payload for an inbox delivery — a clear visual frame so
@@ -63,6 +74,7 @@ impl Manager {
             last_activity: Mutex::new(Instant::now()),
             registry: Registry::load(),
             store,
+            tokens: Mutex::new(HashMap::new()),
         }
     }
 
@@ -96,7 +108,23 @@ impl Manager {
     /// Spawn a high-level agent request: the registry builds the provider command
     /// + MCP injection, then we spawn it like any other session (the Phase-1
     /// all-CLI path). The session carries the MCP cleanup + provider id.
-    pub fn spawn_agent(&self, spec: AgentSpawnSpec) -> Result<String, String> {
+    pub fn spawn_agent(&self, mut spec: AgentSpawnSpec) -> Result<String, String> {
+        // Phase-5 transport: an orchestration-enabled agent gets the daemon's own
+        // MCP endpoint injected (the stdio shim = this binary `--mcp-stdio`),
+        // authenticated by a per-agent token. Plain agents skip it (CAO parity).
+        let mut issued_token: Option<String> = None;
+        if spec.inject_orchestration {
+            if let Some(bin) = std::env::current_exe().ok().and_then(|p| p.to_str().map(String::from)) {
+                let token = gen_id();
+                spec.profile.mcp_servers.push(McpServerConfig {
+                    name: "taime".to_string(),
+                    command: bin,
+                    args: vec!["--mcp-stdio".to_string()],
+                    env: vec![("TAIME_MCP_TOKEN".to_string(), token.clone())],
+                });
+                issued_token = Some(token);
+            }
+        }
         let prepared = self.registry.build(&spec)?;
         // The adapter (status inference) travels with the session.
         let adapter = self.registry.adapter(&spec.provider);
@@ -104,6 +132,9 @@ impl Manager {
         let program = prepared.spec.prog.clone();
         let session = Session::spawn_prepared(id.clone(), prepared, adapter)?;
         self.sessions.lock().unwrap().insert(id.clone(), session);
+        if let (Some(token), Some(key)) = (issued_token, &spec.attribution_key) {
+            self.tokens.lock().unwrap().insert(token, key.clone());
+        }
         // Durable record (best-effort): the agent existed, with its provider +
         // attribution key + cwd, for history / Phase-6 attribution.
         if let Some(store) = &self.store {
@@ -208,6 +239,119 @@ impl Manager {
         }
     }
 
+    // ---- Phase 5 MCP transport + orchestration tools ----
+
+    /// Resolve a per-agent MCP token to the authenticated caller's attribution
+    /// key. `None` = unknown/expired token (request is rejected).
+    fn resolve_token(&self, token: &str) -> Option<String> {
+        self.tokens.lock().unwrap().get(token).cloned()
+    }
+
+    /// Dispatch one MCP JSON-RPC request from an agent's stdio shim: authenticate
+    /// via `token`, then run the in-process tool layer with the resolved caller.
+    /// Returns the JSON-RPC response (empty string for a notification). Shells out
+    /// (assign → git worktree), so call from a blocking context.
+    pub fn handle_mcp(&self, token: &str, json: &str) -> String {
+        let caller = match self.resolve_token(token) {
+            Some(c) => c,
+            None => {
+                return r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"unauthorized"}}"#
+                    .to_string()
+            }
+        };
+        let req: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(_) => {
+                return r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#
+                    .to_string()
+            }
+        };
+        let resp = crate::mcp::handle(self, &caller, &req);
+        if resp.is_null() {
+            String::new()
+        } else {
+            resp.to_string()
+        }
+    }
+
+    /// Broadcast a message to every live agent except the sender. Returns the
+    /// count enqueued.
+    pub fn broadcast(&self, sender: &str, body: &str) -> usize {
+        let receivers: Vec<String> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|s| s.attribution_key())
+            .filter(|k| k != sender)
+            .collect();
+        let mut n = 0;
+        for r in receivers {
+            if self.enqueue_message(sender.to_string(), r, body.to_string()).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Hand off to another agent: enqueue the summary + record a handoff edge.
+    pub fn handoff(&self, from: &str, to: &str, summary: &str) -> Result<i64, String> {
+        let id = self.enqueue_message(from.to_string(), to.to_string(), summary.to_string())?;
+        if let Some(store) = &self.store {
+            let _ = store.record_activity_edge(&gen_id(), "handoff", from, to, now_unix());
+        }
+        Ok(id)
+    }
+
+    /// Spawn a worker sub-agent (`assign`): provision a worktree off the parent's
+    /// project, launch a default-profile worker (same provider, **no**
+    /// orchestration tools so it can't re-assign), seed the task via the inbox
+    /// (delivered when the worker is idle), and record the parent→child edge.
+    /// Returns the worker's attribution key.
+    pub fn assign_worker(
+        &self,
+        parent_key: &str,
+        prompt: &str,
+        working_directory: Option<String>,
+    ) -> Result<String, String> {
+        let parent = self.session_by_attribution(parent_key);
+        let provider = parent
+            .as_ref()
+            .and_then(|s| s.provider())
+            .unwrap_or_else(|| "claude_code".to_string());
+        let project_root = working_directory
+            .clone()
+            .or_else(|| parent.as_ref().map(|s| s.cwd()))
+            .filter(|c| !c.is_empty());
+
+        let (cwd, child_key) = match project_root {
+            Some(root) => {
+                let info = self.provision_worktree(root, provider.clone(), true);
+                (Some(info.worktree_path), info.terminal_key)
+            }
+            None => (working_directory, gen_id()[..8].to_string()),
+        };
+
+        let spec = AgentSpawnSpec {
+            provider,
+            profile: AgentProfile { name: "default".to_string(), ..Default::default() },
+            cwd,
+            rows: 24,
+            cols: 80,
+            attribution_key: Some(child_key.clone()),
+            seed_prompt: None,
+            env: vec![],
+            inject_orchestration: false,
+        };
+        self.spawn_agent(spec)?;
+        // Seed the task: delivered to the worker when it first goes idle.
+        let _ = self.enqueue_message(parent_key.to_string(), child_key.clone(), prompt.to_string());
+        if let Some(store) = &self.store {
+            let _ = store.record_activity_edge(&gen_id(), "assign", parent_key, &child_key, now_unix());
+        }
+        Ok(child_key)
+    }
+
     pub fn list(&self) -> Vec<SessionSummary> {
         self.sessions.lock().unwrap().values().map(|s| s.summary()).collect()
     }
@@ -215,11 +359,15 @@ impl Manager {
     pub fn kill(&self, id: &str) {
         let session = self.sessions.lock().unwrap().remove(id);
         if let Some(s) = session {
+            let akey = s.attribution_key();
             s.kill();
             // Removed from the live map, so gc_tick won't see it die — record the
-            // exit here.
+            // exit + drop its MCP token here.
             if let Some(store) = &self.store {
                 let _ = store.set_session_status(id, "exited");
+            }
+            if let Some(akey) = akey {
+                self.tokens.lock().unwrap().retain(|_, v| v != &akey);
             }
         }
         self.touch();
@@ -236,19 +384,27 @@ impl Manager {
     /// quiet-window attribution check, and returns `true` when the daemon should
     /// shut down (no sessions + no connected client + idle past `idle_grace`).
     pub fn gc_tick(&self, quiet_threshold: Duration, idle_grace: Duration) -> bool {
-        // Reap only DEAD sessions; record their exit in the durable store.
+        // Reap only DEAD sessions; record their exit + drop their MCP tokens.
         {
             let mut map = self.sessions.lock().unwrap();
-            let dead: Vec<String> = map
+            let dead: Vec<(String, Option<String>)> = map
                 .iter()
                 .filter(|(_, s)| !s.is_alive())
-                .map(|(k, _)| k.clone())
+                .map(|(k, s)| (k.clone(), s.attribution_key()))
                 .collect();
-            for k in dead {
+            let mut dead_akeys: Vec<String> = Vec::new();
+            for (k, akey) in dead {
                 map.remove(&k);
                 if let Some(store) = &self.store {
                     let _ = store.set_session_status(&k, "exited");
                 }
+                if let Some(a) = akey {
+                    dead_akeys.push(a);
+                }
+            }
+            drop(map);
+            if !dead_akeys.is_empty() {
+                self.tokens.lock().unwrap().retain(|_, v| !dead_akeys.contains(v));
             }
         }
         // Quiet-window attribution boundaries for live sessions.
@@ -280,6 +436,7 @@ impl Manager {
             last_activity: Mutex::new(Instant::now()),
             registry: Registry::load(),
             store,
+            tokens: Mutex::new(HashMap::new()),
         }
     }
 
