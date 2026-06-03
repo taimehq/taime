@@ -72,6 +72,33 @@ export async function daemonSpawnAgent(
   });
 }
 
+/** Daemon-owned worktree provisioning result (Phase 3). snake_case to match the
+ *  Rust `WorktreeInfo`; `terminal_key` is the attribution id. */
+export interface DaemonWorktreeInfo {
+  terminal_key: string;
+  project_root: string;
+  repo_root: string | null;
+  worktree_path: string;
+  branch: string | null;
+  base_sha: string | null;
+  mode: string; // "worktree" | "shared"
+  error: string | null;
+}
+
+/** Provision (or resolve) an isolated git worktree for a daemon agent — the
+ *  daemon-owned replacement for CAO's /worktrees/provision. */
+export async function daemonProvisionWorktree(
+  projectRoot: string,
+  provider: string,
+  isolate: boolean,
+): Promise<DaemonWorktreeInfo> {
+  return invoke<DaemonWorktreeInfo>("daemon_provision_worktree", {
+    projectRoot,
+    provider,
+    isolate,
+  });
+}
+
 export async function daemonWrite(sessionId: string, data: string): Promise<void> {
   if (!inTauri()) return;
   try {

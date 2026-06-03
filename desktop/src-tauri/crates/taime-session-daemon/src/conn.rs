@@ -109,6 +109,21 @@ pub async fn handle(stream: UnixStream, manager: Arc<Manager>, token: String) {
                 Ok(session_id) => send(&out_tx, &ServerMsg::Spawned { req_id, session_id }).await,
                 Err(e) => send(&out_tx, &ServerMsg::Error { message: e }).await,
             },
+            ClientMsg::ProvisionWorktree { req_id, project_root, provider, isolate } => {
+                // git worktree shells out (blocking); keep it off the async worker.
+                let mgr = manager.clone();
+                match tokio::task::spawn_blocking(move || {
+                    mgr.provision_worktree(project_root, provider, isolate)
+                })
+                .await
+                {
+                    Ok(info) => send(&out_tx, &ServerMsg::Worktree { req_id, info }).await,
+                    Err(_) => {
+                        send(&out_tx, &ServerMsg::Error { message: "worktree provisioning failed".into() })
+                            .await
+                    }
+                }
+            }
             ClientMsg::List { req_id } => {
                 send(&out_tx, &ServerMsg::Sessions { req_id, sessions: manager.list() }).await
             }

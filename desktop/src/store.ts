@@ -637,9 +637,15 @@ export const useStore = create<Store>((set, get) => ({
     try {
       // Same attribution surface as CAO: provision a worktree first so
       // dirty/diff/timeline/graph key off this terminalId, and pass it to the
-      // daemon as the attribution_key so turn events carry it. (Worktree
-      // provisioning still uses the CAO backend — orchestration stays in CAO
-      // until Phase 3 moves it daemon-side.)
+      // daemon as the attribution_key so turn events carry it.
+      //
+      // NOTE(phase3): the daemon can now provision worktrees itself
+      // (daemonProvisionWorktree → git worktree in Rust + app-data persistence),
+      // and Phase-5 headless `assign` uses that path internally. The interactive
+      // launch still goes through CAO here, because CAO-backed diff/graph
+      // (api.getTerminalDiff/getGraph) need CAO to hold the worktree record;
+      // the frontend switches to daemonProvisionWorktree in Phase 6, together
+      // with the diff/graph move daemon-side (else diff would break in between).
       let terminalId: string | null = null;
       let cwd = dir;
       let branch: string | null = null;

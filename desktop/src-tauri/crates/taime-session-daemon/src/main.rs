@@ -16,6 +16,7 @@ mod repaint;
 mod runtime;
 mod session;
 mod store;
+mod worktree;
 
 use std::path::PathBuf;
 use std::sync::Arc;

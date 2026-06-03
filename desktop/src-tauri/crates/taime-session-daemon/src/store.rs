@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use rusqlite::Connection;
+use taime_protocol::WorktreeInfo;
 
 /// The durable store. `Connection` is `Send` but not `Sync`; the `Mutex` makes
 /// `Store` `Sync` so it can live behind the shared `Arc<Manager>`. Write volume
@@ -105,6 +106,38 @@ impl Store {
         conn.execute(
             "UPDATE daemon_sessions SET status = ?2 WHERE pty_session_id = ?1",
             rusqlite::params![pty_session_id, status],
+        )?;
+        Ok(())
+    }
+
+    /// Persist (or update) a provisioned worktree row, keyed by `terminal_key`
+    /// (the CAO terminal id). Mirrors CAO's `taime_worktrees` upsert so the
+    /// Phase-7 import is a row copy. `created_at` stored as a unix-seconds string.
+    pub fn upsert_worktree(
+        &self,
+        info: &WorktreeInfo,
+        provider: &str,
+        created_at_unix: u64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO taime_worktrees \
+               (terminal_id, project_root, repo_root, worktree_path, branch, base_sha, mode, provider, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(terminal_id) DO UPDATE SET \
+               worktree_path = excluded.worktree_path, branch = excluded.branch, \
+               base_sha = excluded.base_sha, mode = excluded.mode",
+            rusqlite::params![
+                info.terminal_key,
+                info.project_root,
+                info.repo_root,
+                info.worktree_path,
+                info.branch,
+                info.base_sha,
+                info.mode,
+                provider,
+                created_at_unix.to_string(),
+            ],
         )?;
         Ok(())
     }
