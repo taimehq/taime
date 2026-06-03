@@ -170,7 +170,20 @@ impl Session {
     /// Attach `out` (the connection's outbound frame channel) as the streaming
     /// client. Enqueues `AttachOk(seq_n)` + the grid repaint, then marks attached
     /// so the reader's first live data frame is ordered after the repaint.
-    pub fn attach(&self, conn_id: u64, out: mpsc::UnboundedSender<Bytes>) -> Result<(), String> {
+    pub fn attach(
+        &self,
+        conn_id: u64,
+        rows: u16,
+        cols: u16,
+        out: mpsc::UnboundedSender<Bytes>,
+    ) -> Result<(), String> {
+        // Handoff step 1 — Resize FIRST (no lock held across it; `resize` takes
+        // master-then-state in that order to avoid inversion), so the grid repaint
+        // below reflects the client's actual viewport rather than the spawn-time
+        // size. A no-op when the size already matches.
+        if rows != 0 && cols != 0 {
+            let _ = self.resize(rows, cols);
+        }
         let mut st = self.inner.state.lock().unwrap();
         let seq_n = st.out_offset;
         let (rows, cols) = (st.rows, st.cols);

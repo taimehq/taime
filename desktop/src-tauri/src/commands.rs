@@ -220,9 +220,11 @@ pub async fn daemon_spawn_claude(
 pub async fn daemon_attach(
     daemon: State<'_, DaemonClient>,
     session_id: String,
+    rows: u16,
+    cols: u16,
     on_data: Channel<InvokeResponseBody>,
 ) -> Result<(), String> {
-    daemon.attach(session_id, on_data).await
+    daemon.attach(session_id, rows, cols, on_data).await
 }
 
 #[tauri::command]
@@ -253,6 +255,16 @@ pub async fn daemon_ack(
     offset: u64,
 ) -> Result<(), String> {
     daemon.ack(&session_id, offset).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn daemon_checkpoint(
+    daemon: State<'_, DaemonClient>,
+    session_id: String,
+    cause: String,
+) -> Result<(), String> {
+    daemon.checkpoint(&session_id, cause).await;
     Ok(())
 }
 
