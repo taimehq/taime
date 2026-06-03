@@ -16,11 +16,32 @@
 //! (every call goes through `Manager`'s `Option<Store>`); a launch never fails
 //! because of the store.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use taime_protocol::WorktreeInfo;
+
+/// The CAO tables to import, each with its explicit column list (robust against
+/// schema-order drift between CAO's SQLAlchemy DDL and our `CREATE TABLE`).
+const IMPORT_TABLES: &[(&str, &str)] = &[
+    ("terminals", "id, tmux_session, tmux_window, provider, agent_profile, allowed_tools, shell_command, last_active"),
+    ("inbox", "id, sender_id, receiver_id, message, status, created_at"),
+    ("memory_metadata", "id, key, memory_type, scope, scope_id, file_path, tags, source_provider, source_terminal_id, token_estimate, created_at, updated_at"),
+    ("flows", "name, file_path, schedule, agent_profile, provider, script, last_run, next_run, enabled"),
+    ("taime_worktrees", "terminal_id, session_name, project_root, repo_root, worktree_path, branch, base_sha, mode, provider, member_of, created_at"),
+    ("taime_agent_turns", "id, terminal_id, session_name, turn_index, started_at, ended_at, start_snapshot, end_snapshot, files_touched"),
+    ("taime_activity_events", "id, ts, kind, terminal_id, session_name, agent_profile, provider, target_terminal_id, path, change_kind, turn_id, snapshot_sha, meta"),
+];
+
+/// Result of a `--import-cao` run.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ImportStats {
+    /// True if the import ran; false if it was already done (idempotent no-op).
+    pub ran: bool,
+    /// Rows copied per table (only tables present in the CAO db).
+    pub copied: Vec<(String, usize)>,
+}
 
 /// The durable store. `Connection` is `Send` but not `Sync`; the `Mutex` makes
 /// `Store` `Sync` so it can live behind the shared `Arc<Manager>`. Write volume
@@ -217,6 +238,51 @@ impl Store {
             rusqlite::params![id, status],
         )?;
         Ok(())
+    }
+
+    /// One-time, idempotent import of a CAO SQLite db into this store (Phase 7).
+    /// Re-runs no-op (a `taime_meta.migrated_from_cao` marker gates it). Per
+    /// table: `INSERT OR IGNORE INTO <t> (cols) SELECT cols FROM cao.<t>`, with
+    /// explicit columns; a missing/incompatible CAO table is skipped, not fatal.
+    pub fn import_cao(&self, cao_path: &Path) -> rusqlite::Result<ImportStats> {
+        let conn = self.conn.lock().unwrap();
+        let already: Option<String> = conn
+            .query_row(
+                "SELECT value FROM taime_meta WHERE key = 'migrated_from_cao'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if already.is_some() {
+            return Ok(ImportStats { ran: false, copied: Vec::new() });
+        }
+        conn.execute("ATTACH DATABASE ?1 AS cao", rusqlite::params![cao_path.to_string_lossy()])?;
+        let mut copied = Vec::new();
+        for (table, cols) in IMPORT_TABLES {
+            // Skip tables absent from the CAO db.
+            let exists: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM cao.sqlite_master WHERE type='table' AND name = ?1",
+                    rusqlite::params![table],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            if exists.is_none() {
+                continue;
+            }
+            let sql = format!("INSERT OR IGNORE INTO {table} ({cols}) SELECT {cols} FROM cao.{table}");
+            match conn.execute(&sql, []) {
+                Ok(n) => copied.push((table.to_string(), n)),
+                Err(e) => eprintln!("[taime-daemon] import: skipped {table}: {e}"),
+            }
+        }
+        conn.execute("DETACH DATABASE cao", [])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO taime_meta (key, value) VALUES ('migrated_from_cao', ?1)",
+            rusqlite::params![cao_path.to_string_lossy()],
+        )?;
+        Ok(ImportStats { ran: true, copied })
     }
 
     /// Record an inter-agent edge in the activity graph (`kind` ∈
@@ -457,6 +523,40 @@ mod tests {
         store.set_message_status(id2, "delivered").unwrap();
         // b drained; only c remains.
         assert_eq!(store.receivers_with_pending().unwrap(), vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn import_cao_copies_rows_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("taime-import-{}", unsafe { libc::getpid() }));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cao_path = dir.join("cao.sqlite");
+        {
+            let cao = Connection::open(&cao_path).unwrap();
+            cao.execute_batch(
+                "CREATE TABLE terminals (id TEXT PRIMARY KEY, tmux_session TEXT, tmux_window TEXT, provider TEXT, agent_profile TEXT, allowed_tools TEXT, shell_command TEXT, last_active TEXT);
+                 INSERT INTO terminals (id, tmux_session, tmux_window, provider) VALUES ('t1','s','w','claude_code');
+                 CREATE TABLE taime_worktrees (terminal_id TEXT PRIMARY KEY, session_name TEXT, project_root TEXT, repo_root TEXT, worktree_path TEXT, branch TEXT, base_sha TEXT, mode TEXT, provider TEXT, member_of TEXT, created_at TEXT);
+                 INSERT INTO taime_worktrees (terminal_id, project_root, worktree_path, mode) VALUES ('t1','/p','/wt','worktree');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open_at(&dir.join("daemon.sqlite")).unwrap();
+        let stats = store.import_cao(&cao_path).unwrap();
+        assert!(stats.ran);
+        {
+            let conn = store.conn.lock().unwrap();
+            let terms: i64 = conn.query_row("SELECT COUNT(*) FROM terminals", [], |r| r.get(0)).unwrap();
+            let wts: i64 = conn.query_row("SELECT COUNT(*) FROM taime_worktrees", [], |r| r.get(0)).unwrap();
+            assert_eq!(terms, 1);
+            assert_eq!(wts, 1);
+        }
+
+        // Re-run is a no-op (the marker gates it).
+        let again = store.import_cao(&cao_path).unwrap();
+        assert!(!again.ran);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -105,13 +105,36 @@ fn run_mcp_shim() -> anyhow::Result<()> {
 }
 
 fn parse_socket_arg() -> Option<PathBuf> {
+    parse_flag_value("--socket")
+}
+
+/// The value following `flag` in argv (e.g. `--socket <path>`), if present.
+fn parse_flag_value(flag: &str) -> Option<PathBuf> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        if a == "--socket" {
+        if a == flag {
             return args.next().map(PathBuf::from);
         }
     }
     None
+}
+
+/// `--import-cao <cao.sqlite>`: one-time, idempotent import of a CAO SQLite db
+/// into the daemon's app-data store (Phase 7), then exit.
+fn run_import_cao(cao_path: &std::path::Path) -> anyhow::Result<()> {
+    let store = store::Store::open().map_err(|e| anyhow::anyhow!("open store: {e}"))?;
+    let stats = store
+        .import_cao(cao_path)
+        .map_err(|e| anyhow::anyhow!("import: {e}"))?;
+    if stats.ran {
+        eprintln!("[taime-daemon] imported CAO db {cao_path:?}:");
+        for (table, n) in &stats.copied {
+            eprintln!("  {table}: {n} rows");
+        }
+    } else {
+        eprintln!("[taime-daemon] CAO already imported (no-op); marker present");
+    }
+    Ok(())
 }
 
 fn cleanup(paths: &Paths) {
@@ -125,6 +148,11 @@ async fn main() -> anyhow::Result<()> {
     // client to the daemon's tool dispatcher. Runs instead of the daemon.
     if std::env::args().any(|a| a == "--mcp-stdio") {
         return run_mcp_shim();
+    }
+
+    // One-time CAO state migration (Phase 7): `--import-cao <cao.sqlite>`.
+    if let Some(cao_path) = parse_flag_value("--import-cao") {
+        return run_import_cao(&cao_path);
     }
 
     let paths = match parse_socket_arg() {
