@@ -1,0 +1,118 @@
+//! Owns the live sessions. Orphan GC reaps only **dead** sessions — it never
+//! auto-reaps a live agent (closing the app overnight must not kill a running
+//! agent). The daemon shuts itself down only when it has no sessions AND no
+//! connected client for an idle grace period; a live session or a connected app
+//! keeps it alive.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use taime_protocol::{SessionSummary, SpawnSpec};
+
+use crate::session::Session;
+
+pub struct Manager {
+    sessions: Mutex<HashMap<String, Session>>,
+    session_counter: AtomicU64,
+    conn_counter: AtomicU64,
+    active_conns: AtomicU64,
+    last_activity: Mutex<Instant>,
+}
+
+impl Default for Manager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Manager {
+    pub fn new() -> Self {
+        Manager {
+            sessions: Mutex::new(HashMap::new()),
+            session_counter: AtomicU64::new(0),
+            conn_counter: AtomicU64::new(0),
+            active_conns: AtomicU64::new(0),
+            last_activity: Mutex::new(Instant::now()),
+        }
+    }
+
+    pub fn next_conn_id(&self) -> u64 {
+        self.conn_counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn conn_opened(&self) {
+        self.active_conns.fetch_add(1, Ordering::SeqCst);
+        self.touch();
+    }
+
+    pub fn conn_closed(&self) {
+        self.active_conns.fetch_sub(1, Ordering::SeqCst);
+        self.touch();
+    }
+
+    /// Mark recent client activity (resets the idle-shutdown timer).
+    pub fn touch(&self) {
+        *self.last_activity.lock().unwrap() = Instant::now();
+    }
+
+    pub fn spawn(&self, spec: SpawnSpec) -> Result<String, String> {
+        let id = format!("pty-{:x}", self.session_counter.fetch_add(1, Ordering::SeqCst));
+        let session = Session::spawn(id.clone(), &spec)?;
+        self.sessions.lock().unwrap().insert(id.clone(), session);
+        self.touch();
+        Ok(id)
+    }
+
+    pub fn get(&self, id: &str) -> Option<Session> {
+        self.sessions.lock().unwrap().get(id).cloned()
+    }
+
+    pub fn list(&self) -> Vec<SessionSummary> {
+        self.sessions.lock().unwrap().values().map(|s| s.summary()).collect()
+    }
+
+    pub fn kill(&self, id: &str) {
+        let session = self.sessions.lock().unwrap().remove(id);
+        if let Some(s) = session {
+            s.kill();
+        }
+        self.touch();
+    }
+
+    pub fn kill_all(&self) {
+        let sessions: Vec<Session> = self.sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
+        for s in sessions {
+            s.kill();
+        }
+    }
+
+    /// Periodic maintenance. Reaps dead sessions (never a live agent), runs the
+    /// quiet-window attribution check, and returns `true` when the daemon should
+    /// shut down (no sessions + no connected client + idle past `idle_grace`).
+    pub fn gc_tick(&self, quiet_threshold: Duration, idle_grace: Duration) -> bool {
+        // Reap only DEAD sessions.
+        {
+            let mut map = self.sessions.lock().unwrap();
+            let dead: Vec<String> = map
+                .iter()
+                .filter(|(_, s)| !s.is_alive())
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in dead {
+                map.remove(&k);
+            }
+        }
+        // Quiet-window attribution boundaries for live sessions.
+        let live: Vec<Session> = self.sessions.lock().unwrap().values().cloned().collect();
+        for s in &live {
+            s.quiet_check(quiet_threshold);
+        }
+        // Shutdown decision: nothing left to serve and the app isn't connected.
+        let empty = self.sessions.lock().unwrap().is_empty();
+        let no_clients = self.active_conns.load(Ordering::SeqCst) == 0;
+        let idle = self.last_activity.lock().unwrap().elapsed() > idle_grace;
+        empty && no_clients && idle
+    }
+}

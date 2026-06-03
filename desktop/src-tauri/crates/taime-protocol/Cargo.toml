@@ -1,0 +1,20 @@
+# Shared wire-protocol types for the Taime session daemon <-> app transport.
+# Transport-agnostic (no tokio, no tauri): both the daemon and the Tauri app
+# depend on this so the framing + control messages are defined exactly once.
+[package]
+name = "taime-protocol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# postcard, NOT bincode: bincode 3.0.0 is a non-compiling stub and every version
+# trips RUSTSEC-2025-0141 (unmaintained). postcard is serde-compatible + maintained.
+postcard = { version = "1.1", features = ["use-std"] }
+# BytesMut/Bytes frame building shared with daemon/app.
+bytes = "1"
+
+[target.'cfg(unix)'.dependencies]
+# getuid() for the deterministic per-user socket path (app + daemon must agree).
+libc = "0.2"

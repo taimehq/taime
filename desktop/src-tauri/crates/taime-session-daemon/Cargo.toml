@@ -1,0 +1,46 @@
+# Taime session daemon: a long-lived, detached Rust binary that owns the PTY
+# masters + an authoritative wezterm-term emulator and outlives the app.
+[package]
+name = "taime-session-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+
+[[bin]]
+name = "taime-session-daemon"
+path = "src/main.rs"
+
+[dependencies]
+taime-protocol = { path = "../taime-protocol" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1.1", features = ["use-std"] }
+
+portable-pty = "0.9"
+anyhow = "1"
+rand = "0.8"
+subtle = "2"
+dirs = "5"
+
+# Authoritative headless emulator + (alternative) repaint renderer. Git-pinned,
+# SAME rev for both, NOT crates.io (wezterm-term is unpublished; crates.io termwiz
+# 0.23.3 would mismatch the in-tree 0.24.0 Line/surface types).
+wezterm-term = { git = "https://github.com/wezterm/wezterm", rev = "577474d89ee61aef4a48145cdec82a638d874751" }
+termwiz = { git = "https://github.com/wezterm/wezterm", rev = "577474d89ee61aef4a48145cdec82a638d874751" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Step 2.5 (deferred — uncomment when implementing zero-downtime fd handoff):
+# sendfd = { version = "0.4.4", features = ["tokio"] }
+
+[dev-dependencies]
+taime-protocol = { path = "../taime-protocol" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+bytes = "1"
