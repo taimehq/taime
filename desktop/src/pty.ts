@@ -39,6 +39,11 @@ export interface DaemonSessionSummary {
   cols: number;
   created_at_unix: number;
   attribution_key: string | null;
+  /** Provider id (`claude_code`/…) — daemon-reported (Phase 4), else null. */
+  provider: string | null;
+  /** Inferred status in CAO vocabulary (IDLE/PROCESSING/WAITING_USER_ANSWER/
+   *  COMPLETED/ERROR) — daemon-reported (Phase 4), null when not yet known. */
+  status: string | null;
   protocol_version: number;
 }
 

@@ -36,7 +36,11 @@ pub const MAGIC: u32 = 0x7461_696d;
 /// The app's daemon-upgrade policy keys off this: a daemon whose version differs
 /// (or is missing a required capability) is *adopted read-only* for its existing
 /// sessions (List + Kill) rather than killed.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// v2: `SessionSummary` gained `provider` + `status` (Phase 4 status inference).
+/// Postcard is positional, so this is a wire-layout change — a stale v1 daemon is
+/// rejected at handshake and the app falls back rather than misparsing.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Feature flags negotiated in the handshake (`capabilities` bitset). Reserving
 /// the bits now keeps app-update-while-old-daemon-running safe.
@@ -259,14 +263,27 @@ pub struct SessionSummary {
     pub cols: u16,
     pub created_at_unix: u64,
     pub attribution_key: Option<String>,
+    /// Provider id (`claude_code`/…) when spawned via the registry; `None` for a
+    /// low-level spawn. Lets the app label/adopt without inferring from `program`.
+    pub provider: Option<String>,
+    /// Inferred lifecycle status from the live grid (Phase 4). `None` when no
+    /// provider adapter is attached (low-level spawn).
+    pub status: Option<AgentStatus>,
     /// Protocol version the daemon serving this session speaks (upgrade UI).
     pub protocol_version: u16,
 }
 
 /// An agent's inferred lifecycle state — CAO's `TerminalStatus`, native to the
 /// daemon. Phase 1 defines it (the provider adapters compute it from the grid);
-/// Phase 4 adds it to [`SessionSummary`] + a push event and drives the UI badge.
+/// Phase 4 adds it to [`SessionSummary`] and drives the UI badge.
+///
+/// `rename_all = "SCREAMING_SNAKE_CASE"` so the JSON the app forwards to the
+/// frontend matches the CAO status vocabulary the `StatusBadge` already keys on
+/// (`IDLE`/`PROCESSING`/`WAITING_USER_ANSWER`/`COMPLETED`/`ERROR`). This affects
+/// only name-based formats (serde_json); the daemon↔app postcard path encodes
+/// enum variants by index, so the rename is wire-neutral there.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentStatus {
     /// Ready for input; idle prompt visible, no active work.
     Idle,

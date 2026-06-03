@@ -32,7 +32,7 @@ use taime_protocol::{encode_data, encode_repaint, encode_server, ServerMsg, Sess
 use tokio::sync::mpsc;
 
 use crate::attribution::Attribution;
-use crate::providers::{Cleanup, DaemonSessionSpec, Prepared};
+use crate::providers::{Cleanup, DaemonSessionSpec, GridView, Prepared, Provider};
 use crate::{emulator, repaint};
 
 /// Backpressure watermarks (bytes in flight = sent − acked). Generous for the
@@ -75,10 +75,12 @@ struct SessionInner {
     program: String,
     cwd: String,
     attribution_key: Option<String>,
-    /// Provider id (`claude_code`/`codex`/…) when spawned via the registry — the
-    /// adapter to use for status inference (Phase 4). `None` for low-level spawns.
-    #[allow(dead_code)]
+    /// Provider id (`claude_code`/`codex`/…) when spawned via the registry.
+    /// `None` for low-level spawns.
     provider: Option<String>,
+    /// The provider adapter, used to infer `status` from the live grid (Phase 4).
+    /// `None` for low-level spawns.
+    adapter: Option<Box<dyn Provider>>,
     /// Enters to send after a bracketed paste (CAO `paste_enter_count`); carried
     /// for the Phase-5 idle-gated stdin delivery.
     #[allow(dead_code)]
@@ -119,13 +121,14 @@ impl Session {
     }
 
     /// Spawn a registry-`Prepared` agent: the daemon-built command + MCP injection
-    /// (the Phase-1 all-provider path). `provider` is the adapter id for status.
+    /// (the Phase-1 all-provider path). `adapter` is the provider adapter, used
+    /// for status inference; its `id()` is recorded as the session's provider.
     pub fn spawn_prepared(
         id: String,
         prepared: Prepared,
-        provider: Option<String>,
+        adapter: Option<Box<dyn Provider>>,
     ) -> Result<Session, String> {
-        Self::spawn_inner(id, &prepared.spec, prepared.cleanup, provider)
+        Self::spawn_inner(id, &prepared.spec, prepared.cleanup, adapter)
     }
 
     /// Shared PTY setup for both spawn paths.
@@ -133,8 +136,9 @@ impl Session {
         id: String,
         spec: &DaemonSessionSpec,
         cleanup: Cleanup,
-        provider: Option<String>,
+        adapter: Option<Box<dyn Provider>>,
     ) -> Result<Session, String> {
+        let provider = adapter.as_ref().map(|a| a.id().to_string());
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -192,6 +196,7 @@ impl Session {
             cwd: spec.cwd.clone().unwrap_or_default(),
             attribution_key: spec.attribution_key.clone(),
             provider,
+            adapter,
             paste_enter_count: spec.paste_enter_count,
             cleanup,
             created_at_unix,
@@ -368,6 +373,17 @@ impl Session {
 
     pub fn summary(&self) -> SessionSummary {
         let st = self.inner.state.lock().unwrap();
+        // Infer status from the live grid via the provider adapter (Phase 4). A
+        // dead session is COMPLETED/Error-agnostic here — report no live status so
+        // the app's exit handling (daemon_list `alive=false`) drives the badge.
+        let status = if self.is_alive() {
+            self.inner.adapter.as_ref().map(|a| {
+                let lines = emulator::snapshot_visible_text(&st.term);
+                a.status(&GridView::new(&lines))
+            })
+        } else {
+            None
+        };
         SessionSummary {
             id: self.inner.id.clone(),
             cwd: self.inner.cwd.clone(),
@@ -378,6 +394,8 @@ impl Session {
             cols: st.cols,
             created_at_unix: self.inner.created_at_unix,
             attribution_key: self.inner.attribution_key.clone(),
+            provider: self.inner.provider.clone(),
+            status,
             protocol_version: taime_protocol::PROTOCOL_VERSION,
         }
     }

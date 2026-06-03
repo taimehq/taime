@@ -1,7 +1,17 @@
 import { useEffect } from "react";
 import { inTauri } from "../backend";
 import { useStore } from "../store";
-import { daemonList } from "../pty";
+import { daemonList, type DaemonSessionSummary } from "../pty";
+
+/** Mirror daemon-reported status (Phase 4) into the shared terminalStatuses map,
+ *  keyed by the attribution id the StatusBadge already reads — so a daemon
+ *  agent's badge is daemon-driven, no CAO /terminals/{id} poll. */
+function applyDaemonStatuses(sessions: DaemonSessionSummary[]) {
+  const setStatus = useStore.getState().setTerminalStatus;
+  for (const s of sessions) {
+    if (s.attribution_key && s.status) setStatus(s.attribution_key, s.status);
+  }
+}
 
 /**
  * Keep the daemon-session registry honest: enumerate the daemon on boot to adopt
@@ -25,6 +35,7 @@ export function useRustPtyReconcile() {
       if (!alive) return;
       const adopt = useStore.getState().adoptDaemonSession;
       for (const s of sessions) adopt(s);
+      applyDaemonStatuses(sessions);
     })();
 
     const tick = async () => {
@@ -33,6 +44,7 @@ export function useRustPtyReconcile() {
       if (ids.length === 0) return;
       const daemonSessions = await daemonList();
       if (!alive) return;
+      applyDaemonStatuses(daemonSessions);
       const live = new Set(
         daemonSessions.filter((s) => s.alive !== false).map((s) => s.id),
       );

@@ -276,8 +276,7 @@ impl Registry {
         Ok(prepared)
     }
 
-    /// The adapter for a provider id, for status/idle queries (wired in Phase 4/5).
-    #[allow(dead_code)]
+    /// The adapter for a provider id, for status/idle queries (Phase 4/5).
     pub fn adapter(&self, id: &str) -> Option<Box<dyn Provider>> {
         self.provider(id)
     }
@@ -330,6 +329,23 @@ mod tests {
     fn unknown_provider_errors() {
         let reg = Registry::load();
         assert!(reg.build(&default_req("nope")).is_err());
+    }
+
+    #[test]
+    fn agent_status_json_matches_cao_status_vocab() {
+        // The frontend StatusBadge keys on these exact strings; the daemon→app
+        // status field must serialize to them (serde rename_all).
+        use taime_protocol::AgentStatus;
+        let cases = [
+            (AgentStatus::Idle, "\"IDLE\""),
+            (AgentStatus::Processing, "\"PROCESSING\""),
+            (AgentStatus::WaitingUserAnswer, "\"WAITING_USER_ANSWER\""),
+            (AgentStatus::Completed, "\"COMPLETED\""),
+            (AgentStatus::Error, "\"ERROR\""),
+        ];
+        for (status, json) in cases {
+            assert_eq!(serde_json::to_string(&status).unwrap(), json);
+        }
     }
 
     #[test]

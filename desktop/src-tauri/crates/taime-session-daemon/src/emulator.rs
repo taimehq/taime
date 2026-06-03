@@ -77,10 +77,8 @@ pub fn visible_lines(term: &Terminal) -> Vec<Line> {
 }
 
 /// Snapshot the visible screen as plain text (one String per row, trailing
-/// blanks trimmed) — the per-turn attribution artifact. Cheap relative to a
-/// full cell-attribute clone; we only call it at turn boundaries. (Substrate for
-/// turn-level grid snapshots; not yet wired into the wire `TurnInfo`.)
-#[allow(dead_code)]
+/// blanks trimmed) — the per-turn attribution artifact + the input to provider
+/// status inference (Phase 4). Cheap relative to a full cell-attribute clone.
 pub fn snapshot_visible_text(term: &Terminal) -> Vec<String> {
     visible_lines(term)
         .iter()

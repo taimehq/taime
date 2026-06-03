@@ -718,7 +718,9 @@ export const useStore = create<Store>((set, get) => ({
       const meta: RustPtyMeta = {
         ptySessionId: summary.id,
         terminalId: summary.attribution_key ?? "",
-        provider: providerFromProgram(summary.program),
+        // Daemon-reported provider (Phase 4); fall back to program inference for
+        // a pre-Phase-4 daemon that doesn't report it.
+        provider: summary.provider ?? providerFromProgram(summary.program),
         branch: null,
         cwd: summary.cwd || null,
         startedAt: summary.created_at_unix ? summary.created_at_unix * 1000 : Date.now(),
