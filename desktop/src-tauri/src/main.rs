@@ -4,15 +4,15 @@
 mod backend;
 mod commands;
 mod config;
+mod daemon;
 mod fs_watch;
 mod pty;
 
 use backend::SupervisorHandle;
-use base64::Engine;
+use daemon::DaemonClient;
 use fs_watch::FsWatchState;
-use pty::{EventSink, PtyEvent, PtyManager};
-use std::sync::Arc;
-use tauri::{Emitter, Manager, RunEvent};
+use pty::PtyManager;
+use tauri::{Manager, RunEvent};
 
 /// Shared application state managed by Tauri.
 pub struct AppStateHandle {
@@ -72,25 +72,20 @@ fn main() {
         .setup(move |app| {
             let supervisor = backend::start(&app.handle(), resolved.clone());
 
-            // Rust-owned PTY manager. Its output sink emits Tauri events keyed
-            // by session id; the frontend listens on `pty://{id}/data|exit`.
-            let app_handle = app.handle().clone();
-            let sink: EventSink = Arc::new(move |id: &str, ev: PtyEvent| match ev {
-                PtyEvent::Data(d) => {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&d);
-                    let _ = app_handle.emit(&format!("pty://{id}/data"), b64);
-                }
-                PtyEvent::Exit(code) => {
-                    let _ = app_handle.emit(&format!("pty://{id}/exit"), code);
-                }
-            });
-            let pty = PtyManager::new(sink);
+            // Rust-owned PTY manager. Output is delivered as raw bytes through a
+            // per-session binary `Channel` registered by `pty_attach` (no base64,
+            // no global event) — see commands.rs.
+            let pty = PtyManager::new();
 
             #[cfg(unix)]
             signals::install(supervisor.clone(), pty.clone());
             app.manage(AppStateHandle { supervisor });
             app.manage(FsWatchState::new());
             app.manage(pty);
+            // App-side client to the detached session daemon (Step 2). Resolved
+            // next to the app exe (dev) or in Resources (bundle); spawned lazily
+            // on first daemon-backed launch.
+            app.manage(DaemonClient::new(daemon::resolve_daemon_bin()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -104,9 +99,18 @@ fn main() {
             commands::pty_write,
             commands::pty_resize,
             commands::pty_close_view,
-            commands::pty_reattach_view,
+            commands::pty_attach,
+            commands::pty_ack,
             commands::pty_kill,
             commands::pty_list,
+            commands::daemon_spawn_claude,
+            commands::daemon_attach,
+            commands::daemon_write,
+            commands::daemon_resize,
+            commands::daemon_ack,
+            commands::daemon_close_view,
+            commands::daemon_kill,
+            commands::daemon_list,
             commands::set_clipboard_image_from_path
         ])
         .build(tauri::generate_context!())
