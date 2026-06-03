@@ -1,0 +1,3 @@
+# Build-staging dir for the session daemon (real binary staged here by
+# scripts/stage-daemon.sh at `tauri build`; gitignored). The .gitkeep keeps the
+# dir present so tauri-build resource validation passes for bare `cargo build`.

@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "cargo build --manifest-path src-tauri/Cargo.toml -p taime-session-daemon && pnpm dev",
-    "beforeBuildCommand": "pnpm build"
+    "beforeBuildCommand": "bash scripts/stage-daemon.sh && pnpm build"
   },
   "app": {
     "windows": [
@@ -32,6 +32,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": ["binaries"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

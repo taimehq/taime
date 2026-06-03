@@ -1,43 +1,29 @@
 # Packaging the daemon with the app
 
 The app is a thin client; the real backend is the detached `taime-session-daemon`
-binary. `resolve_daemon_bin()` (desktop/src-tauri/src/daemon.rs) looks for it,
-in order:
+binary. `resolve_daemon_bin()` (desktop/src-tauri/src/daemon.rs) finds it, in
+order: a **sibling** of the app exe (`target/<profile>/` in dev;
+`Taime.app/Contents/MacOS/` in a bundle), then the bundle **Resources** dir
+(`…/Resources/taime-session-daemon` or `…/Resources/binaries/taime-session-daemon`).
 
-1. a **sibling** of the app exe (`target/<profile>/taime-session-daemon` in dev;
-   `Taime.app/Contents/MacOS/taime-session-daemon` in a bundle), then
-2. the bundle **Resources** dir (`…/Contents/Resources/taime-session-daemon` or
-   `…/Resources/binaries/taime-session-daemon`).
+## Dev (`pnpm tauri dev`) — automatic
 
-## Dev — works out of the box
+`beforeDevCommand` builds the daemon first (`cargo build -p taime-session-daemon`),
+so the sibling `target/debug/taime-session-daemon` always exists.
 
-`pnpm tauri dev`'s `beforeDevCommand` builds the daemon first
-(`cargo build -p taime-session-daemon`), so the sibling
-`target/debug/taime-session-daemon` always exists. No manual step.
+## Bundle (`pnpm tauri build`) — automatic
 
-## Bundle (`pnpm tauri build`) — one config toggle
+`beforeBuildCommand` runs `scripts/stage-daemon.sh`, which builds the **release**
+daemon and copies it into `src-tauri/binaries/`. `bundle.resources` ships the
+`binaries/` directory, so the daemon lands at
+`…/Contents/Resources/binaries/taime-session-daemon`, where `resolve_daemon_bin()`
+finds it. No manual step.
 
-`bundle.resources` is validated by `tauri-build` at **compile time**, so it can't
-be enabled unconditionally (it would break a bare `cargo build` on a fresh
-checkout where the binary isn't staged yet). To produce a distributable bundle
-that ships the daemon:
+### Why a `binaries/` dir + `.gitkeep`
 
-1. Stage the release daemon into `src-tauri/binaries/`:
-   ```
-   bash desktop/scripts/stage-daemon.sh
-   ```
-2. Enable the resource in `desktop/src-tauri/tauri.conf.json`:
-   ```json
-   "bundle": { "active": true, "targets": "all",
-     "resources": ["binaries/taime-session-daemon"], … }
-   ```
-3. `pnpm tauri build`.
-
-The daemon is copied into the bundle's Resources, where `resolve_daemon_bin()`
-finds it. (Alternatively, wire steps 1–2 into CI's build job so a release build
-always stages + bundles the daemon.)
-
-> Known gap: this packaging step is currently manual (the resource toggle is left
-> off so `cargo build` works standalone). Automating it cleanly needs a committed
-> placeholder at `binaries/taime-session-daemon` or a CI staging job — tracked as
-> a follow-up.
+`tauri-build` validates `bundle.resources` at **compile time** (in `build.rs`), so
+the resource path must exist even for a bare `cargo build`. Pointing the resource
+at the `binaries/` **directory** (with a committed `binaries/.gitkeep`) satisfies
+that check without committing a 32 MB binary: bare `cargo build` sees an
+empty-but-present dir; `tauri build` populates it via `stage-daemon.sh` before
+bundling. `binaries/*` is gitignored except `.gitkeep`.
