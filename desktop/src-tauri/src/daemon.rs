@@ -87,12 +87,7 @@ impl DaemonClient {
         Err("session daemon did not come up".into())
     }
 
-    async fn connect_handshake(&self) -> Result<Conn, String> {
-        self.ensure_running().await?;
-        let stream = UnixStream::connect(&self.socket)
-            .await
-            .map_err(|e| format!("connect: {e}"))?;
-        let mut conn = framed(stream);
+    async fn handshake(&self, mut conn: Conn) -> Result<Conn, String> {
         let token = std::fs::read_to_string(paths::token_path(&self.socket)).unwrap_or_default();
         let hello = ClientMsg::Hello {
             magic: MAGIC,
@@ -108,25 +103,47 @@ impl DaemonClient {
         }
     }
 
-    /// One request/reply over a short-lived control connection.
-    async fn control(&self, msg: ClientMsg) -> Result<ServerMsg, String> {
-        let mut conn = self.connect_handshake().await?;
-        send(&mut conn, &msg).await?;
-        read_server(&mut conn).await
+    /// Spawn-if-needed, then connect + handshake. Used by ops that REQUIRE a
+    /// daemon (spawn, attach).
+    async fn connect_handshake(&self) -> Result<Conn, String> {
+        self.ensure_running().await?;
+        let stream = UnixStream::connect(&self.socket)
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        self.handshake(framed(stream)).await
+    }
+
+    /// Connect-only handshake: returns `Ok(None)` if no daemon is reachable.
+    /// Does NOT spawn one — used by enumeration/kill so we never boot a daemon
+    /// just to list (or to kill a session that's already gone with it).
+    async fn try_connect_handshake(&self) -> Result<Option<Conn>, String> {
+        match UnixStream::connect(&self.socket).await {
+            Ok(stream) => self.handshake(framed(stream)).await.map(Some),
+            Err(_) => Ok(None),
+        }
     }
 
     pub async fn spawn_session(&self, spec: SpawnSpec) -> Result<String, String> {
         let req_id = self.next_req();
-        match self.control(ClientMsg::Spawn { req_id, spec }).await? {
+        let mut conn = self.connect_handshake().await?;
+        send(&mut conn, &ClientMsg::Spawn { req_id, spec }).await?;
+        match read_server(&mut conn).await? {
             ServerMsg::Spawned { session_id, .. } => Ok(session_id),
             ServerMsg::Error { message } => Err(message),
             other => Err(format!("unexpected spawn reply: {other:?}")),
         }
     }
 
+    /// Enumerate the daemon's live sessions for discovery/adoption + liveness.
+    /// Returns empty (without spawning) when no daemon is running.
     pub async fn list(&self) -> Result<Vec<taime_protocol::SessionSummary>, String> {
+        let mut conn = match self.try_connect_handshake().await? {
+            Some(c) => c,
+            None => return Ok(Vec::new()),
+        };
         let req_id = self.next_req();
-        match self.control(ClientMsg::List { req_id }).await? {
+        send(&mut conn, &ClientMsg::List { req_id }).await?;
+        match read_server(&mut conn).await? {
             ServerMsg::Sessions { sessions, .. } => Ok(sessions),
             other => Err(format!("unexpected list reply: {other:?}")),
         }
@@ -134,9 +151,10 @@ impl DaemonClient {
 
     pub async fn kill(&self, session_id: String) -> Result<(), String> {
         self.attaches.lock().await.remove(&session_id);
-        // Kill has no reply; send on a short-lived connection and drop it.
-        let mut conn = self.connect_handshake().await?;
-        send(&mut conn, &ClientMsg::Kill { session_id }).await?;
+        // Connect-only: if no daemon is running the session is already gone.
+        if let Some(mut conn) = self.try_connect_handshake().await? {
+            send(&mut conn, &ClientMsg::Kill { session_id }).await?;
+        }
         Ok(())
     }
 
@@ -145,10 +163,16 @@ impl DaemonClient {
     pub async fn attach(
         &self,
         session_id: String,
+        rows: u16,
+        cols: u16,
         channel: Channel<InvokeResponseBody>,
     ) -> Result<(), String> {
         let mut conn = self.connect_handshake().await?;
-        send(&mut conn, &ClientMsg::Attach { session_id: session_id.clone() }).await?;
+        send(
+            &mut conn,
+            &ClientMsg::Attach { session_id: session_id.clone(), rows, cols },
+        )
+        .await?;
 
         let (input_tx, mut input_rx) = mpsc::channel::<ClientMsg>(256);
         let seq_n = Arc::new(AtomicU64::new(0));
@@ -221,6 +245,12 @@ impl DaemonClient {
 
     pub async fn resize(&self, session_id: &str, rows: u16, cols: u16) {
         self.send_to_session(session_id, ClientMsg::Resize { rows, cols }).await;
+    }
+
+    /// App-driven attribution checkpoint (the strongest boundary signal): the app
+    /// knows when the user submitted a command. Routed to the attached session.
+    pub async fn checkpoint(&self, session_id: &str, cause: String) {
+        self.send_to_session(session_id, ClientMsg::Checkpoint { cause }).await;
     }
 
     /// Translate the frontend's cumulative processed-byte count (`processed`,

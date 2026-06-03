@@ -109,9 +109,12 @@ pub enum ClientMsg {
     Spawn { req_id: u64, spec: SpawnSpec },
     /// Enumerate sessions. `req_id` correlates the `Sessions` reply.
     List { req_id: u64 },
-    /// Bind THIS connection to stream `session_id`'s output. Triggers the handoff
-    /// (`AttachOk` → `T_REPAINT` → `T_DATA` frames). One attached session per conn.
-    Attach { session_id: String },
+    /// Bind THIS connection to stream `session_id`'s output. Carries the client's
+    /// current viewport so the daemon **resizes the PTY + emulator BEFORE
+    /// snapshotting the grid** (handoff step 1 = Resize) — otherwise the repaint
+    /// would reflect the spawn-time size, not the real viewport. Triggers the
+    /// handoff (`AttachOk` → `T_REPAINT` → `T_DATA` frames). One session per conn.
+    Attach { session_id: String, rows: u16, cols: u16 },
     /// Stop streaming on this connection without killing the agent (close_view).
     Detach,
     /// Write bytes to the attached session's PTY (stdin). Low volume → control.
@@ -371,11 +374,13 @@ mod tests {
 
     #[test]
     fn client_control_roundtrips() {
-        let msg = ClientMsg::Attach { session_id: "pty-1".into() };
+        let msg = ClientMsg::Attach { session_id: "pty-1".into(), rows: 40, cols: 120 };
         let payload = encode_client(&msg).unwrap();
         match parse_frame(BytesMut::from(&payload[..])).unwrap() {
             Frame::Control(body) => match decode_client(&body).unwrap() {
-                ClientMsg::Attach { session_id } => assert_eq!(session_id, "pty-1"),
+                ClientMsg::Attach { session_id, rows, cols } => {
+                    assert_eq!((session_id.as_str(), rows, cols), ("pty-1", 40, 120))
+                }
                 other => panic!("wrong msg {other:?}"),
             },
             other => panic!("expected Control, got {other:?}"),

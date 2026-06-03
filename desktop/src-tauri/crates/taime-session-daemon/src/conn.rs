@@ -108,13 +108,13 @@ pub async fn handle(stream: UnixStream, manager: Arc<Manager>, token: String) {
             ClientMsg::List { req_id } => {
                 send(&out_tx, &ServerMsg::Sessions { req_id, sessions: manager.list() }).await
             }
-            ClientMsg::Attach { session_id } => match manager.get(&session_id) {
+            ClientMsg::Attach { session_id, rows, cols } => match manager.get(&session_id) {
                 Some(session) => {
                     // Detach any previously attached session on this connection.
                     if let Some(prev) = &attached {
                         prev.detach(conn_id);
                     }
-                    if let Err(e) = session.attach(conn_id, out_tx.clone()) {
+                    if let Err(e) = session.attach(conn_id, rows, cols, out_tx.clone()) {
                         send(&out_tx, &ServerMsg::Error { message: e }).await;
                     } else {
                         attached = Some(session);

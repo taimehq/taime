@@ -162,11 +162,16 @@ async fn daemon_full_lifecycle() {
         other => panic!("expected Spawned, got {other:?}"),
     };
 
-    // 3) Attach → AttachOk(seq_n) then a Repaint frame.
-    send_client(&mut framed, &ClientMsg::Attach { session_id: session_id.clone() }).await;
+    // 3) Attach with a DIFFERENT viewport (30x100) than the 24x80 spawn → the
+    //    daemon must resize before snapshotting, so AttachOk reflects 30x100.
+    send_client(
+        &mut framed,
+        &ClientMsg::Attach { session_id: session_id.clone(), rows: 30, cols: 100 },
+    )
+    .await;
     let seq_n = match next_server_msg(&mut framed).await {
         ServerMsg::AttachOk { rows, cols, seq_n, .. } => {
-            assert_eq!((rows, cols), (24, 80));
+            assert_eq!((rows, cols), (30, 100), "attach must resize before repaint");
             seq_n
         }
         other => panic!("expected AttachOk, got {other:?}"),

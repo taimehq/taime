@@ -108,6 +108,7 @@ fn main() {
             commands::daemon_write,
             commands::daemon_resize,
             commands::daemon_ack,
+            commands::daemon_checkpoint,
             commands::daemon_close_view,
             commands::daemon_kill,
             commands::daemon_list,
