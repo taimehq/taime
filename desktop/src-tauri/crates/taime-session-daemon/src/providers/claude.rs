@@ -171,7 +171,10 @@ impl Provider for ClaudeProvider {
         if has_idle {
             return AgentStatus::Idle;
         }
-        AgentStatus::Error
+        // A populated but unrecognized screen (startup banner, `/doctor`, a
+        // "press Enter to continue" page, alt-screen UI) means the agent is alive
+        // and waiting — NOT errored. Reserve ERROR for an empty/dead grid.
+        AgentStatus::Idle
     }
 
     fn approval_prompt(&self, view: &GridView) -> Option<ApprovalPrompt> {
