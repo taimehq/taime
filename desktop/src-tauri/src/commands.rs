@@ -3,32 +3,7 @@
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, State};
 
-use crate::backend::BackendState;
-use crate::config::ResolvedConfig;
 use crate::fs_watch::FsWatchState;
-use crate::AppStateHandle;
-
-/// Frontend calls this on boot to discover where the backend lives.
-/// (config.ts → getConfig())
-#[tauri::command]
-pub fn get_api_url(state: State<'_, AppStateHandle>) -> ResolvedConfig {
-    state.supervisor.cfg.clone()
-}
-
-/// Alias of `get_api_url` under the name the Step 2 terminal-canvas spec uses
-/// (`get_backend_routing`). Resolves the host/port the frontend uses to build
-/// the PTY WebSocket URL. Kept distinct so either command name works.
-#[tauri::command]
-pub fn get_backend_routing(state: State<'_, AppStateHandle>) -> ResolvedConfig {
-    state.supervisor.cfg.clone()
-}
-
-/// One-shot pull of the current supervisor status. Live updates arrive via the
-/// `backend://status` event.
-#[tauri::command]
-pub fn get_backend_status(state: State<'_, AppStateHandle>) -> BackendState {
-    state.supervisor.snapshot()
-}
 
 /// Start watching `dir` for the given terminal; dirty-state events are emitted
 /// as `terminal://{id}/fs-dirty`.
@@ -109,6 +84,21 @@ fn default_agent_spec(
         // CAO); a supervisor launch would set this true.
         inject_orchestration: false,
     }
+}
+
+/// Generic daemon query RPC (Phase 6 route-layer migration) — the daemon-backed
+/// replacement for the CAO REST surface (diff/hunks/attribution/contention/
+/// worktree/sessions). Returns a JSON value in the frontend's existing shape.
+#[tauri::command]
+pub async fn daemon_query(
+    daemon: State<'_, DaemonClient>,
+    kind: String,
+    args: serde_json::Value,
+    fallback: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let fb = fallback.unwrap_or_else(|| "null".to_string());
+    let json = daemon.query(kind, args.to_string(), &fb).await?;
+    serde_json::from_str(&json).map_err(|e| format!("parse query result: {e}"))
 }
 
 /// The daemon-side activity graph (agents + inter-agent assign/handoff/message

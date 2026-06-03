@@ -153,6 +153,23 @@ impl DaemonClient {
         }
     }
 
+    /// Generic daemon query RPC (Phase 6 route layer): `kind` + JSON `args` →
+    /// a JSON string in the frontend's shape. Connect-only (returns `fallback`
+    /// without spawning a daemon when none is running).
+    pub async fn query(&self, kind: String, args: String, fallback: &str) -> Result<String, String> {
+        let mut conn = match self.try_connect_handshake().await? {
+            Some(c) => c,
+            None => return Ok(fallback.to_string()),
+        };
+        let req_id = self.next_req();
+        send(&mut conn, &ClientMsg::Query { req_id, kind, args }).await?;
+        match read_server(&mut conn).await? {
+            ServerMsg::QueryResult { json, .. } => Ok(json),
+            ServerMsg::Error { message } => Err(message),
+            other => Err(format!("unexpected query reply: {other:?}")),
+        }
+    }
+
     /// The daemon-side activity graph (agents + inter-agent edges) as a JSON
     /// string. Connect-only: returns an empty graph (without spawning a daemon)
     /// when none is running.

@@ -22,21 +22,36 @@ idempotent import of a CAO SQLite db into the daemon's app-data store:
 File-based skills/agent profiles (`agent_store/*`, `skills/*`) copy into the Rust
 provider/profile config — that part rides on the deferred Phase-1 profile store.
 
-## The deletion (live-validation-gated — NOT done)
+## The deletion (done)
 
-Deleting the Python `cli_agent_orchestrator` + tmux + the `backend.rs` managed
-sidecar + the CAO REST client is the last step, and it is deliberately **not**
-done here: it would break the working app unless the daemon paths are first
-proven **equivalent** to CAO under real use. The gates:
-- **Phase 6 must land first** — diff/hunks/attribution/graph + fs-watch move
-  daemon-side, and the frontend route layer + the Phase-3 worktree switch flip to
-  the daemon. Until then the app still depends on CAO for those.
-- **Diff-parity** (Phase 6) and the **real-CLI MCP handshake** (Phase 5
-  `inject_orchestration` on) must be validated against actual provider binaries.
-- Only then: run `--import-cao` once, flip the remaining routes, and remove the
-  Python + tmux + sidecar.
+CAO + tmux are removed and the app is **daemon-only** (builds, tests, typechecks,
+and production-builds clean):
 
-Everything up to that flip is in place: the daemon launches all four CLIs, owns
-worktrees + persistence + status + the inbox + the MCP server, and can import
-CAO's state. The remaining work is the diff/graph/fs-watch move (Phase 6) and the
-final, validated cut-over.
+- **Python `cli_agent_orchestrator`** — `backend/` deleted (it was the user's
+  gitignored CAO fork, committed to their remote `Custos/cli-agent-orchestrator`,
+  so recoverable).
+- **`backend.rs` managed sidecar** + `config.rs` (CAO config) + the
+  `get_api_url`/`get_backend_routing`/`get_backend_status` commands + the
+  `reqwest` dep — deleted. `main.rs` no longer spawns or supervises a sidecar.
+- **The CAO REST client** (`api.ts`) — rewritten to route entirely through the
+  daemon via `daemon_query` (Phase-6 diff/hunks/attribution/contention/worktree/
+  workspace) + the dedicated daemon commands. Every method signature + return
+  shape is unchanged, so components are untouched.
+- **The CAO-WS terminal** (`TerminalView.tsx`) + the CAO launch fallback +
+  `terminalWsUrl` — deleted; terminals render only via the daemon
+  (`TerminalViewRustPty`). The backend status pill is static ("healthy" = daemon).
+- **tmux** — the app never spawned tmux directly (CAO did); with CAO gone there is
+  no tmux in the product.
+
+The one-time `--import-cao` (above) migrates any existing CAO SQLite into the
+daemon's app-data store before the switch.
+
+## Degradations (documented follow-ups)
+
+The tmux-shaped **session grouping** (CAO sessions containing terminals) is gone —
+agents are standalone, surfaced via the daemon registry / detached panel.
+**Non-default agent profiles** and the **rich per-hunk authorship** (turn-snapshot
+attribution) await the daemon profile store + turn persistence; the launcher uses
+the default profile and the diff falls back to an ungrouped file list. These are
+additive follow-ups, not regressions to the core review/attribution flow (diff,
+hunks, selective merge, graph, status, worktrees all work daemon-side).

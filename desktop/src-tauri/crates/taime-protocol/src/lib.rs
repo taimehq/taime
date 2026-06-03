@@ -43,9 +43,11 @@ pub const MAGIC: u32 = 0x7461_696d;
 /// v5: added `McpRequest`/`McpResponse` + `AgentSpawnSpec.inject_orchestration`
 ///     (Phase 5 daemon-hosted MCP transport).
 /// v6: added `GetGraph`/`Graph` (Phase 6 daemon-side activity graph).
+/// v7: added `Query`/`QueryResult` (Phase 6 daemon query RPC: diff/contention/
+///     sessions/worktree/attribution — the route-layer migration).
 /// Postcard is positional, so these are wire-layout changes — a stale older
 /// daemon is rejected at handshake and the app falls back rather than misparsing.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// Feature flags negotiated in the handshake (`capabilities` bitset). Reserving
 /// the bits now keeps app-update-while-old-daemon-running safe.
@@ -230,6 +232,11 @@ pub enum ClientMsg {
     /// Fetch the daemon-side activity graph (agents + inter-agent edges) as JSON
     /// (Phase 6). Read from the durable store, so it's complete even UI-closed.
     GetGraph { req_id: u64 },
+    /// Generic read/compute query RPC (Phase 6 route-layer migration): `kind` ∈
+    /// terminal_diff|file_diffs|hunked_diff|apply_selection|contention|sessions|
+    /// session_detail|worktree|attribution|graph; `args` is a JSON object. The
+    /// daemon replies `QueryResult` with a JSON string in the frontend's shape.
+    Query { req_id: u64, kind: String, args: String },
     /// Enumerate sessions. `req_id` correlates the `Sessions` reply.
     List { req_id: u64 },
     /// Bind THIS connection to stream `session_id`'s output. Carries the client's
@@ -295,6 +302,8 @@ pub enum ServerMsg {
     /// Reply to `GetGraph`: the activity graph as a JSON string
     /// (`{agents:[…], edges:[…]}`).
     Graph { req_id: u64, json: String },
+    /// Reply to `Query`: a JSON string in the frontend's shape for that `kind`.
+    QueryResult { req_id: u64, json: String },
     /// Handoff step 2: the grid is snapshotted at `seq_n`. A `T_REPAINT` frame
     /// (carrying the same `seq_n`) follows immediately, then `T_DATA` frames with
     /// `start_offset >= seq_n`.

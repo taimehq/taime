@@ -1,5 +1,4 @@
 import { useStore, isDaemonTransport, type Frame } from "../store";
-import { TerminalView } from "../components/TerminalView";
 import { TerminalViewRustPty } from "../components/TerminalViewRustPty";
 import { StatusBadge, statusDotClass } from "../components/StatusBadge";
 import { prettySessionText } from "../lib/sessionName";
@@ -288,9 +287,9 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
       </header>
 
       <div className="min-h-0 flex-1">
-        {isRustPty ? (
-          <TerminalViewRustPty sessionId={frame.ptySessionId!} frameKey={frame.key} />
-        ) : frame.pending || !frame.terminalId ? (
+        {isRustPty && frame.ptySessionId ? (
+          <TerminalViewRustPty sessionId={frame.ptySessionId} frameKey={frame.key} />
+        ) : (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-zinc-500">
             <Loader2 size={20} className="animate-spin text-teal-400" />
             <span className="text-xs">Starting {title}…</span>
@@ -298,8 +297,6 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
               cold-starting the CLI
             </span>
           </div>
-        ) : (
-          <TerminalView terminalId={frame.terminalId} frameKey={frame.key} />
         )}
       </div>
     </div>

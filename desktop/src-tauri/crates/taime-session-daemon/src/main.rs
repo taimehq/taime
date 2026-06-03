@@ -8,6 +8,7 @@
 
 mod attribution;
 mod conn;
+mod diff;
 mod emulator;
 mod listener;
 mod manager;

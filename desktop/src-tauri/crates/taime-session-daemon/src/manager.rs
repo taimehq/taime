@@ -296,6 +296,100 @@ impl Manager {
         serde_json::json!({ "agents": agents, "edges": edges }).to_string()
     }
 
+    /// Resolve a terminal's diff context `(cwd, base)`: an isolated worktree diffs
+    /// against its `base_sha` (fork point → shows all the agent's changes); a
+    /// shared/live terminal against HEAD (`None`).
+    fn diff_context(&self, terminal_key: &str) -> (String, Option<String>) {
+        if let Some(store) = &self.store {
+            if let Ok(Some((path, base_sha, mode))) = store.worktree(terminal_key) {
+                let base = if mode == "worktree" { base_sha } else { None };
+                return (path, base);
+            }
+        }
+        let cwd = self.session_by_attribution(terminal_key).map(|s| s.cwd()).unwrap_or_default();
+        (cwd, None)
+    }
+
+    /// Generic query RPC (Phase 6 route-layer migration): returns a JSON string in
+    /// the frontend's shape for `kind`. Shells out to git (diffs) — call from a
+    /// blocking context.
+    pub fn query(&self, kind: &str, args_json: &str) -> String {
+        let a: serde_json::Value =
+            serde_json::from_str(args_json).unwrap_or_else(|_| serde_json::json!({}));
+        let tk = a.get("terminal_key").and_then(|v| v.as_str()).unwrap_or("");
+        match kind {
+            "terminal_diff" => {
+                let (cwd, base) = self.diff_context(tk);
+                crate::diff::terminal_diff(tk, &cwd, base.as_deref()).to_string()
+            }
+            "file_diffs" => {
+                let (cwd, base) = self.diff_context(tk);
+                crate::diff::file_diffs(tk, &cwd, base.as_deref()).to_string()
+            }
+            "hunked_diff" => {
+                let (cwd, base) = self.diff_context(tk);
+                crate::diff::hunked_diff(tk, &cwd, base.as_deref()).to_string()
+            }
+            "apply_selection" => {
+                let (cwd, base) = self.diff_context(tk);
+                let target = a.get("target_dir").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| cwd.clone());
+                let mode = a.get("mode").and_then(|v| v.as_str()).unwrap_or("merge");
+                let sel = a.get("selections").cloned().unwrap_or_else(|| serde_json::json!({}));
+                crate::diff::apply_selection(&cwd, base.as_deref(), &target, mode, &sel).to_string()
+            }
+            "contention" => self.contention_json(a.get("session").and_then(|v| v.as_str()).unwrap_or("")),
+            "workspace_info" => {
+                crate::diff::workspace_info(a.get("path").and_then(|v| v.as_str()).unwrap_or("")).to_string()
+            }
+            "worktree" => self.worktree_json(tk),
+            "attribution" => self.attribution_json(tk),
+            "sessions" => "[]".to_string(),
+            "session_detail" => r#"{"session":null,"terminals":[]}"#.to_string(),
+            "graph" => self.activity_graph_json(),
+            other => serde_json::json!({ "error": format!("unknown query {other}") }).to_string(),
+        }
+    }
+
+    /// Files changed in ≥2 of a session's worktrees (contention).
+    fn contention_json(&self, session: &str) -> String {
+        let Some(store) = &self.store else { return "[]".to_string() };
+        let wts = store.worktrees_for_session(session).unwrap_or_default();
+        let mut map: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+        for (tid, _path, _prov) in wts {
+            let (cwd, base) = self.diff_context(&tid);
+            let v = crate::diff::terminal_diff(&tid, &cwd, base.as_deref());
+            if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
+                for f in files.iter().filter_map(|f| f.as_str()) {
+                    map.entry(f.to_string()).or_default().insert(tid.clone());
+                }
+            }
+        }
+        let contention: Vec<serde_json::Value> = map
+            .into_iter()
+            .filter(|(_, t)| t.len() > 1)
+            .map(|(path, terms)| serde_json::json!({ "path": path, "terminals": terms.into_iter().collect::<Vec<_>>() }))
+            .collect();
+        serde_json::json!(contention).to_string()
+    }
+
+    fn worktree_json(&self, tk: &str) -> String {
+        if let Some(store) = &self.store {
+            if let Ok(Some((path, base_sha, mode))) = store.worktree(tk) {
+                return serde_json::json!({
+                    "terminal_key": tk, "worktree_path": path, "base_sha": base_sha, "mode": mode
+                })
+                .to_string();
+            }
+        }
+        "null".to_string()
+    }
+
+    /// Minimal attribution (team + files). Rich per-hunk authorship awaits turn
+    /// persistence; the UI falls back to an ungrouped file list.
+    fn attribution_json(&self, _tk: &str) -> String {
+        r#"{"team":[],"files":{}}"#.to_string()
+    }
+
     /// Broadcast a message to every live agent except the sender. Returns the
     /// count enqueued.
     pub fn broadcast(&self, sender: &str, body: &str) -> usize {

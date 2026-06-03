@@ -146,6 +146,14 @@ pub async fn handle(stream: UnixStream, manager: Arc<Manager>, token: String) {
                 let json = manager.activity_graph_json();
                 send(&out_tx, &ServerMsg::Graph { req_id, json }).await;
             }
+            ClientMsg::Query { req_id, kind, args } => {
+                // Diffs shell out to git — keep them off the async worker.
+                let mgr = manager.clone();
+                let json = tokio::task::spawn_blocking(move || mgr.query(&kind, &args))
+                    .await
+                    .unwrap_or_else(|_| r#"{"error":"query panicked"}"#.to_string());
+                send(&out_tx, &ServerMsg::QueryResult { req_id, json }).await;
+            }
             ClientMsg::List { req_id } => {
                 send(&out_tx, &ServerMsg::Sessions { req_id, sessions: manager.list() }).await
             }

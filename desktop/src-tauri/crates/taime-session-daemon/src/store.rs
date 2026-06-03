@@ -334,16 +334,38 @@ impl Store {
         Ok(rows)
     }
 
-    /// The worktree path for an attribution key (for daemon-side diff, Phase 6).
-    #[allow(dead_code)] // consumed when the diff route moves daemon-side.
-    pub fn worktree_path(&self, terminal_key: &str) -> rusqlite::Result<Option<String>> {
+    /// The worktree `(path, base_sha, mode)` for an attribution key — the daemon
+    /// diff's context (Phase 6). `base_sha` is the fork point for an isolated
+    /// worktree (diff against it shows all the agent's changes).
+    pub fn worktree(
+        &self,
+        terminal_key: &str,
+    ) -> rusqlite::Result<Option<(String, Option<String>, String)>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT worktree_path FROM taime_worktrees WHERE terminal_id = ?1",
+            "SELECT worktree_path, base_sha, mode FROM taime_worktrees WHERE terminal_id = ?1",
             rusqlite::params![terminal_key],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
+    }
+
+    /// All worktrees for a session: `(terminal_id, worktree_path, provider)` — the
+    /// contention source (files changed in ≥2 worktrees).
+    pub fn worktrees_for_session(
+        &self,
+        session_name: &str,
+    ) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT terminal_id, worktree_path, provider FROM taime_worktrees WHERE session_name = ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![session_name], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// All recorded sessions, newest first (history / detached-panel backfill).

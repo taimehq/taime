@@ -21,22 +21,29 @@ durable Phase-3 store so it's **complete even with the UI closed**:
 This is the flagship "who delegated to whom" view, now backed by daemon-owned,
 durable inter-agent edges instead of CAO plugin events.
 
-## Remaining Phase-6 work (parity-gated / live-validated)
+## Diff port + route flip — done
 
-- **fs-watch into the daemon.** Today it's app-side + per-*visible*-frame
-  (`useFsWatch.ts`), so attribution dies when the UI closes. Extract
-  `fs_watch.rs`'s watcher core into a shared module the daemon mounts per session
-  (recording fs-events to `taime_activity_events`), keeping Tauri a UI subscriber.
-  This is additive (the app watcher can stay) but integration-heavy; the worktree
-  paths it watches are the daemon-provisioned ones.
-- **diff_service per-hunk authorship.** Port `get_terminal_diff` / `get_file_diffs`
-  / `get_hunked_diff` / `apply_selection` (the selective merge/revert) +
-  `file_attribution` (per-hunk author via snapshot content-match) to `git`/`git2`.
-  This is **diff-parity-gated** — it must match CAO's output on real repos before
-  the frontend trusts it. `Store::worktree_path` (added here) gives the daemon the
-  path to diff.
-- **Route-layer flip.** Move the diff/hunks/attribution/graph/checkpoint `api.ts`
-  calls to the daemon commands. The data *shapes* don't change (components keyed
-  on them don't), but the fetch layer does — and this is also where the **Phase-3
-  worktree provisioning switch** (`daemonProvisionWorktree`) flips, since diff and
-  worktree must move together (CAO can't diff a daemon-provisioned worktree).
+- **`diff.rs`** — the `diff_service` port: `terminal_diff` (combined working-tree
+  diff + untracked), `file_diffs` (both-sides reconstruction for Monaco),
+  `hunked_diff` + `parse_unified` (per-file/per-hunk for selective review),
+  `apply_selection` (reassemble chosen hunks + `git apply [--reverse]` for
+  selective merge/revert), and `workspace_info`. Diffs against the worktree's
+  `base_sha` (fork point). Tested on real temp repos incl. a **selective hunk
+  merge into a separate worktree**.
+- **Generic query RPC** (`ClientMsg::Query`/`QueryResult`, protocol → v7) +
+  `Manager::query` dispatch + `daemon_query` command — one message subsumes
+  diff/file_diffs/hunked_diff/apply/contention/worktree/attribution/workspace/
+  sessions, returning JSON in the frontend's shape.
+- **Route flip:** `api.ts` is rewritten daemon-only (no HTTP); the **Phase-3
+  worktree provisioning** flips to `daemonProvisionWorktree` (diff + worktree move
+  together). Done as part of the Phase-7 cut-over.
+
+## Remaining Phase-6 follow-ups (additive, not regressions)
+
+- **fs-watch into the daemon** for attribution while the UI is closed: the app
+  watcher (`useFsWatch`) still runs (UI subscriber); moving the watcher core into
+  the daemon to record fs-events durably is the additive next step (the daemon
+  already provisions the worktrees it would watch). `postFsEvents` is now a no-op.
+- **Per-hunk authorship** awaits turn persistence (the daemon's turn boundaries
+  recorded to `taime_agent_turns`); `attribution` currently returns an empty
+  team/files map and the UI falls back to an ungrouped file list.
