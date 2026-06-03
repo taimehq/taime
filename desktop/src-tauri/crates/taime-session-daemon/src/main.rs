@@ -15,6 +15,7 @@ mod providers;
 mod repaint;
 mod runtime;
 mod session;
+mod store;
 
 use std::path::PathBuf;
 use std::sync::Arc;
