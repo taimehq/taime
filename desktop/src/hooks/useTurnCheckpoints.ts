@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { api } from "../api";
-import { useStore } from "../store";
+import { useStore, isDaemonTransport } from "../store";
 
 /**
  * Derive agent "turn" boundaries from the status signal we already poll and
@@ -17,8 +17,15 @@ export function useTurnCheckpoints() {
   const prev = useRef<Record<string, string>>({});
 
   useEffect(() => {
+    // Only CAO frames drive CAO checkpoints. Daemon frames now carry a
+    // terminalStatuses entry too (Phase 4 daemon status), but their turn
+    // boundaries arrive as daemon turn events (recordTurn) — posting a CAO
+    // checkpoint for them would double-attribute, so exclude them here.
     const liveIds = new Set(
-      frames.map((f) => f.terminalId).filter((x): x is string => !!x),
+      frames
+        .filter((f) => !isDaemonTransport(f.transport))
+        .map((f) => f.terminalId)
+        .filter((x): x is string => !!x),
     );
     for (const tid of liveIds) {
       const cur = statuses[tid];

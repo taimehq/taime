@@ -75,8 +75,10 @@ impl Manager {
     /// all-CLI path). The session carries the MCP cleanup + provider id.
     pub fn spawn_agent(&self, spec: AgentSpawnSpec) -> Result<String, String> {
         let prepared = self.registry.build(&spec)?;
+        // The adapter (status inference) travels with the session.
+        let adapter = self.registry.adapter(&spec.provider);
         let id = format!("pty-{:x}", self.session_counter.fetch_add(1, Ordering::SeqCst));
-        let session = Session::spawn_prepared(id.clone(), prepared, Some(spec.provider))?;
+        let session = Session::spawn_prepared(id.clone(), prepared, adapter)?;
         self.sessions.lock().unwrap().insert(id.clone(), session);
         self.touch();
         Ok(id)
