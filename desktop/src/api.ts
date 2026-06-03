@@ -1,4 +1,6 @@
+import { invoke } from "@tauri-apps/api/core";
 import { daemonQuery, daemonProvisionWorktree, daemonActivityGraph } from "./pty";
+import { inTauri } from "./backend";
 
 /**
  * The data layer. After the CAO/tmux → all-Rust migration (Phase 6/7), there is
@@ -202,15 +204,16 @@ export const api = {
   listProviders: () => daemonQuery<ProviderInfo[]>("providers", {}, PROVIDERS),
   listProfiles: async (): Promise<AgentProfileInfo[]> => [],
 
-  getWorkspaceInfo: (path: string) =>
-    daemonQuery<WorkspaceInfo>("workspace_info", { path }, {
-      path,
-      exists: false,
-      is_git: false,
-      repo_root: null,
-      branch: null,
-      head_short: null,
-    }),
+  /** Probe a project dir (app-side git read — no daemon, no boot race). */
+  getWorkspaceInfo: async (path: string): Promise<WorkspaceInfo> => {
+    if (!inTauri())
+      return { path, exists: false, is_git: false, repo_root: null, branch: null, head_short: null };
+    try {
+      return await invoke<WorkspaceInfo>("workspace_info", { path });
+    } catch {
+      return { path, exists: false, is_git: false, repo_root: null, branch: null, head_short: null };
+    }
+  },
 
   /** Sessions are the daemon's agents (surfaced via the daemon registry); the
    *  tmux-shaped session grouping is gone. */
