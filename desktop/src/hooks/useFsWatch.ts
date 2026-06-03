@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { api } from "../api";
 import { useStore } from "../store";
+import { resolveWorkingDirectory } from "../lib/terminalRouting";
 import { watchTerminal, unwatchTerminal, onDirty, onFsEvent } from "../fswatch";
 
 /**
@@ -38,7 +39,14 @@ export function useFsWatch(terminalId: string | null) {
         });
       });
       try {
-        const { working_directory } = await api.getWorkingDirectory(terminalId);
+        // Route by ownership: a daemon-owned terminal resolves to its local cwd
+        // (no CAO round-trip; survives worktrees moving daemon-side in Phase 3).
+        // `getState()` so the watch keys only off `terminalId`, not the registry.
+        const working_directory = await resolveWorkingDirectory(
+          terminalId,
+          useStore.getState().rustPtySessions,
+          async (id) => (await api.getWorkingDirectory(id)).working_directory,
+        );
         if (cancelled || !working_directory) return;
         await watchTerminal(terminalId, working_directory);
       } catch {
