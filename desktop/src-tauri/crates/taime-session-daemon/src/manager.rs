@@ -33,6 +33,13 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// The delimited stdin payload for an inbox delivery — a clear visual frame so
+/// the user can tell orchestrator injection from agent output (the plan's
+/// delivery format). Pure + testable.
+fn format_delivery(sender_id: &str, body: &str) -> String {
+    format!("\r\n--- MESSAGE FROM {sender_id} ---\r\n{body}\r\n--- END MESSAGE ---\r\n")
+}
+
 impl Default for Manager {
     fn default() -> Self {
         Self::new()
@@ -141,6 +148,66 @@ impl Manager {
         self.sessions.lock().unwrap().get(id).cloned()
     }
 
+    /// The live session addressed by `attribution_key` (the inbox routes to it).
+    fn session_by_attribution(&self, key: &str) -> Option<Session> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .find(|s| s.attribution_key().as_deref() == Some(key))
+            .cloned()
+    }
+
+    /// Enqueue an inbox message for `receiver_id` (Phase 5 message bus). Persisted
+    /// `pending`; the delivery engine injects it when the receiver next goes
+    /// idle. Returns the monotonic message id.
+    pub fn enqueue_message(
+        &self,
+        sender_id: String,
+        receiver_id: String,
+        message: String,
+    ) -> Result<i64, String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "persistence disabled; cannot enqueue".to_string())?;
+        store
+            .enqueue_message(&sender_id, &receiver_id, &message, now_unix())
+            .map_err(|e| format!("enqueue: {e}"))
+    }
+
+    /// Idle-gated delivery (the safety property): for each receiver with a pending
+    /// message that maps to a live, **ready** (idle/completed) session, inject the
+    /// oldest message into its stdin with a visual delimiter and mark it
+    /// `delivered` (idempotent). Never interrupts a mid-turn agent. Best-effort.
+    pub fn deliver_pending(&self) {
+        let Some(store) = &self.store else { return };
+        let receivers = match store.receivers_with_pending() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        for receiver in receivers {
+            let Some(session) = self.session_by_attribution(&receiver) else { continue };
+            if !session.is_ready_for_delivery() {
+                continue;
+            }
+            let msg = match store.pending_for(&receiver, 1) {
+                Ok(mut m) => m.pop(),
+                Err(_) => None,
+            };
+            let Some(msg) = msg else { continue };
+            let payload = format_delivery(&msg.sender_id, &msg.message);
+            match session.input(payload.as_bytes()) {
+                Ok(_) => {
+                    let _ = store.set_message_status(msg.id, "delivered");
+                }
+                Err(_) => {
+                    let _ = store.set_message_status(msg.id, "failed");
+                }
+            }
+        }
+    }
+
     pub fn list(&self) -> Vec<SessionSummary> {
         self.sessions.lock().unwrap().values().map(|s| s.summary()).collect()
     }
@@ -189,10 +256,30 @@ impl Manager {
         for s in &live {
             s.quiet_check(quiet_threshold);
         }
+        // Idle-gated inbox delivery (Phase 5): deliver pending messages to any
+        // receiver that's now idle. Runs on the same 250ms tick as quiet-window.
+        self.deliver_pending();
         // Shutdown decision: nothing left to serve and the app isn't connected.
         let empty = self.sessions.lock().unwrap().is_empty();
         let no_clients = self.active_conns.load(Ordering::SeqCst) == 0;
         let idle = self.last_activity.lock().unwrap().elapsed() > idle_grace;
         empty && no_clients && idle
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_payload_is_clearly_delimited() {
+        let out = format_delivery("term-a", "please review the diff");
+        assert_eq!(
+            out,
+            "\r\n--- MESSAGE FROM term-a ---\r\nplease review the diff\r\n--- END MESSAGE ---\r\n"
+        );
+        // The frame is visually distinguishable from agent output.
+        assert!(out.contains("--- MESSAGE FROM term-a ---"));
+        assert!(out.contains("--- END MESSAGE ---"));
     }
 }

@@ -39,9 +39,10 @@ pub const MAGIC: u32 = 0x7461_696d;
 ///
 /// v2: `SessionSummary` gained `provider` + `status` (Phase 4 status inference).
 /// v3: added `ProvisionWorktree`/`Worktree` (Phase 3 daemon-owned worktrees).
+/// v4: added `SendMessage`/`MessageQueued` (Phase 5 inbox message bus).
 /// Postcard is positional, so these are wire-layout changes — a stale older
 /// daemon is rejected at handshake and the app falls back rather than misparsing.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Feature flags negotiated in the handshake (`capabilities` bitset). Reserving
 /// the bits now keeps app-update-while-old-daemon-running safe.
@@ -204,6 +205,13 @@ pub enum ClientMsg {
     /// The daemon mints the attribution key, runs `git worktree`, persists the
     /// row, and replies `Worktree`. `isolate=false` (or a non-git root) ⇒ shared.
     ProvisionWorktree { req_id: u64, project_root: String, provider: String, isolate: bool },
+    /// Enqueue an inbox message for `receiver` (the attribution key of a live
+    /// agent) — the Phase-5 message bus (ops/app entry; the agent-facing MCP
+    /// `send_message` tool feeds the same inbox in-process). The daemon delivers
+    /// it into the receiver's stdin when it next goes idle. Replies
+    /// `MessageQueued`. (`sender` is trusted same-user here; the MCP path stamps
+    /// it from the authenticated session.)
+    SendMessage { req_id: u64, sender: String, receiver: String, message: String },
     /// Enumerate sessions. `req_id` correlates the `Sessions` reply.
     List { req_id: u64 },
     /// Bind THIS connection to stream `session_id`'s output. Carries the client's
@@ -262,6 +270,8 @@ pub enum ServerMsg {
     /// Reply to `ProvisionWorktree`. `info.error` is set (and `mode="shared"`)
     /// when isolation fell back; the app uses the cwd/key regardless.
     Worktree { req_id: u64, info: WorktreeInfo },
+    /// Reply to `SendMessage`: the enqueued message's monotonic inbox id.
+    MessageQueued { req_id: u64, id: i64 },
     /// Handoff step 2: the grid is snapshotted at `seq_n`. A `T_REPAINT` frame
     /// (carrying the same `seq_n`) follows immediately, then `T_DATA` frames with
     /// `start_offset >= seq_n`.
@@ -606,6 +616,34 @@ mod tests {
                     assert_eq!(req_id, 3);
                     assert_eq!(got, info);
                 }
+                other => panic!("wrong msg {other:?}"),
+            },
+            other => panic!("expected Control, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_message_roundtrips_both_ways() {
+        let req = ClientMsg::SendMessage {
+            req_id: 5,
+            sender: "term-a".into(),
+            receiver: "term-b".into(),
+            message: "review please".into(),
+        };
+        match parse_frame(BytesMut::from(&encode_client(&req).unwrap()[..])).unwrap() {
+            Frame::Control(b) => match decode_client(&b).unwrap() {
+                ClientMsg::SendMessage { req_id, sender, receiver, message } => {
+                    assert_eq!((req_id, sender.as_str(), receiver.as_str(), message.as_str()),
+                               (5, "term-a", "term-b", "review please"))
+                }
+                other => panic!("wrong msg {other:?}"),
+            },
+            other => panic!("expected Control, got {other:?}"),
+        }
+        let reply = ServerMsg::MessageQueued { req_id: 5, id: 42 };
+        match parse_frame(BytesMut::from(&encode_server(&reply).unwrap()[..])).unwrap() {
+            Frame::Control(b) => match decode_server(&b).unwrap() {
+                ServerMsg::MessageQueued { req_id, id } => assert_eq!((req_id, id), (5, 42)),
                 other => panic!("wrong msg {other:?}"),
             },
             other => panic!("expected Control, got {other:?}"),

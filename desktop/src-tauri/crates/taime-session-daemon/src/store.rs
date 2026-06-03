@@ -34,6 +34,17 @@ pub fn data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("taime"))
 }
 
+/// A persisted inbox message (Phase 5). `created_at` is a unix-seconds string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxMessage {
+    pub id: i64,
+    pub sender_id: String,
+    pub receiver_id: String,
+    pub message: String,
+    pub status: String,
+    pub created_at: String,
+}
+
 /// A persisted daemon session row (history + crash-survival metadata).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
@@ -138,6 +149,72 @@ impl Store {
                 provider,
                 created_at_unix.to_string(),
             ],
+        )?;
+        Ok(())
+    }
+
+    // ---- Inbox (Phase 5): persisted-by-default mailbox, FIFO per receiver ----
+
+    /// Enqueue a message for `receiver_id` (status `pending`). Returns the
+    /// monotonic message id. The daemon stamps `sender_id` (never a client field).
+    pub fn enqueue_message(
+        &self,
+        sender_id: &str,
+        receiver_id: &str,
+        message: &str,
+        created_at_unix: u64,
+    ) -> rusqlite::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO inbox (sender_id, receiver_id, message, status, created_at) \
+             VALUES (?1, ?2, ?3, 'pending', ?4)",
+            rusqlite::params![sender_id, receiver_id, message, created_at_unix.to_string()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// The distinct receivers that have at least one `pending` message (the
+    /// delivery engine's work-list).
+    pub fn receivers_with_pending(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT receiver_id FROM inbox WHERE status = 'pending'")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The oldest `pending` messages for `receiver_id` (FIFO by id), up to `limit`.
+    pub fn pending_for(&self, receiver_id: &str, limit: i64) -> rusqlite::Result<Vec<InboxMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, sender_id, receiver_id, message, status, created_at \
+             FROM inbox WHERE receiver_id = ?1 AND status = 'pending' \
+             ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![receiver_id, limit], |r| {
+                Ok(InboxMessage {
+                    id: r.get(0)?,
+                    sender_id: r.get(1)?,
+                    receiver_id: r.get(2)?,
+                    message: r.get(3)?,
+                    status: r.get(4)?,
+                    created_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Transition a message's status (`delivered` / `failed`). The
+    /// `pending → delivered` gate makes delivery idempotent across a restart.
+    pub fn set_message_status(&self, id: i64, status: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE inbox SET status = ?2 WHERE id = ?1",
+            rusqlite::params![id, status],
         )?;
         Ok(())
     }
@@ -334,6 +411,32 @@ mod tests {
         assert_eq!(p0.status, "exited");
         assert_eq!(p0.provider.as_deref(), Some("claude_code"));
         assert_eq!(p0.attribution_key.as_deref(), Some("term-1"));
+    }
+
+    #[test]
+    fn inbox_enqueue_fifo_and_status_gate() {
+        let store = Store::open_at(std::path::Path::new(":memory:")).unwrap();
+        let id1 = store.enqueue_message("a", "b", "first", 10).unwrap();
+        let id2 = store.enqueue_message("a", "b", "second", 11).unwrap();
+        let _other = store.enqueue_message("a", "c", "for-c", 12).unwrap();
+        assert!(id2 > id1, "monotonic ids");
+
+        assert_eq!(store.receivers_with_pending().unwrap().len(), 2); // b, c
+
+        // FIFO: oldest first.
+        let next = store.pending_for("b", 1).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].message, "first");
+        assert_eq!(next[0].id, id1);
+
+        // Deliver the first → the second becomes head; b stays a pending receiver.
+        store.set_message_status(id1, "delivered").unwrap();
+        let next = store.pending_for("b", 1).unwrap();
+        assert_eq!(next[0].message, "second");
+
+        store.set_message_status(id2, "delivered").unwrap();
+        // b drained; only c remains.
+        assert_eq!(store.receivers_with_pending().unwrap(), vec!["c".to_string()]);
     }
 
     #[test]
