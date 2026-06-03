@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { inTauri } from "../backend";
 import { useStore } from "../store";
-import { ptyList } from "../pty";
+import { ptyList, daemonList } from "../pty";
 
 /**
  * Keep the Rust-PTY registry honest: every few seconds, mark any tracked
@@ -19,21 +19,33 @@ export function useRustPtyReconcile() {
       const meta = useStore.getState().rustPtySessions;
       const ids = Object.keys(meta);
       if (ids.length === 0) return;
-      const live = new Set((await ptyList()).map((s) => s.id));
+      // Reconcile each session against the backend that OWNS it: in-app sessions
+      // via pty_list, daemon sessions via daemon_list. Polling only the in-app
+      // list would falsely mark every detached daemon agent as exited.
+      const needInapp = ids.some((id) => meta[id].transport !== "daemon");
+      const needDaemon = ids.some((id) => meta[id].transport === "daemon");
+      const [inappList, daemonSessions] = await Promise.all([
+        needInapp ? ptyList() : Promise.resolve([]),
+        needDaemon ? daemonList() : Promise.resolve([]),
+      ]);
       if (!alive) return;
+      const liveInapp = new Set(inappList.map((s) => s.id));
+      const liveDaemon = new Set(
+        daemonSessions.filter((s) => s.alive !== false).map((s) => s.id),
+      );
       const framed = new Set(
         useStore
           .getState()
           .frames.map((f) => f.ptySessionId)
           .filter(Boolean) as string[],
       );
-      // Mark sessions that are neither alive in the manager nor currently framed
-      // (a just-launched frame may briefly precede pty_list visibility) as exited.
+      // Mark sessions that are neither alive in their backend nor currently framed
+      // (a just-launched frame may briefly precede list visibility) as exited.
       const markExited = useStore.getState().markRustPtyExited;
       for (const id of ids) {
-        if (!live.has(id) && !framed.has(id) && meta[id].status === "running") {
-          markExited(id);
-        }
+        if (meta[id].status !== "running" || framed.has(id)) continue;
+        const live = meta[id].transport === "daemon" ? liveDaemon : liveInapp;
+        if (!live.has(id)) markExited(id);
       }
     };
 

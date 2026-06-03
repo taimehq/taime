@@ -20,6 +20,7 @@ export function ControlColumn({ onLaunch }: { onLaunch: () => void }) {
   const sessions = useStore((s) => s.sessions);
   const connected = useStore((s) => s.connected);
   const launchClaudeRustPty = useStore((s) => s.launchClaudeRustPty);
+  const launchClaudeDaemon = useStore((s) => s.launchClaudeDaemon);
   const width = useStore((s) => s.sidebarWidth);
   const collapsed = useStore((s) => s.sidebarCollapsed);
   const setSidebarWidth = useStore((s) => s.setSidebarWidth);
@@ -99,6 +100,15 @@ export function ControlColumn({ onLaunch }: { onLaunch: () => void }) {
               className="no-drag flex items-center justify-center gap-2 rounded-lg border border-ink-500 px-3 py-1.5 text-xs text-zinc-400 hover:bg-ink-700"
             >
               Claude · Rust PTY (dev)
+            </button>
+          )}
+          {import.meta.env.DEV && (
+            // Claude via the detached session daemon (survives app crashes).
+            <button
+              onClick={() => launchClaudeDaemon()}
+              className="no-drag flex items-center justify-center gap-2 rounded-lg border border-ink-500 px-3 py-1.5 text-xs text-zinc-400 hover:bg-ink-700"
+            >
+              Claude · Daemon (dev)
             </button>
           )}
         </div>
