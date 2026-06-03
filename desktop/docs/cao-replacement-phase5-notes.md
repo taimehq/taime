@@ -35,15 +35,26 @@ mailbox + send_message + idle-gated stdin delivery (MVP loop)*.
   protocol round-trip. 52 daemon + 9 protocol + 2 integration green; zero
   warnings; typecheck clean.
 
-## Remaining Phase-5 work (the flagship's larger half)
+## MCP tool dispatcher (`src/mcp.rs`) — built (in-process; transport remaining)
 
-- **Daemon-hosted MCP server** so agents call orchestration tools themselves:
-  expose `list_agents`/`send_message`/`broadcast`/`request`/`reply`/`handoff`/
-  `assign`/`share` as MCP tools over a per-provider transport (stdio shim or
-  loopback HTTP+SSE + per-agent token), resolving against the live registry +
-  idle state + inbox in-process. The daemon **stamps `from` from the
-  authenticated session** (closes CAO's `sender_id` spoof). Wire the Phase-1
-  per-provider MCP injection to *this* endpoint instead of CAO's.
+The **in-process JSON-RPC dispatcher** that turns the orchestration primitives
+into MCP tools: handles `initialize` / `tools/list` / `tools/call` for
+`list_agents` + `send_message`, resolving against the live registry + inbox.
+Crucially, `send_message`'s `from` is **stamped from the authenticated `caller`**
+(the calling session's attribution key), never a client field — closing CAO's
+`sender_id` spoof. Tool-level failures are MCP `isError` content; unknown methods
+are JSON-RPC errors. Unit-tested (initialize/tools-list/from-stamping/self-send
+rejection/unknown-method).
+
+## Remaining Phase-5 work (needs a live agent to validate)
+
+- **The per-agent transport** that mounts the dispatcher: a tiny **stdio shim**
+  bridging each CLI's MCP client to the daemon (or loopback HTTP+SSE + per-agent
+  token), injected via the Phase-1 per-provider MCP config (swap the daemon's
+  endpoint in for CAO's). Validating the MCP handshake against a real CLI is why
+  this isn't mounted yet.
+- **More tools:** `broadcast`/`request`/`reply` (correlation id over the inbox),
+  `handoff` (transfer + edge).
 - **`assign`** (worker spawn): `Manager::spawn_agent` + `provision_worktree`
   already exist; `assign` adds a constrained MCP allow-list (so a worker can't
   infinitely re-`assign`), parent→child linkage, and result fan-in via `reply`.
