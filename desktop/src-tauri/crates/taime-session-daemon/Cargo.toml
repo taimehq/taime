@@ -4,7 +4,9 @@
 name = "taime-session-daemon"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.77"
+# 1.80 for std::sync::LazyLock (the provider-registry status regexes). The daemon
+# already needs a recent toolchain for the git-pinned wezterm-term dep.
+rust-version = "1.80"
 
 [[bin]]
 name = "taime-session-daemon"
@@ -19,6 +21,12 @@ bytes = "1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1", features = ["use-std"] }
+# Provider registry: serde_json for claude `--mcp-config` JSON + gemini
+# settings.json merge; toml for `~/.taime/providers.toml` defaults; regex for the
+# per-provider status/approval heuristics ported from CAO.
+serde_json = "1"
+toml = "0.8"
+regex = "1"
 
 portable-pty = "0.9"
 anyhow = "1"

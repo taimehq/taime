@@ -1,0 +1,223 @@
+//! Gemini CLI adapter (`gemini`).
+//!
+//! Command parity with CAO's `_build_gemini_command`:
+//!   * `--yolo --sandbox false` (base_args), `--model`;
+//!   * system prompt written to a per-terminal `GEMINI.md` workspace with a brief
+//!     `-i` role confirmation, and the child `cwd` set to that workspace (CAO uses
+//!     `cd <ws> && gemini`; spawning directly we just set cwd) — cleaned up by
+//!     removing the workspace dir;
+//!   * MCP merged into `~/.gemini/settings.json` (`mcpServers`), with
+//!     `CAO_TERMINAL_ID` stamped into each server's env, and removed on exit.
+//!
+//! Status heuristics ported from `gemini_cli.py:565-647`.
+
+// Status heuristics + patterns are wired into the protocol + UI in Phase 4.
+#![allow(dead_code)]
+
+use regex::Regex;
+use std::path::PathBuf;
+use std::sync::LazyLock;
+
+use taime_protocol::{AgentProfile, AgentStatus, McpServerConfig};
+
+use super::config::{self, ProviderDefaults};
+use super::{
+    with_terminal_id, Cleanup, CleanupAction, DaemonSessionSpec, GridView, LaunchOpts, Prepared,
+    Provider,
+};
+
+pub struct GeminiProvider {
+    defaults: ProviderDefaults,
+}
+
+impl GeminiProvider {
+    pub fn new(defaults: ProviderDefaults) -> Self {
+        GeminiProvider { defaults }
+    }
+}
+
+/// `~/.gemini/settings.json` (the MCP merge target).
+fn gemini_settings_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".gemini").join("settings.json"))
+}
+
+/// Per-terminal workspace dir that holds `GEMINI.md` (so Gemini's hierarchical
+/// lookup finds this terminal's instructions first).
+fn workspace_dir(terminal_id: &str) -> Option<PathBuf> {
+    let tid = if terminal_id.is_empty() { "default" } else { terminal_id };
+    dirs::home_dir().map(|h| h.join(".taime").join("gemini-workspaces").join(tid))
+}
+
+impl Provider for GeminiProvider {
+    fn id(&self) -> &str {
+        "gemini_cli"
+    }
+
+    fn build(&self, profile: &AgentProfile, opts: &LaunchOpts) -> std::io::Result<Prepared> {
+        let mut args: Vec<String> = self.defaults.base_args.clone();
+        if let Some(model) = &profile.model {
+            args.push(self.defaults.model_flag.clone());
+            args.push(model.clone());
+        }
+
+        let mut cleanup = Cleanup::default();
+        // Default cwd is the caller's worktree; a system prompt redirects it to the
+        // per-terminal GEMINI.md workspace.
+        let mut cwd = opts.cwd.clone();
+
+        if let Some(sp) = profile.system_prompt.as_deref().filter(|s| !s.is_empty()) {
+            if let Some(ws) = workspace_dir(opts.terminal_id()) {
+                std::fs::create_dir_all(&ws)?;
+                std::fs::write(ws.join("GEMINI.md"), sp)?;
+                let role = if profile.name.is_empty() { "agent" } else { &profile.name };
+                args.push("-i".into());
+                args.push(format!(
+                    "You are the {role}. Your instructions are in GEMINI.md. \
+                     Acknowledge your role in one sentence, then wait for tasks."
+                ));
+                cwd = Some(ws.to_string_lossy().into_owned());
+                cleanup.push(CleanupAction::RemoveDir(ws));
+                // NOTE(phase1): CAO also pre-trusts the workspace parent; with
+                // --yolo + --sandbox false the trust prompt is bypassed for the
+                // default flow. Restricted/policy launches still route via CAO.
+            }
+        }
+
+        let mut spec = DaemonSessionSpec {
+            prog: self.defaults.binary.clone(),
+            args,
+            cwd,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            rows: opts.rows,
+            cols: opts.cols,
+            attribution_key: opts.attribution_key.clone(),
+            paste_enter_count: self.paste_enter_count(),
+        };
+
+        inject_mcp(&mut spec, &mut cleanup, &profile.mcp_servers, opts.terminal_id())?;
+        Ok(Prepared { spec, cleanup })
+    }
+
+    fn paste_enter_count(&self) -> u8 {
+        1
+    }
+
+    fn status(&self, view: &GridView) -> AgentStatus {
+        let text = view.text();
+        if text.trim().is_empty() {
+            return AgentStatus::Error;
+        }
+        let tail = view.nonblank_tail(50);
+        let has_idle = tail.iter().any(|l| IDLE_PROMPT_RE.is_match(l));
+        if has_idle {
+            let has_response = RESPONSE_RE.is_match(&text);
+            let has_query = tail.iter().any(|l| QUERY_BOX_RE.is_match(l));
+            let has_spinner = view.nonblank_tail(8).iter().any(|l| SPINNER_RE.is_match(l));
+            if has_spinner && !(has_query && has_response) {
+                return AgentStatus::Processing;
+            }
+            if has_query && has_response {
+                return AgentStatus::Completed;
+            }
+            return AgentStatus::Idle;
+        }
+        if ERROR_RE.is_match(&text) {
+            return AgentStatus::Error;
+        }
+        AgentStatus::Processing
+    }
+
+    fn idle_pattern(&self) -> &str {
+        r"\*\s+Type your message"
+    }
+}
+
+/// MCP injection: merge each server into `~/.gemini/settings.json` and record a
+/// removal cleanup. `CAO_TERMINAL_ID` is stamped into each server's env.
+fn inject_mcp(
+    _spec: &mut DaemonSessionSpec,
+    cleanup: &mut Cleanup,
+    servers: &[McpServerConfig],
+    terminal_id: &str,
+) -> std::io::Result<()> {
+    if servers.is_empty() {
+        return Ok(());
+    }
+    let path = match gemini_settings_path() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for s in servers {
+        let env = with_terminal_id(&s.env, terminal_id);
+        let env_obj: serde_json::Map<String, serde_json::Value> =
+            env.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
+        entries.push((
+            s.name.clone(),
+            serde_json::json!({ "command": s.command, "args": s.args, "env": env_obj }),
+        ));
+        names.push(s.name.clone());
+    }
+    config::merge_json_mcp_servers(&path, &entries)?;
+    cleanup.push(CleanupAction::RemoveJsonMcpServers { path, names });
+    Ok(())
+}
+
+// --- Heuristic patterns (ported from gemini_cli.py:61-140) ---
+static IDLE_PROMPT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\s+Type your message").unwrap());
+static RESPONSE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"✦\s").unwrap());
+static QUERY_BOX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*>\s+\S").unwrap());
+static SPINNER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏].*\(esc to cancel").unwrap());
+static ERROR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(?:Error:|ERROR:|Traceback \(most recent call last\):|ConnectionError:|APIError:)")
+        .unwrap()
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults() -> ProviderDefaults {
+        ProviderDefaults {
+            binary: "gemini".into(),
+            base_args: vec!["--yolo".into(), "--sandbox".into(), "false".into()],
+            model_flag: "--model".into(),
+            env: Default::default(),
+        }
+    }
+    fn profile() -> AgentProfile {
+        AgentProfile { name: "default".into(), ..Default::default() }
+    }
+    fn opts() -> LaunchOpts {
+        LaunchOpts { cwd: Some("/tmp/wt".into()), rows: 24, cols: 80, attribution_key: Some("t1".into()), seed_prompt: None }
+    }
+    fn grid(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_is_yolo_sandbox_false_in_worktree() {
+        let p = GeminiProvider::new(defaults());
+        let prepared = p.build(&profile(), &opts()).unwrap();
+        assert_eq!(prepared.spec.args, vec!["--yolo", "--sandbox", "false"]);
+        assert_eq!(prepared.spec.cwd.as_deref(), Some("/tmp/wt"));
+        assert_eq!(prepared.spec.paste_enter_count, 1);
+        assert!(prepared.cleanup.actions.is_empty());
+    }
+
+    #[test]
+    fn status_transitions() {
+        let p = GeminiProvider::new(defaults());
+        let idle = grid(&["box", "* Type your message"]);
+        assert_eq!(p.status(&GridView::new(&idle)), AgentStatus::Idle);
+        let completed = grid(&["> my question", "✦ the answer", "* Type your message"]);
+        assert_eq!(p.status(&GridView::new(&completed)), AgentStatus::Completed);
+        let processing = grid(&["⠋ thinking (esc to cancel)", "* Type your message"]);
+        assert_eq!(p.status(&GridView::new(&processing)), AgentStatus::Processing);
+        let working = grid(&["⠹ generating (esc to cancel)"]);
+        assert_eq!(p.status(&GridView::new(&working)), AgentStatus::Processing);
+    }
+}

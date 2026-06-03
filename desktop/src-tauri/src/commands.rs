@@ -64,51 +64,59 @@ pub fn clear_dirty(fs: State<'_, FsWatchState>, terminal_id: String) {
 // ---------------------------------------------------------------------------
 
 use crate::daemon::DaemonClient;
-use taime_protocol::{SessionSummary, SpawnSpec};
+use taime_protocol::{AgentProfile, AgentSpawnSpec, SessionSummary};
 
-/// Resolve the claude binary: prefer the known install, else rely on PATH.
-fn claude_binary() -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = std::path::Path::new(&home).join(".local/bin/claude");
-        if p.exists() {
-            return p.to_string_lossy().to_string();
-        }
-    }
-    "claude".to_string()
-}
-
-/// Permission mode mirrors CAO's `_build_claude_command`: a caller-supplied
-/// `--permission-mode <mode>` when given, else the bypass default ("bypass
-/// permissions on" — no per-tool prompts) that Taime/CAO uses for unattended
-/// orchestration. SECURITY: bypass runs tools without prompts; it's the
-/// deliberate model for driving real CLIs in the workspace, overridable here.
-fn claude_args(permission_mode: Option<String>) -> Vec<String> {
-    match permission_mode {
-        Some(mode) if !mode.is_empty() => vec!["--permission-mode".to_string(), mode],
-        _ => vec!["--dangerously-skip-permissions".to_string()],
-    }
-}
-
-#[tauri::command]
-pub async fn daemon_spawn_claude(
-    daemon: State<'_, DaemonClient>,
+/// A high-level spawn for ANY provider through the daemon's registry (Phase 1).
+/// The daemon owns the launch recipe + MCP injection; the app just names the
+/// provider + default profile. `model`/`permission_mode` flow into the profile.
+fn default_agent_spec(
+    provider: String,
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
-    permission_mode: Option<String>,
     attribution_key: Option<String>,
-) -> Result<String, String> {
-    let spec = SpawnSpec {
-        prog: claude_binary(),
-        args: claude_args(permission_mode),
+    model: Option<String>,
+    permission_mode: Option<String>,
+) -> AgentSpawnSpec {
+    AgentSpawnSpec {
+        provider,
+        profile: AgentProfile {
+            name: "default".to_string(),
+            model,
+            permission_mode,
+            ..Default::default()
+        },
         cwd,
-        env: vec![],
         rows: rows.unwrap_or(24),
         cols: cols.unwrap_or(80),
         attribution_key,
-    };
-    daemon.spawn_session(spec).await
+        seed_prompt: None,
+        env: vec![],
+    }
 }
+
+/// Launch any supported CLI (`claude_code`/`codex`/`gemini_cli`/`grok_cli`) via
+/// the daemon's provider registry with the default (unrestricted) profile.
+#[tauri::command]
+pub async fn daemon_spawn_agent(
+    daemon: State<'_, DaemonClient>,
+    provider: String,
+    cwd: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    attribution_key: Option<String>,
+) -> Result<String, String> {
+    let spec = default_agent_spec(provider, cwd, rows, cols, attribution_key, model, permission_mode);
+    daemon.spawn_agent(spec).await
+}
+
+// SECURITY: the default profile is unrestricted (`--dangerously-skip-permissions`
+// / `--yolo` / `--always-approve` per provider) — the deliberate model for driving
+// the CLIs unattended in the workspace. Claude now launches via
+// `daemon_spawn_agent` with provider="claude_code" (the daemon's adapter owns the
+// binary + args), so the old Claude-specific `daemon_spawn_claude` is gone.
 
 #[tauri::command]
 pub async fn daemon_attach(

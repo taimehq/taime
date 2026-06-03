@@ -42,16 +42,27 @@ export interface DaemonSessionSummary {
   protocol_version: number;
 }
 
-export async function daemonSpawnClaude(
+/**
+ * Launch any supported CLI (`claude_code`/`codex`/`gemini_cli`/`grok_cli`) on the
+ * detached session daemon via its provider registry (the daemon owns the launch
+ * recipe + MCP injection). The default (unrestricted) profile is used; richer
+ * profiles still route through CAO until the daemon learns them.
+ */
+export async function daemonSpawnAgent(
+  provider: string,
   cwd: string | null,
   rows: number,
   cols: number,
   attributionKey: string | null,
+  model: string | null = null,
 ): Promise<string> {
-  return invoke<string>("daemon_spawn_claude", {
+  return invoke<string>("daemon_spawn_agent", {
+    provider,
     cwd: cwd ?? null,
     rows,
     cols,
+    model: model ?? null,
+    permissionMode: null,
     attributionKey: attributionKey ?? null,
   });
 }

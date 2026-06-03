@@ -32,6 +32,7 @@ use taime_protocol::{encode_data, encode_repaint, encode_server, ServerMsg, Sess
 use tokio::sync::mpsc;
 
 use crate::attribution::Attribution;
+use crate::providers::{Cleanup, DaemonSessionSpec, Prepared};
 use crate::{emulator, repaint};
 
 /// Backpressure watermarks (bytes in flight = sent − acked). Generous for the
@@ -74,6 +75,16 @@ struct SessionInner {
     program: String,
     cwd: String,
     attribution_key: Option<String>,
+    /// Provider id (`claude_code`/`codex`/…) when spawned via the registry — the
+    /// adapter to use for status inference (Phase 4). `None` for low-level spawns.
+    #[allow(dead_code)]
+    provider: Option<String>,
+    /// Enters to send after a bracketed paste (CAO `paste_enter_count`); carried
+    /// for the Phase-5 idle-gated stdin delivery.
+    #[allow(dead_code)]
+    paste_enter_count: u8,
+    /// Spawn-time MCP injection to undo when the process exits (best-effort).
+    cleanup: Cleanup,
     created_at_unix: u64,
     state: Mutex<SessionState>,
     resume: Condvar,
@@ -90,8 +101,40 @@ pub struct Session {
 }
 
 impl Session {
-    /// Spawn `spec` in a PTY, start the reader thread, and return the session.
+    /// Spawn a low-level [`SpawnSpec`] (the Claude-only Step-2 path; no provider
+    /// recipe, no MCP cleanup). Kept for back-compat with `ClientMsg::Spawn`.
     pub fn spawn(id: String, spec: &SpawnSpec) -> Result<Session, String> {
+        let dspec = DaemonSessionSpec {
+            prog: spec.prog.clone(),
+            args: spec.args.clone(),
+            cwd: spec.cwd.clone(),
+            env: spec.env.clone(),
+            env_remove: Vec::new(),
+            rows: spec.rows,
+            cols: spec.cols,
+            attribution_key: spec.attribution_key.clone(),
+            paste_enter_count: 1,
+        };
+        Self::spawn_inner(id, &dspec, Cleanup::default(), None)
+    }
+
+    /// Spawn a registry-`Prepared` agent: the daemon-built command + MCP injection
+    /// (the Phase-1 all-provider path). `provider` is the adapter id for status.
+    pub fn spawn_prepared(
+        id: String,
+        prepared: Prepared,
+        provider: Option<String>,
+    ) -> Result<Session, String> {
+        Self::spawn_inner(id, &prepared.spec, prepared.cleanup, provider)
+    }
+
+    /// Shared PTY setup for both spawn paths.
+    fn spawn_inner(
+        id: String,
+        spec: &DaemonSessionSpec,
+        cleanup: Cleanup,
+        provider: Option<String>,
+    ) -> Result<Session, String> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -110,11 +153,15 @@ impl Session {
             cmd.cwd(dir);
         }
         // Inherit the daemon's env (seeded from the app at detached-spawn), force
-        // a sane TERM for the TUI, then apply caller overrides.
+        // a sane TERM for the TUI, drop provider-requested vars (e.g. Claude's
+        // CLAUDE* to avoid a "nested session"), then apply caller overrides.
         for (k, v) in std::env::vars() {
             cmd.env(k, v);
         }
         cmd.env("TERM", "xterm-256color");
+        for k in &spec.env_remove {
+            cmd.env_remove(k);
+        }
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
@@ -144,6 +191,9 @@ impl Session {
             program: spec.prog.clone(),
             cwd: spec.cwd.clone().unwrap_or_default(),
             attribution_key: spec.attribution_key.clone(),
+            provider,
+            paste_enter_count: spec.paste_enter_count,
+            cleanup,
             created_at_unix,
             state: Mutex::new(SessionState {
                 term: emulator::build_terminal(spec.rows, spec.cols),
@@ -395,6 +445,8 @@ fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
             .ok()
             .map(|s| s.exit_code() as i32);
         inner.dead.store(true, Ordering::SeqCst);
+        // Undo spawn-time MCP injection (temp config / settings.json / workspace).
+        inner.cleanup.run();
         let st = inner.state.lock().unwrap();
         if let Some(c) = st.attached.as_ref() {
             if let Ok(frame) = encode_server(&ServerMsg::Exited { code }) {
