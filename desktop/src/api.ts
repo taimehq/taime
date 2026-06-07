@@ -55,6 +55,67 @@ export interface AgentProfileInfo {
   source: string;
 }
 
+/** A cron-triggered schedule as reported by the daemon. */
+export interface ScheduleInfo {
+  name: string;
+  /** 5-field POSIX cron string. */
+  schedule: string;
+  agent_profile: string;
+  provider: string;
+  enabled: boolean;
+  /** Unix seconds of the last fire / next scheduled fire, or null. */
+  last_run: number | null;
+  next_run: number | null;
+}
+
+/** Fields the Add-schedule dialog sends to create/replace a schedule. */
+export interface ScheduleInput {
+  name: string;
+  schedule: string;
+  agent_profile: string;
+  provider: string;
+  prompt: string;
+  script?: string | null;
+}
+
+// ── Workflows (the loopable agent step-graph) ───────────────────────────────
+export interface WorkflowNode {
+  id: string;
+  role: string;
+  prompt: string;
+}
+export interface WorkflowEdge {
+  from: string;
+  to: string;
+  /** "always" | "keyword:WORD" | "/regex/" — first match wins; none = terminal. */
+  when: string;
+}
+/** Live state of one node within a run. */
+export interface WorkflowNodeState {
+  status: "pending" | "running" | "completed" | "failed" | string;
+  iteration: number;
+  agent_key: string | null;
+}
+export interface WorkflowRunSummary {
+  id: string;
+  workflow_name: string;
+  status: "running" | "completed" | "failed" | string;
+  started_at: number | null;
+  ended_at: number | null;
+  error: string | null;
+  /** node_id → its latest state in this run. */
+  node_states: Record<string, WorkflowNodeState>;
+}
+export interface WorkflowInfo {
+  name: string;
+  source: string;
+  entry: string;
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+  /** The most recent run, if any (drives the graph's status colors). */
+  last_run: WorkflowRunSummary | null;
+}
+
 export interface ProviderInfo {
   name: string;
   binary: string;
@@ -199,10 +260,77 @@ export const api = {
   health: async (): Promise<HealthInfo> => ({ status: "ok", service: "taime-session-daemon" }),
 
   /** The daemon's provider registry (the 4 CLIs) with an accurate `installed`
-   *  flag (binary resolvable in the daemon's env). Profiles aren't yet a daemon
-   *  store — the launcher uses the default profile. */
+   *  flag (binary resolvable in the daemon's env). */
   listProviders: () => daemonQuery<ProviderInfo[]>("providers", {}, PROVIDERS),
-  listProfiles: async (): Promise<AgentProfileInfo[]> => [],
+
+  /** Agent profiles from the daemon's profile store (`~/.taime/agents/*.toml`
+   *  plus the built-in `default`/`orchestrator`). The launcher renders these as
+   *  selectable roles; the chosen name flows back to the daemon at spawn. */
+  listProfiles: () =>
+    daemonQuery<AgentProfileInfo[]>("profiles", {}, [
+      { name: "default", description: "Plain agent — no orchestration tools.", source: "builtin" },
+      {
+        name: "orchestrator",
+        description: "Can assign / handoff to other agents.",
+        source: "builtin",
+      },
+    ]),
+
+  // ── Schedules (cron-triggered unattended agent runs) ──────────────────────
+  // All ride the generic daemon Query RPC (reads + mutations), like clear_dirty.
+  /** All schedules from the daemon (`~/.taime/schedules/*.md` + UI-created),
+   *  with their cron, target role/provider, enabled flag, and last/next run. */
+  listSchedules: () => daemonQuery<ScheduleInfo[]>("schedules", {}, []),
+  /** Create (or replace) a schedule; the daemon writes its `.md` + computes the
+   *  next run. Returns an error string on a bad cron/field, else null. */
+  addSchedule: async (input: ScheduleInput): Promise<string | null> => {
+    const r = await daemonQuery<{ ok?: boolean; error?: string }>(
+      "schedule_add",
+      { ...input },
+      { error: "daemon unavailable" },
+    );
+    return r.error ?? null;
+  },
+  /** Fire a schedule now (manual test run), bypassing the cron + gate. */
+  runSchedule: async (name: string): Promise<string | null> => {
+    const r = await daemonQuery<{ ok?: boolean; error?: string }>(
+      "schedule_run",
+      { name },
+      { error: "daemon unavailable" },
+    );
+    return r.error ?? null;
+  },
+  /** Enable/disable a schedule (disabled schedules don't fire on cron). */
+  toggleSchedule: async (name: string, enabled: boolean): Promise<void> => {
+    await daemonQuery("schedule_toggle", { name, enabled }, { ok: true });
+  },
+  /** Delete a schedule (removes its `.md` + row). */
+  deleteSchedule: async (name: string): Promise<void> => {
+    await daemonQuery("schedule_delete", { name }, { ok: true });
+  },
+
+  // ── Workflows (loopable agent step-graphs) ────────────────────────────────
+  /** All workflows (`~/.taime/workflows/*.json` + orchestrator-generated), each
+   *  with its node/edge graph and most-recent run state. */
+  listWorkflows: () => daemonQuery<WorkflowInfo[]>("workflows", {}, []),
+  /** Start a run of a workflow now; returns the run id, or an error string.
+   *  `projectRoot` (the active workspace) is where the nodes' worktrees fork from. */
+  runWorkflow: async (
+    name: string,
+    projectRoot?: string | null,
+  ): Promise<{ run_id?: string; error?: string }> =>
+    daemonQuery<{ run_id?: string; error?: string }>(
+      "workflow_run",
+      { name, project_root: projectRoot ?? null },
+      { error: "daemon unavailable" },
+    ),
+  /** Live status of a run (poll while a run is active). */
+  getWorkflowRun: (runId: string) =>
+    daemonQuery<WorkflowRunSummary | null>("workflow_run_status", { run_id: runId }, null),
+  /** Delete a workflow (removes its `.json` + rows). */
+  deleteWorkflow: async (name: string): Promise<void> => {
+    await daemonQuery("workflow_delete", { name }, { ok: true });
+  },
 
   /** Probe a project dir (app-side git read — no daemon, no boot race). */
   getWorkspaceInfo: async (path: string): Promise<WorkspaceInfo> => {
@@ -313,21 +441,29 @@ export const api = {
       agents: g.agents.map((a) => ({
         terminal_id: a.id,
         provider: a.provider,
-        mode: null,
-        branch: null,
-        member_of: null,
-        turns: [],
+        status: a.status ?? null,
+        mode: a.mode ?? null,
+        branch: a.branch ?? null,
+        member_of: a.member_of ?? null,
+        turns: (a.turns ?? []).map((t) => ({
+          id: t.id,
+          turn_index: t.turn_index,
+          started_at: t.started_at,
+          ended_at: t.ended_at,
+          files_touched: t.files_touched,
+          start_snapshot: t.start_snapshot,
+          end_snapshot: t.end_snapshot,
+        })),
       })),
       edges: g.edges.map((e) => ({ kind: e.kind, source: e.source, target: e.target, ts: null })),
-      contention: [],
+      contention: g.contention ?? [],
     };
   },
 
-  /** The daemon watches worktrees natively; forwarding is a no-op now. */
-  postFsEvents: async (
-    _terminalId: string,
-    _events: { path: string; kind?: string; ts?: number }[],
-  ) => ({ recorded: 0, mode: "daemon", confidence: "certain" }),
+  /** Tell the daemon to reset an agent's accumulated dirty set (the user reviewed
+   *  its diff), so the next `FsDirty` push starts fresh. */
+  clearDaemonDirty: (terminalId: string) =>
+    daemonQuery<boolean>("clear_dirty", { terminal_key: terminalId }, true),
 
   getActivity: async (_params?: { session?: string; terminalId?: string; limit?: number }): Promise<ActivityEvent[]> => [],
 };
@@ -347,6 +483,8 @@ export interface ActivityGraph {
   agents: {
     terminal_id: string;
     provider: string | null;
+    /** Inferred live status (IDLE/PROCESSING/WAITING_USER_ANSWER/COMPLETED/ERROR). */
+    status: string | null;
     mode: string | null;
     branch: string | null;
     member_of: string | null;

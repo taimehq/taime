@@ -7,6 +7,8 @@ import {
 import { useStore } from "../store";
 import { StatusBadge, statusDotClass } from "../components/StatusBadge";
 import { FileInventory } from "../components/FileInventory";
+import { SchedulesPanel } from "../components/SchedulesPanel";
+import { WorkflowsPanel } from "../components/WorkflowsPanel";
 import { WorkspacePicker } from "../components/WorkspacePicker";
 import { providerTitle } from "../lib/providerLabel";
 
@@ -86,9 +88,11 @@ export function ControlColumn({ onLaunch }: { onLaunch: () => void }) {
         </div>
       </div>
 
-      {/* Zone 2 — agents (the only scrolling zone) */}
-      <div className="min-h-0 flex-1 overflow-y-auto border-t border-ink-700 px-3 py-3">
+      {/* Zone 2 — agents + schedules (the only scrolling zone) */}
+      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto border-t border-ink-700 px-3 py-3">
         <AgentsSection />
+        <WorkflowsPanel />
+        <SchedulesPanel />
       </div>
 
       {/* Zone 3 — changes / review (pinned bottom, capped) */}

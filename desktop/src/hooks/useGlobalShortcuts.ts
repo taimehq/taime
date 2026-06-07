@@ -60,6 +60,14 @@ export function useGlobalShortcuts() {
         return;
       }
 
+      // --- Agent team / activity graph: Cmd+Shift+A toggles the visual graph ---
+      if (e.shiftKey && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        const s = useStore.getState();
+        s.setGraphOpen(!s.graphOpen);
+        return;
+      }
+
       // --- Frame switching by number: Cmd+1..8 = Nth frame, Cmd+9 = last ---
       // Routed through setActiveFrameGuarded so the dirty-state guard (and its
       // pending-switch re-entrancy rule) always applies — this is the only way

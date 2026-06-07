@@ -212,6 +212,10 @@ export function TerminalViewRustPty({
         },
         // Attribution turn boundaries (daemon transport only) → store.
         (turn) => useStore.getState().recordTurn(frameKey, turn),
+        // Phase 4 status push → badge map (resolves terminalId via the session).
+        (status) => useStore.getState().setDaemonSessionStatus(sessionId, status),
+        // Phase 6 fs push → mark the agent's terminal dirty (its diff is stale).
+        (paths) => useStore.getState().markDaemonFsDirty(sessionId, paths),
       );
       if (!alive) {
         // Unmounted while the attach was in flight: detach so we don't leave a
