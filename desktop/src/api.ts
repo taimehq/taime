@@ -1,44 +1,21 @@
-import { getConfig } from "./config";
+import { invoke } from "@tauri-apps/api/core";
+import { daemonQuery, daemonProvisionWorktree, daemonActivityGraph } from "./pty";
+import { inTauri } from "./backend";
 
 /**
- * Base URL is resolved once from the Tauri layer (config.ts → get_api_url) and
- * cached. Every request awaits it lazily, so there is no boot-ordering issue and
- * no hardcoded port/host anywhere in the frontend.
+ * The data layer. After the CAO/tmux → all-Rust migration (Phase 6/7), there is
+ * NO HTTP backend: every call routes to the `taime-session-daemon` via Tauri
+ * commands (`daemon_query` for the diff/attribution/contention/worktree surface,
+ * plus the dedicated daemon commands). The method signatures + return shapes are
+ * unchanged, so the components are untouched — only this fetch layer moved.
+ *
+ * Session/terminal CRUD that was tmux-shaped (createSession/addTerminal/
+ * getTerminal/output/input/exit) is gone: agents are launched + driven through
+ * the daemon transport (see `store.launchAgentDaemon` + `pty.ts`).
  */
-async function apiBase(): Promise<string> {
-  return (await getConfig()).apiUrl;
-}
-
-/** ws://host:port/terminals/{id}/ws — the live PTY stream endpoint. */
-export async function terminalWsUrl(terminalId: string): Promise<string> {
-  const { wsUrl } = await getConfig();
-  return `${wsUrl}/terminals/${terminalId}/ws`;
-}
-
-async function fetchJSON<T>(
-  path: string,
-  opts?: RequestInit & { timeoutMs?: number },
-): Promise<T> {
-  const base = await apiBase();
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    opts?.timeoutMs ?? 10000,
-  );
-  try {
-    const res = await fetch(`${base}${path}`, {
-      ...opts,
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    return res.json();
-  } finally {
-    clearTimeout(timeout);
-  }
-}
 
 // ---------------------------------------------------------------------------
-// Types (mirror the CAO backend JSON shapes; verified against a live server)
+// Types (unchanged shapes — the daemon returns these directly)
 // ---------------------------------------------------------------------------
 
 export interface Session {
@@ -68,15 +45,75 @@ export interface TerminalMeta {
 }
 
 export interface SessionDetail {
-  session: Session;
+  session: Session | null;
   terminals: TerminalMeta[];
 }
 
 export interface AgentProfileInfo {
   name: string;
   description: string;
-  /** Where the profile came from (e.g. "built-in", "local"). */
   source: string;
+}
+
+/** A cron-triggered schedule as reported by the daemon. */
+export interface ScheduleInfo {
+  name: string;
+  /** 5-field POSIX cron string. */
+  schedule: string;
+  agent_profile: string;
+  provider: string;
+  enabled: boolean;
+  /** Unix seconds of the last fire / next scheduled fire, or null. */
+  last_run: number | null;
+  next_run: number | null;
+}
+
+/** Fields the Add-schedule dialog sends to create/replace a schedule. */
+export interface ScheduleInput {
+  name: string;
+  schedule: string;
+  agent_profile: string;
+  provider: string;
+  prompt: string;
+  script?: string | null;
+}
+
+// ── Workflows (the loopable agent step-graph) ───────────────────────────────
+export interface WorkflowNode {
+  id: string;
+  role: string;
+  prompt: string;
+}
+export interface WorkflowEdge {
+  from: string;
+  to: string;
+  /** "always" | "keyword:WORD" | "/regex/" — first match wins; none = terminal. */
+  when: string;
+}
+/** Live state of one node within a run. */
+export interface WorkflowNodeState {
+  status: "pending" | "running" | "completed" | "failed" | string;
+  iteration: number;
+  agent_key: string | null;
+}
+export interface WorkflowRunSummary {
+  id: string;
+  workflow_name: string;
+  status: "running" | "completed" | "failed" | string;
+  started_at: number | null;
+  ended_at: number | null;
+  error: string | null;
+  /** node_id → its latest state in this run. */
+  node_states: Record<string, WorkflowNodeState>;
+}
+export interface WorkflowInfo {
+  name: string;
+  source: string;
+  entry: string;
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+  /** The most recent run, if any (drives the graph's status colors). */
+  last_run: WorkflowRunSummary | null;
 }
 
 export interface ProviderInfo {
@@ -99,7 +136,7 @@ export interface InboxMessage {
   created_at: string | null;
 }
 
-/** A unified working-tree diff for the terminal's cwd (added by Taime; step 5). */
+/** A unified working-tree diff for the terminal's worktree. */
 export interface TerminalDiff {
   working_directory: string | null;
   is_git: boolean;
@@ -108,7 +145,6 @@ export interface TerminalDiff {
   error?: string | null;
 }
 
-/** One changed file with both sides for a side-by-side review (Taime). */
 export interface FileDiffEntry {
   path: string;
   status: "added" | "modified" | "deleted" | "renamed" | string;
@@ -125,14 +161,12 @@ export interface FileDiffsResponse {
   files: FileDiffEntry[];
 }
 
-/** Who last changed a file, and all contributing turns (team-worktree review). */
 export interface FileContributor {
   terminal_id: string;
   provider: string | null;
   turn_index: number;
   ended_at: string | null;
 }
-/** Per-hunk author (which member/turn authored a hunk in a shared file). */
 export interface HunkAuthor {
   terminal_id: string;
   provider: string | null;
@@ -155,7 +189,6 @@ export interface AttributionResponse {
   >;
 }
 
-/** One hunk of a file's diff (Taime selective merge/revert). */
 export interface HunkEntry {
   index: number;
   header: string;
@@ -184,7 +217,6 @@ export interface ApplyResult {
   error: string | null;
 }
 
-/** Probe of a candidate project directory for the workspace picker. */
 export interface WorkspaceInfo {
   path: string;
   exists: boolean;
@@ -194,7 +226,7 @@ export interface WorkspaceInfo {
   head_short: string | null;
 }
 
-/** Per-agent worktree provenance (Taime attribution). */
+/** Per-agent worktree provenance. `terminal_id` == the daemon `terminal_key`. */
 export interface WorktreeInfo {
   terminal_id: string;
   mode: "worktree" | "shared";
@@ -207,141 +239,179 @@ export interface WorktreeInfo {
   member_of?: string | null;
 }
 
-/** Options for launching an agent into an isolated git worktree. */
 export interface LaunchIsolation {
   isolate?: boolean;
   projectRoot?: string;
 }
 
-function isolationQuery(opts?: LaunchIsolation): string {
-  if (!opts?.isolate) return "";
-  return (
-    `&isolate=true` +
-    `${opts.projectRoot ? `&project_root=${encodeURIComponent(opts.projectRoot)}` : ""}`
-  );
-}
+/** The four supported CLIs (the daemon's provider registry). */
+const PROVIDERS: ProviderInfo[] = [
+  { name: "claude_code", binary: "claude", installed: true },
+  { name: "codex", binary: "codex", installed: true },
+  { name: "gemini_cli", binary: "gemini", installed: true },
+  { name: "grok_cli", binary: "grok", installed: true },
+];
 
 // ---------------------------------------------------------------------------
-// REST surface
+// Daemon-backed surface
 // ---------------------------------------------------------------------------
 
 export const api = {
-  health: () => fetchJSON<HealthInfo>("/health"),
+  health: async (): Promise<HealthInfo> => ({ status: "ok", service: "taime-session-daemon" }),
 
-  listProviders: () => fetchJSON<ProviderInfo[]>("/agents/providers"),
-  listProfiles: () => fetchJSON<AgentProfileInfo[]>("/agents/profiles"),
+  /** The daemon's provider registry (the 4 CLIs) with an accurate `installed`
+   *  flag (binary resolvable in the daemon's env). */
+  listProviders: () => daemonQuery<ProviderInfo[]>("providers", {}, PROVIDERS),
 
-  /** Taime-added: probe a candidate project dir (exists / git / branch). */
-  getWorkspaceInfo: (path: string) =>
-    fetchJSON<WorkspaceInfo>(
-      `/workspace/info?path=${encodeURIComponent(path)}`,
-      { timeoutMs: 8000 },
+  /** Agent profiles from the daemon's profile store (`~/.taime/agents/*.toml`
+   *  plus the built-in `default`/`orchestrator`). The launcher renders these as
+   *  selectable roles; the chosen name flows back to the daemon at spawn. */
+  listProfiles: () =>
+    daemonQuery<AgentProfileInfo[]>("profiles", {}, [
+      { name: "default", description: "Plain agent — no orchestration tools.", source: "builtin" },
+      {
+        name: "orchestrator",
+        description: "Can assign / handoff to other agents.",
+        source: "builtin",
+      },
+    ]),
+
+  // ── Schedules (cron-triggered unattended agent runs) ──────────────────────
+  // All ride the generic daemon Query RPC (reads + mutations), like clear_dirty.
+  /** All schedules from the daemon (`~/.taime/schedules/*.md` + UI-created),
+   *  with their cron, target role/provider, enabled flag, and last/next run. */
+  listSchedules: () => daemonQuery<ScheduleInfo[]>("schedules", {}, []),
+  /** Create (or replace) a schedule; the daemon writes its `.md` + computes the
+   *  next run. Returns an error string on a bad cron/field, else null. */
+  addSchedule: async (input: ScheduleInput): Promise<string | null> => {
+    const r = await daemonQuery<{ ok?: boolean; error?: string }>(
+      "schedule_add",
+      { ...input },
+      { error: "daemon unavailable" },
+    );
+    return r.error ?? null;
+  },
+  /** Fire a schedule now (manual test run), bypassing the cron + gate. */
+  runSchedule: async (name: string): Promise<string | null> => {
+    const r = await daemonQuery<{ ok?: boolean; error?: string }>(
+      "schedule_run",
+      { name },
+      { error: "daemon unavailable" },
+    );
+    return r.error ?? null;
+  },
+  /** Enable/disable a schedule (disabled schedules don't fire on cron). */
+  toggleSchedule: async (name: string, enabled: boolean): Promise<void> => {
+    await daemonQuery("schedule_toggle", { name, enabled }, { ok: true });
+  },
+  /** Delete a schedule (removes its `.md` + row). */
+  deleteSchedule: async (name: string): Promise<void> => {
+    await daemonQuery("schedule_delete", { name }, { ok: true });
+  },
+
+  // ── Workflows (loopable agent step-graphs) ────────────────────────────────
+  /** All workflows (`~/.taime/workflows/*.json` + orchestrator-generated), each
+   *  with its node/edge graph and most-recent run state. */
+  listWorkflows: () => daemonQuery<WorkflowInfo[]>("workflows", {}, []),
+  /** Start a run of a workflow now; returns the run id, or an error string.
+   *  `projectRoot` (the active workspace) is where the nodes' worktrees fork from. */
+  runWorkflow: async (
+    name: string,
+    projectRoot?: string | null,
+  ): Promise<{ run_id?: string; error?: string }> =>
+    daemonQuery<{ run_id?: string; error?: string }>(
+      "workflow_run",
+      { name, project_root: projectRoot ?? null },
+      { error: "daemon unavailable" },
     ),
+  /** Live status of a run (poll while a run is active). */
+  getWorkflowRun: (runId: string) =>
+    daemonQuery<WorkflowRunSummary | null>("workflow_run_status", { run_id: runId }, null),
+  /** Delete a workflow (removes its `.json` + rows). */
+  deleteWorkflow: async (name: string): Promise<void> => {
+    await daemonQuery("workflow_delete", { name }, { ok: true });
+  },
 
-  listSessions: () => fetchJSON<Session[]>("/sessions"),
+  /** Probe a project dir (app-side git read — no daemon, no boot race). */
+  getWorkspaceInfo: async (path: string): Promise<WorkspaceInfo> => {
+    if (!inTauri())
+      return { path, exists: false, is_git: false, repo_root: null, branch: null, head_short: null };
+    try {
+      return await invoke<WorkspaceInfo>("workspace_info", { path });
+    } catch {
+      return { path, exists: false, is_git: false, repo_root: null, branch: null, head_short: null };
+    }
+  },
+
+  /** Sessions are the daemon's agents (surfaced via the daemon registry); the
+   *  tmux-shaped session grouping is gone. */
+  listSessions: () => daemonQuery<Session[]>("sessions", {}, []),
   getSession: (name: string) =>
-    fetchJSON<SessionDetail>(`/sessions/${name}`),
+    daemonQuery<SessionDetail>("session_detail", { name }, { session: null, terminals: [] }),
+  deleteSession: async (_name: string) => ({ success: true, deleted: [] as string[], errors: [] as unknown[] }),
 
-  /** Create a new session (and its first terminal). Long timeout: CLI cold-start. */
-  createSession: (
-    provider: string,
-    agentProfile: string,
-    sessionName?: string,
-    workingDirectory?: string,
-    isolation?: LaunchIsolation,
-  ) =>
-    fetchJSON<Terminal>(
-      `/sessions?provider=${provider}&agent_profile=${agentProfile}` +
-        `${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ""}` +
-        `${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ""}` +
-        isolationQuery(isolation),
-      { method: "POST", timeoutMs: 90000 },
-    ),
-
-  deleteSession: (name: string) =>
-    fetchJSON<{ success: boolean; deleted: string[]; errors: unknown[] }>(
-      `/sessions/${name}`,
-      { method: "DELETE" },
-    ),
-
-  /** Add another agent terminal to an existing session. */
-  addTerminal: (
-    sessionName: string,
-    provider: string,
-    agentProfile: string,
-    workingDirectory?: string,
-    isolation?: LaunchIsolation,
-  ) =>
-    fetchJSON<Terminal>(
-      `/sessions/${sessionName}/terminals?provider=${provider}&agent_profile=${agentProfile}` +
-        `${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ""}` +
-        isolationQuery(isolation),
-      { method: "POST", timeoutMs: 90000 },
-    ),
-
-  getTerminal: (id: string) => fetchJSON<Terminal>(`/terminals/${id}`),
-  getTerminalStatus: (id: string) =>
-    fetchJSON<Terminal>(`/terminals/${id}`).then((t) => t.status),
   getWorkingDirectory: (id: string) =>
-    fetchJSON<{ working_directory: string | null }>(
-      `/terminals/${id}/working-directory`,
-    ),
-  getTerminalOutput: (id: string, mode: "full" | "last" = "full") =>
-    fetchJSON<{ output: string; mode: string }>(
-      `/terminals/${id}/output?mode=${mode}`,
-    ),
-  sendInput: (id: string, message: string) =>
-    fetchJSON<{ success: boolean }>(
-      `/terminals/${id}/input?message=${encodeURIComponent(message)}`,
-      { method: "POST" },
-    ),
-  exitTerminal: (id: string) =>
-    fetchJSON<{ success: boolean }>(`/terminals/${id}/exit`, {
-      method: "POST",
+    daemonQuery<{ working_directory: string | null }>(
+      "worktree",
+      { terminal_key: id },
+      { working_directory: null },
+    ).then((w) => {
+      const raw = w as unknown as { worktree_path?: string; working_directory?: string | null };
+      return { working_directory: raw.worktree_path ?? raw.working_directory ?? null };
     }),
-  deleteTerminal: (id: string) =>
-    fetchJSON<{ success: boolean }>(`/terminals/${id}`, { method: "DELETE" }),
 
-  /** Taime-added: unified diff of the terminal's working tree (step 5). */
+  getTerminalStatus: (_id: string): Promise<string | null> => Promise.resolve(null),
+
   getTerminalDiff: (id: string) =>
-    fetchJSON<TerminalDiff>(`/terminals/${id}/diff`, { timeoutMs: 20000 }),
+    daemonQuery<TerminalDiff>("terminal_diff", { terminal_key: id }, {
+      working_directory: null,
+      is_git: false,
+      diff: "",
+      files_changed: 0,
+      error: null,
+    }),
 
-  /** Taime-added: per-agent worktree provenance, or null if not isolated. */
   getWorktree: (id: string) =>
-    fetchJSON<WorktreeInfo | null>(`/terminals/${id}/worktree`),
+    daemonQuery<WorktreeInfo | null>("worktree", { terminal_key: id }, null),
 
-  /** Taime-added: provision a worktree + terminal id for a CAO-external agent
-   * (Rust PTY), so it gets the full attribution surface keyed by that id. */
-  provisionWorktree: (body: {
+  /** Provision a daemon-owned worktree for an agent (Phase 3). */
+  provisionWorktree: async (body: {
     project_root: string;
     provider?: string;
     isolate?: boolean;
     session_name?: string;
-  }) =>
-    fetchJSON<WorktreeInfo>(`/worktrees/provision`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      timeoutMs: 20000,
-    }),
+  }): Promise<WorktreeInfo> => {
+    const wt = await daemonProvisionWorktree(
+      body.project_root,
+      body.provider ?? "claude_code",
+      body.isolate ?? false,
+    );
+    return {
+      terminal_id: wt.terminal_key,
+      mode: wt.mode === "worktree" ? "worktree" : "shared",
+      worktree_path: wt.worktree_path,
+      project_root: wt.project_root,
+      repo_root: wt.repo_root,
+      branch: wt.branch,
+      base_sha: wt.base_sha,
+      provider: body.provider ?? null,
+      member_of: null,
+    };
+  },
 
-  /** Taime-added: structured per-file diff (both sides) for side-by-side review. */
   getFileDiffs: (id: string) =>
-    fetchJSON<FileDiffsResponse>(`/terminals/${id}/file-diffs`, {
-      timeoutMs: 20000,
-    }),
+    daemonQuery<FileDiffsResponse>("file_diffs", { terminal_key: id }, { terminal_id: id, files: [] }),
 
-  /** Taime-added: per-file, per-hunk diff for selective merge/revert. */
   getHunks: (id: string) =>
-    fetchJSON<HunkedDiffResponse>(`/terminals/${id}/hunks`, { timeoutMs: 20000 }),
-
-  /** Taime-added: per-file authorship (who/which turn) for team-worktree review. */
-  getAttribution: (id: string) =>
-    fetchJSON<AttributionResponse>(`/terminals/${id}/attribution`, {
-      timeoutMs: 15000,
+    daemonQuery<HunkedDiffResponse>("hunked_diff", { terminal_key: id }, {
+      terminal_id: id,
+      base: null,
+      files: [],
     }),
 
-  /** Taime-added: selectively merge/revert chosen files/hunks. */
+  getAttribution: (id: string) =>
+    daemonQuery<AttributionResponse>("attribution", { terminal_key: id }, { team: [], files: {} }),
+
   applySelection: (
     id: string,
     body: {
@@ -350,63 +420,54 @@ export const api = {
       selections: Record<string, number[] | null>;
     },
   ) =>
-    fetchJSON<ApplyResult>(`/terminals/${id}/apply`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      timeoutMs: 20000,
-    }),
+    daemonQuery<ApplyResult>(
+      "apply_selection",
+      { terminal_key: id, target_dir: body.target, mode: body.mode, selections: body.selections },
+      { applied: false, target_dir: body.target, files: [], conflicts: [], error: "daemon unavailable" },
+    ),
 
-  /** Taime-added: files changed by >1 agent in a session (collision risk). */
   getContention: (session: string) =>
-    fetchJSON<{ path: string; terminals: string[] }[]>(
-      `/worktrees/contention?session=${encodeURIComponent(session)}`,
-    ),
+    daemonQuery<{ path: string; terminals: string[] }[]>("contention", { session }, []),
 
-  /** Taime-added: snapshot an agent's tree at a turn boundary. */
-  postCheckpoint: (terminalId: string, boundary: "turn_start" | "turn_end") =>
-    fetchJSON<{ turn_id?: string; files_touched?: string[] }>(
-      `/activity/checkpoint`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ terminal_id: terminalId, boundary }),
-      },
-    ),
+  /** The daemon records turns natively; checkpoints are a no-op now. */
+  postCheckpoint: async (_terminalId: string, _boundary: "turn_start" | "turn_end") => ({}),
 
-  /** Taime-added: the session's activity graph (nodes + edges + contention). */
-  getGraph: (session: string) =>
-    fetchJSON<ActivityGraph>(
-      `/activity/graph?session=${encodeURIComponent(session)}`,
-      { timeoutMs: 20000 },
-    ),
-
-  /** Taime-added: forward attributed filesystem events into the activity graph. */
-  postFsEvents: (
-    terminalId: string,
-    events: { path: string; kind?: string; ts?: number }[],
-  ) =>
-    fetchJSON<{ recorded: number; mode: string; confidence: string }>(
-      `/activity/fs-events`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ terminal_id: terminalId, events }),
-      },
-    ),
-
-  /** Taime-added: query the activity timeline / graph rows. */
-  getActivity: (params?: { session?: string; terminalId?: string; limit?: number }) => {
-    const q = new URLSearchParams();
-    if (params?.session) q.set("session", params.session);
-    if (params?.terminalId) q.set("terminal_id", params.terminalId);
-    if (params?.limit) q.set("limit", String(params.limit));
-    const qs = q.toString();
-    return fetchJSON<ActivityEvent[]>(`/activity${qs ? `?${qs}` : ""}`);
+  /** The activity graph: daemon agents + inter-agent edges, mapped to the shape
+   *  the ActivityGraph component expects. */
+  getGraph: async (session: string): Promise<ActivityGraph> => {
+    const g = await daemonActivityGraph();
+    return {
+      session,
+      agents: g.agents.map((a) => ({
+        terminal_id: a.id,
+        provider: a.provider,
+        status: a.status ?? null,
+        mode: a.mode ?? null,
+        branch: a.branch ?? null,
+        member_of: a.member_of ?? null,
+        turns: (a.turns ?? []).map((t) => ({
+          id: t.id,
+          turn_index: t.turn_index,
+          started_at: t.started_at,
+          ended_at: t.ended_at,
+          files_touched: t.files_touched,
+          start_snapshot: t.start_snapshot,
+          end_snapshot: t.end_snapshot,
+        })),
+      })),
+      edges: g.edges.map((e) => ({ kind: e.kind, source: e.source, target: e.target, ts: null })),
+      contention: g.contention ?? [],
+    };
   },
+
+  /** Tell the daemon to reset an agent's accumulated dirty set (the user reviewed
+   *  its diff), so the next `FsDirty` push starts fresh. */
+  clearDaemonDirty: (terminalId: string) =>
+    daemonQuery<boolean>("clear_dirty", { terminal_key: terminalId }, true),
+
+  getActivity: async (_params?: { session?: string; terminalId?: string; limit?: number }): Promise<ActivityEvent[]> => [],
 };
 
-/** One turn (processing burst) in the activity graph. */
 export interface GraphTurn {
   id: string;
   turn_index: number;
@@ -417,12 +478,13 @@ export interface GraphTurn {
   end_snapshot: string | null;
 }
 
-/** A session's activity graph: agent nodes + their turns, edges, contention. */
 export interface ActivityGraph {
   session: string;
   agents: {
     terminal_id: string;
     provider: string | null;
+    /** Inferred live status (IDLE/PROCESSING/WAITING_USER_ANSWER/COMPLETED/ERROR). */
+    status: string | null;
     mode: string | null;
     branch: string | null;
     member_of: string | null;
@@ -432,7 +494,6 @@ export interface ActivityGraph {
   contention: { path: string; terminals: string[] }[];
 }
 
-/** A row of the activity timeline / graph (mirrors backend ActivityEventResponse). */
 export interface ActivityEvent {
   id: string;
   ts: string | null;

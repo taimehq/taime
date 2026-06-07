@@ -71,6 +71,7 @@ function PaletteBody() {
   const setActiveFrameGuarded = useStore((s) => s.setActiveFrameGuarded);
   const openDiff = useStore((s) => s.openDiff);
   const setLaunchOpen = useStore((s) => s.setLaunchOpen);
+  const setGraphOpen = useStore((s) => s.setGraphOpen);
   const setWorkspaceDir = useStore((s) => s.setWorkspaceDir);
   const setOpen = useStore((s) => s.setCommandPaletteOpen);
 
@@ -146,6 +147,17 @@ function PaletteBody() {
       keywords: "new start spawn claude codex gemini grok",
       run: () => {
         setLaunchOpen(true);
+        setOpen(false);
+      },
+    });
+    out.push({
+      id: "action:graph",
+      group: "Actions",
+      label: "View agent team / activity graph",
+      hint: "⌘⇧A",
+      keywords: "team orchestrator agents flow delegation graph activity who assigned",
+      run: () => {
+        setGraphOpen(true);
         setOpen(false);
       },
     });

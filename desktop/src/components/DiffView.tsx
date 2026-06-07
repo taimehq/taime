@@ -132,6 +132,15 @@ export function DiffView() {
     load();
   }, [load]);
 
+  // Esc closes the review surface (mirrors the X button).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeDiff();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [closeDiff]);
+
   const hunksByPath = useMemo(() => {
     const m: Record<string, HunkedFileEntry> = {};
     for (const h of hunks) m[h.path] = h;
@@ -254,7 +263,7 @@ export function DiffView() {
                 el.indeterminate = (sel[f.path]?.length ?? 0) > 0 && !isFileFull(f.path);
             }}
             onChange={() => toggleFile(f.path)}
-            className="accent-sky-500"
+            className="accent-teal-500"
           />
           <button
             onClick={() => setSelected(f.path)}
@@ -334,13 +343,13 @@ export function DiffView() {
   const currentHunks = current ? (hunksByPath[current.path]?.hunks ?? []) : [];
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-ink-900/95 backdrop-blur-sm">
+    <div className="fixed inset-x-0 top-12 bottom-0 z-50 flex flex-col bg-ink-900">
       {/* Header / provenance / actions */}
       <div className="flex items-center justify-between gap-3 border-b border-ink-600 bg-ink-800 px-4 py-2.5">
         <div className="flex min-w-0 items-center gap-3 text-sm">
           <span className="shrink-0 font-semibold text-zinc-100">{agentName}</span>
           {worktree?.mode === "worktree" && worktree.branch && (
-            <span className="flex shrink-0 items-center gap-1.5 rounded-md border border-ink-600 px-2 py-0.5 font-mono text-[11px] text-sky-300">
+            <span className="flex shrink-0 items-center gap-1.5 rounded-md border border-ink-600 px-2 py-0.5 font-mono text-[11px] text-teal-300">
               <GitBranch size={12} />
               {worktree.branch}
             </span>
@@ -352,7 +361,7 @@ export function DiffView() {
           )}
           {isTeam && (
             <span
-              className="shrink-0 rounded-md border border-violet-500/40 bg-violet-500/10 px-2 py-0.5 text-[11px] text-violet-300"
+              className="shrink-0 rounded-md border border-teal-600/40 bg-teal-400/10 px-2 py-0.5 text-[11px] text-teal-300"
               title="A delegation team shares this worktree; files are grouped by author below."
             >
               team · {attribution?.team.length} agents
@@ -385,7 +394,7 @@ export function DiffView() {
           <button
             disabled={busy || selectionCount === 0}
             onClick={() => apply("merge")}
-            className="flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 disabled:opacity-40"
+            className="flex items-center gap-1.5 rounded-lg bg-teal-600 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 disabled:opacity-40"
           >
             <GitMerge size={14} />
             Merge {selectionCount > 0 ? `${selectionCount}` : ""}
@@ -421,9 +430,6 @@ export function DiffView() {
         <aside className="w-72 shrink-0 overflow-auto border-r border-ink-600 bg-ink-800/60">
           {loading && <p className="p-3 text-xs text-zinc-500">Loading diff…</p>}
           {error && <p className="p-3 text-xs text-rose-400">{error}</p>}
-          {!loading && files.length === 0 && (
-            <p className="p-3 text-xs text-zinc-500">No changes to review.</p>
-          )}
           {isTeam ? (
             // Team worktree: group files by who last changed them, so authorship
             // is obvious and you can merge one teammate's work in one click.
@@ -459,27 +465,50 @@ export function DiffView() {
         {/* Diff + hunk selection */}
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="min-h-0 flex-1">
-            {current && current.binary && (
-              <p className="p-4 text-sm text-zinc-500">Binary file — no preview.</p>
-            )}
-            {current && !current.binary && (
-              <DiffEditor
-                key={current.path}
-                theme="vs-dark"
-                language={langForPath(current.path)}
-                original={current.original}
-                modified={current.modified}
-                options={{
-                  readOnly: true,
-                  renderSideBySide: true,
-                  minimap: { enabled: false },
-                  fontSize: 12,
-                  scrollBeyondLastLine: false,
-                }}
-              />
-            )}
-            {!current && !loading && (
-              <p className="p-4 text-sm text-zinc-600">Select a file to view its diff.</p>
+            {!loading && files.length === 0 ? (
+              // Nothing changed: a single centered empty state spans the body so
+              // we never render a bare bg-ink-900 void.
+              <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+                <GitMerge size={32} className="text-zinc-600" />
+                <p className="mt-3 text-sm text-zinc-300">No changes to review</p>
+                <p className="mt-1 max-w-sm text-[12px] text-zinc-400">
+                  {worktree?.mode === "worktree"
+                    ? `This agent's worktree (${worktree.branch ?? "branch"}) has no changes vs its base yet.`
+                    : "No uncommitted changes in the shared working directory."}
+                </p>
+                <button
+                  onClick={onMarkReviewed}
+                  className="mt-4 flex items-center gap-1.5 rounded-lg border border-ink-500 px-3 py-1.5 text-[12px] text-zinc-300 hover:bg-ink-700 hover:text-zinc-100"
+                >
+                  <Check size={13} />
+                  Mark reviewed
+                </button>
+              </div>
+            ) : (
+              <>
+                {current && current.binary && (
+                  <p className="p-4 text-sm text-zinc-500">Binary file — no preview.</p>
+                )}
+                {current && !current.binary && (
+                  <DiffEditor
+                    key={current.path}
+                    theme="vs-dark"
+                    language={langForPath(current.path)}
+                    original={current.original}
+                    modified={current.modified}
+                    options={{
+                      readOnly: true,
+                      renderSideBySide: true,
+                      minimap: { enabled: false },
+                      fontSize: 12,
+                      scrollBeyondLastLine: false,
+                    }}
+                  />
+                )}
+                {!current && !loading && (
+                  <p className="p-4 text-sm text-zinc-600">Select a file to view its diff.</p>
+                )}
+              </>
             )}
           </div>
 
@@ -516,7 +545,7 @@ export function DiffView() {
                     type="checkbox"
                     checked={(sel[current.path] ?? []).includes(h.index)}
                     onChange={() => toggleHunk(current.path, h.index)}
-                    className="accent-sky-500"
+                    className="accent-teal-500"
                   />
                   {ha && (
                     <span
