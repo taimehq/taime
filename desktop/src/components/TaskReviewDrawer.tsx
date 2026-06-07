@@ -242,7 +242,7 @@ export function TaskReviewDrawer() {
             <div className="space-y-1.5">
               {agents.map((a) => (
                 <div
-                  key={a.terminal_id}
+                  key={a.agent_id}
                   className="rounded-lg border border-ink-600 bg-ink-800 px-2.5 py-2"
                 >
                   <div className="flex items-center gap-2">
@@ -256,7 +256,7 @@ export function TaskReviewDrawer() {
                     )}
                     <span className="ml-auto shrink-0">
                       {/* Prefer the live inferred status; the detail's snapshot is the fallback. */}
-                      <StatusBadge status={terminalStatuses[a.terminal_id] ?? a.status ?? undefined} />
+                      <StatusBadge status={terminalStatuses[a.agent_id] ?? a.status ?? undefined} />
                     </span>
                   </div>
                   {a.branch && (
@@ -267,7 +267,7 @@ export function TaskReviewDrawer() {
                   )}
                   <div className="mt-1.5 flex items-center gap-2">
                     <button
-                      onClick={() => focusAgent(a.terminal_id)}
+                      onClick={() => focusAgent(a.agent_id)}
                       title="Focus this agent's terminal"
                       className="rounded border border-ink-500 px-2 py-0.5 text-[11px] text-zinc-300 hover:bg-ink-700"
                     >
@@ -275,7 +275,7 @@ export function TaskReviewDrawer() {
                     </button>
                     {a.dirty_count > 0 && (
                       <button
-                        onClick={() => openDiff(a.terminal_id)}
+                        onClick={() => openDiff(a.agent_id)}
                         title="Review this agent's changes"
                         className="rounded border border-teal-600/50 px-2 py-0.5 text-[11px] text-teal-300 hover:bg-teal-600/10"
                       >
@@ -283,7 +283,7 @@ export function TaskReviewDrawer() {
                       </button>
                     )}
                     <button
-                      onClick={() => removeAgent(a.terminal_id)}
+                      onClick={() => removeAgent(a.agent_id)}
                       title="Remove from task (agent keeps running)"
                       className="ml-auto text-[11px] text-zinc-600 hover:text-rose-400"
                     >

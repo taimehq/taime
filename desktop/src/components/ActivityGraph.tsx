@@ -118,7 +118,7 @@ export function ActivityGraph() {
   const nameFor = useCallback(
     (tid: string | null) => {
       if (!tid) return "?";
-      const g = graph?.agents.find((a) => a.terminal_id === tid);
+      const g = graph?.agents.find((a) => a.agent_id === tid);
       const fr = frames.find((f) => f.terminalId === tid);
       const prov = g?.provider ?? fr?.provider ?? "";
       return PROVIDER_NAME[prov] ?? prov ?? tid.slice(0, 6);
@@ -129,7 +129,7 @@ export function ActivityGraph() {
   // Order agents as a tree: roots first, each followed by its (indented) workers.
   const tree = useMemo(() => {
     const agents = graph?.agents ?? [];
-    const byId = new Map(agents.map((a) => [a.terminal_id, a]));
+    const byId = new Map(agents.map((a) => [a.agent_id, a]));
     const parentOf = new Map<string, string>();
     const childrenOf = new Map<string, string[]>();
     for (const e of graph?.edges ?? []) {
@@ -150,10 +150,10 @@ export function ActivityGraph() {
       for (const c of childrenOf.get(id) ?? []) visit(c, depth + 1);
     };
     for (const a of agents) {
-      const p = parentOf.get(a.terminal_id);
-      if (!p || !byId.has(p)) visit(a.terminal_id, 0);
+      const p = parentOf.get(a.agent_id);
+      if (!p || !byId.has(p)) visit(a.agent_id, 0);
     }
-    for (const a of agents) visit(a.terminal_id, 0); // any cycle orphans
+    for (const a of agents) visit(a.agent_id, 0); // any cycle orphans
     return { order, byId, parentOf };
   }, [graph]);
 
@@ -254,7 +254,7 @@ export function ActivityGraph() {
                     <FileText size={9} /> {filesTouched}
                   </span>
                 )}
-                {a.mode === "worktree" && a.branch ? (
+                {a.mode === "isolated" && a.branch ? (
                   <span className="flex items-center gap-1 truncate text-teal-300/80">
                     <GitBranch size={9} /> {a.branch}
                   </span>

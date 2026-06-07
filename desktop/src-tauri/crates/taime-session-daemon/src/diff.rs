@@ -81,11 +81,11 @@ pub fn workspace_info(path: &str) -> Value {
 }
 
 /// The combined working-tree diff + changed-file list (CAO `get_terminal_diff`).
-pub fn terminal_diff(terminal_key: &str, cwd: &str, base: Option<&str>) -> Value {
+pub fn terminal_diff(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
     let path = Path::new(cwd);
     if !is_git(path) {
         return json!({
-            "terminal_id": terminal_key, "working_directory": cwd, "is_git": false,
+            "agent_id": agent_id, "working_directory": cwd, "is_git": false,
             "diff": "", "files_changed": 0, "files": [], "error": null
         });
     }
@@ -109,17 +109,17 @@ pub fn terminal_diff(terminal_key: &str, cwd: &str, base: Option<&str>) -> Value
         files.push(f.to_string());
     }
     json!({
-        "terminal_id": terminal_key, "working_directory": cwd, "is_git": true,
+        "agent_id": agent_id, "working_directory": cwd, "is_git": true,
         "diff": diff, "files_changed": files.len(), "files": files, "error": null
     })
 }
 
 /// Per-file both-sides reconstruction for side-by-side review (CAO
-/// `get_file_diffs`). Returns `{terminal_id, files: [FileDiff]}`.
-pub fn file_diffs(terminal_key: &str, cwd: &str, base: Option<&str>) -> Value {
+/// `get_file_diffs`). Returns `{agent_id, files: [FileDiff]}`.
+pub fn file_diffs(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
     let path = Path::new(cwd);
     if !is_git(path) {
-        return json!({ "terminal_id": terminal_key, "files": [] });
+        return json!({ "agent_id": agent_id, "files": [] });
     }
     let base = resolve_base(path, base);
 
@@ -186,18 +186,18 @@ pub fn file_diffs(terminal_key: &str, cwd: &str, base: Option<&str>) -> Value {
             "original": "", "modified": modified, "additions": adds, "deletions": 0, "binary": binary
         }));
     }
-    json!({ "terminal_id": terminal_key, "files": files })
+    json!({ "agent_id": agent_id, "files": files })
 }
 
 /// Per-file, per-hunk diff for selective merge/revert (CAO `get_hunked_diff`).
-pub fn hunked_diff(terminal_key: &str, cwd: &str, base: Option<&str>) -> Value {
+pub fn hunked_diff(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
     let path = Path::new(cwd);
     if !is_git(path) {
-        return json!({ "terminal_id": terminal_key, "base": null, "files": [] });
+        return json!({ "agent_id": agent_id, "base": null, "files": [] });
     }
     let base = resolve_base(path, base);
     let raw = git_ok(path, &["diff", &base]).unwrap_or_default();
-    json!({ "terminal_id": terminal_key, "base": base, "files": parse_unified(&raw) })
+    json!({ "agent_id": agent_id, "base": base, "files": parse_unified(&raw) })
 }
 
 /// Parse unified-diff text into per-file blocks with indexed hunks (CAO

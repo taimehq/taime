@@ -60,7 +60,7 @@ use taime_protocol::{AgentProfile, AgentSpawnSpec, SessionSummary, WorktreeInfo}
 
 /// Provision (or resolve) an isolated git worktree for a daemon agent (Phase 3) —
 /// the daemon-owned replacement for CAO's `/worktrees/provision`. Returns the
-/// worktree info (snake_case fields, incl. `terminal_key` = attribution id).
+/// worktree info (snake_case fields, incl. `agent_id` = the Agent ID).
 #[tauri::command]
 pub async fn daemon_provision_worktree(
     daemon: State<'_, DaemonClient>,
@@ -81,7 +81,7 @@ fn default_agent_spec(
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
-    attribution_key: Option<String>,
+    agent_id: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
     inject_orchestration: bool,
@@ -101,7 +101,7 @@ fn default_agent_spec(
         cwd,
         rows: rows.unwrap_or(24),
         cols: cols.unwrap_or(80),
-        attribution_key,
+        agent_id,
         seed_prompt: None,
         env: vec![],
         // Plain agents don't get the orchestration tools; an "orchestrator" launch
@@ -112,7 +112,7 @@ fn default_agent_spec(
 
 /// Generic daemon query RPC (Phase 6 route-layer migration) — the daemon-backed
 /// replacement for the CAO REST surface (diff/hunks/attribution/contention/
-/// worktree/sessions). Returns a JSON value in the frontend's existing shape.
+/// worktree/agents). Returns a JSON value in the frontend's existing shape.
 #[tauri::command]
 pub async fn daemon_query(
     daemon: State<'_, DaemonClient>,
@@ -160,7 +160,7 @@ pub async fn daemon_spawn_agent(
     cols: Option<u16>,
     model: Option<String>,
     permission_mode: Option<String>,
-    attribution_key: Option<String>,
+    agent_id: Option<String>,
     inject_orchestration: Option<bool>,
     profile: Option<String>,
 ) -> Result<String, String> {
@@ -169,7 +169,7 @@ pub async fn daemon_spawn_agent(
         cwd,
         rows,
         cols,
-        attribution_key,
+        agent_id,
         model,
         permission_mode,
         inject_orchestration.unwrap_or(false),

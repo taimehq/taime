@@ -149,7 +149,7 @@ async fn daemon_full_lifecycle() {
                 env: vec![],
                 rows: 24,
                 cols: 80,
-                attribution_key: Some("term-xyz".into()),
+                agent_id: Some("term-xyz".into()),
             },
         },
     )
@@ -210,7 +210,7 @@ async fn daemon_full_lifecycle() {
             assert_eq!(req_id, 2);
             assert!(sessions.iter().any(|s| s.id == session_id && s.alive));
             let s = sessions.iter().find(|s| s.id == session_id).unwrap();
-            assert_eq!(s.attribution_key.as_deref(), Some("term-xyz"));
+            assert_eq!(s.agent_id.as_deref(), Some("term-xyz"));
         }
         other => panic!("expected Sessions, got {other:?}"),
     }
@@ -286,7 +286,7 @@ async fn daemon_query_and_spawn_surface() {
         ServerMsg::Worktree { info, .. } => {
             // A git repo provisions an isolated worktree (or shared on git failure);
             // either way the daemon ANSWERS without a protocol error.
-            assert!(info.mode == "worktree" || info.mode == "shared");
+            assert!(info.mode == "isolated" || info.mode == "shared");
         }
         other => panic!("expected Worktree, got {other:?}"),
     }
@@ -306,7 +306,7 @@ async fn daemon_query_and_spawn_surface() {
                 cwd: Some(cwd.to_string_lossy().into_owned()),
                 rows: 24,
                 cols: 80,
-                attribution_key: Some("term-it".into()),
+                agent_id: Some("term-it".into()),
                 seed_prompt: None,
                 env: vec![],
                 inject_orchestration: false,

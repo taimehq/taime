@@ -40,10 +40,10 @@ const AUTHOR_COLORS = [
 const UNATTRIBUTED = "unattributed";
 
 function authorName(
-  c: { provider: string | null; terminal_id: string } | null | undefined,
+  c: { provider: string | null; agent_id: string } | null | undefined,
 ): string {
   if (!c) return "unattributed";
-  return PROVIDER_NAME[c.provider ?? ""] ?? c.provider ?? c.terminal_id.slice(0, 6);
+  return PROVIDER_NAME[c.provider ?? ""] ?? c.provider ?? c.agent_id.slice(0, 6);
 }
 
 function langForPath(path: string): string {
@@ -101,8 +101,8 @@ export function DiffView() {
     setError(null);
     try {
       const [fd, hk, wt, attr] = await Promise.all([
-        api.getFileDiffs(terminalId).catch(() => ({ terminal_id: terminalId, files: [] })),
-        api.getHunks(terminalId).catch(() => ({ terminal_id: terminalId, base: null, files: [] })),
+        api.getFileDiffs(terminalId).catch(() => ({ agent_id: terminalId, files: [] })),
+        api.getHunks(terminalId).catch(() => ({ agent_id: terminalId, base: null, files: [] })),
         api.getWorktree(terminalId).catch(() => null),
         api.getAttribution(terminalId).catch(() => ({ team: [], files: {} })),
       ]);
@@ -111,7 +111,7 @@ export function DiffView() {
       setWorktree(wt);
       setAttribution(attr);
       setSelected((prev) => prev ?? fd.files[0]?.path ?? null);
-      if (wt?.mode === "shared" || wt?.mode === "worktree") {
+      if (wt?.mode === "shared" || wt?.mode === "isolated") {
         // Contention is workspace-wide: key off the worktree's project root
         // (the workspace-grouping id), not a frame label.
         const root = wt?.project_root;
@@ -158,7 +158,7 @@ export function DiffView() {
   const teamOrder = useMemo(() => {
     const team = attribution?.team ?? [];
     return [...team.filter((t) => !t.member_of), ...team.filter((t) => t.member_of)].map(
-      (t) => t.terminal_id,
+      (t) => t.agent_id,
     );
   }, [attribution]);
   const colorIndexById = useMemo(() => {
@@ -225,7 +225,7 @@ export function DiffView() {
   const fileGroups = (() => {
     const byKey = new Map<string, FileDiffEntry[]>();
     for (const f of files) {
-      const key = lastAuthor(f.path)?.terminal_id ?? UNATTRIBUTED;
+      const key = lastAuthor(f.path)?.agent_id ?? UNATTRIBUTED;
       const list = byKey.get(key);
       if (list) list.push(f);
       else byKey.set(key, [f]);
@@ -352,7 +352,7 @@ export function DiffView() {
       <div className="flex items-center justify-between gap-3 border-b border-ink-600 bg-ink-800 px-4 py-2.5">
         <div className="flex min-w-0 items-center gap-3 text-sm">
           <span className="shrink-0 font-semibold text-zinc-100">{agentName}</span>
-          {worktree?.mode === "worktree" && worktree.branch && (
+          {worktree?.mode === "isolated" && worktree.branch && (
             <span className="flex shrink-0 items-center gap-1.5 rounded-md border border-ink-600 px-2 py-0.5 font-mono text-[11px] text-teal-300">
               <GitBranch size={12} />
               {worktree.branch}
@@ -476,7 +476,7 @@ export function DiffView() {
                 <GitMerge size={32} className="text-zinc-600" />
                 <p className="mt-3 text-sm text-zinc-300">No changes to review</p>
                 <p className="mt-1 max-w-sm text-[12px] text-zinc-400">
-                  {worktree?.mode === "worktree"
+                  {worktree?.mode === "isolated"
                     ? `This agent's worktree (${worktree.branch ?? "branch"}) has no changes vs its base yet.`
                     : "No uncommitted changes in the shared working directory."}
                 </p>
@@ -524,7 +524,7 @@ export function DiffView() {
                 {(() => {
                   const a = current ? lastAuthor(current.path) : null;
                   if (!isTeam || !a) return null;
-                  const col = colorFor(a.terminal_id);
+                  const col = colorFor(a.agent_id);
                   return (
                     <span className={`rounded px-1.5 normal-case ${col?.chip ?? "text-zinc-400"}`}>
                       {authorName(a)} · turn {a.turn_index + 1}
@@ -539,7 +539,7 @@ export function DiffView() {
               </p>
               {currentHunks.map((h) => {
                 const ha = current ? hunkAuthor(current.path, h.index) : null;
-                const hcol = colorFor(ha?.terminal_id);
+                const hcol = colorFor(ha?.agent_id);
                 return (
                 <label
                   key={h.index}
