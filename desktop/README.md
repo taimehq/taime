@@ -1,83 +1,98 @@
-# Taime — desktop app
+# Taime — desktop app (developer guide)
 
-Native Tauri v2 shell that orchestrates the official AI coding CLIs (Claude Code,
-Codex, Gemini, Grok Build) by driving the **real** CLI binaries through the CAO
-Python engine. This package is the desktop product; the orchestration engine
-lives at `../backend/cao`.
+The Tauri v2 product package. The app is a thin client; the real engine is the
+detached `taime-session-daemon`, which the app spawns and talks to over a
+per-user Unix socket. Concepts and vocabulary (Workspace, Task, Agent, Agent
+ID, Worktree, Runtime, Workflow/Run, Schedule) are defined in
+[`docs/architecture-lexicon.md`](docs/architecture-lexicon.md) — reconcile
+against that file, not against other docs.
 
 ## Prerequisites
 
 - Node 20+ and `pnpm`
 - Rust (stable) + platform toolchain (Xcode CLT on macOS)
-- The CAO backend on PATH as `cao-server` (the dev install: `uv tool install`
-  from `../backend/cao`, exposing `cao-server`, `cao`, `cao-mcp-server`)
-- `tmux` (used by the backend for process isolation)
+- The agent CLIs you want to drive (`claude`, `codex`, `gemini`, `grok`) on
+  `PATH` and logged in
 
-## Run (development)
+## Dev loop
 
 ```bash
-cd desktop
 pnpm install
 pnpm tauri dev
 ```
 
-On launch, the Rust layer:
+`beforeDevCommand` builds the daemon (`cargo build -p taime-session-daemon`),
+so the app always finds it as a sibling of the app exe
+(`src-tauri/target/debug/taime-session-daemon`). Vite hot-reloads the
+frontend; Rust changes need a rerun.
 
-1. resolves the backend address (see **Configuration**),
-2. spawns and supervises `cao-server` (managed mode) — or attaches to an
-   already-running one (external mode),
-3. exposes the resolved URL to the React UI via the `get_api_url` command,
-4. emits live `backend://status` events that drive the status pill.
-
-## Configuration
-
-Resolution order (highest priority first):
-
-1. `TAIME_API_URL` env var (e.g. `http://127.0.0.1:9889`)
-2. project-local `./.taimerc` (JSON) — see `../.taimerc.example`
-3. user `~/.taime/config.json` (JSON)
-4. built-in default `http://127.0.0.1:9889`
-
-Useful env vars:
-
-| Var | Effect |
-| --- | --- |
-| `TAIME_API_URL` | Set backend host+port in one shot |
-| `TAIME_EXTERNAL_BACKEND=1` | Don't spawn `cao-server`; attach to a running one (dev escape hatch) |
-| `TAIME_BACKEND_CMD` | Override the launch command (default `cao-server`) |
-
-### Dev escape hatch (external backend)
-
-Run the backend yourself, then start the app against it:
+## Build
 
 ```bash
-# terminal 1
-cao-server --host 127.0.0.1 --port 9889
-
-# terminal 2
-TAIME_EXTERNAL_BACKEND=1 pnpm tauri dev
+pnpm tauri build
 ```
 
-## Layout
+`beforeBuildCommand` runs `scripts/stage-daemon.sh`, which builds the release
+daemon and stages it into `src-tauri/binaries/` so the bundle ships it under
+`Contents/Resources/binaries/`. Details: [`docs/packaging.md`](docs/packaging.md).
 
-```
-desktop/
-├── src/                 React 19 + TS + Tailwind frontend
-│   ├── config.ts        get_api_url bridge → resolved backend URL
-│   ├── api.ts           REST client (BASE = resolved apiUrl)
-│   ├── backend.ts       backend status types + event subscription
-│   └── components/      BackendStatusPill, ProviderCard, ...
-└── src-tauri/           Rust shell
-    └── src/
-        ├── main.rs      Builder, state, graceful-shutdown hook
-        ├── config.rs    layered config resolver (unit-tested)
-        ├── backend.rs   cao-server supervision (spawn/health/restart/shutdown)
-        └── commands.rs  get_api_url, get_backend_status
-```
+## The daemon
+
+Lives at `src-tauri/crates/taime-session-daemon`. It is spawned **detached**
+(`setsid`, stdio to `/dev/null`, never waited on), so it survives app exit and
+crash — agents keep running, and on the next boot the app discovers and adopts
+them (`daemon_list` is connect-only and never spawns a daemon just to look).
+
+**Protocol-version policy:** the handshake requires an exact
+`PROTOCOL_VERSION` match (`crates/taime-protocol/src/lib.rs` — postcard is
+positional, so any message change is a wire-layout change). When the app
+reaches a daemon speaking an older protocol (i.e. after an app upgrade), it
+**replaces** it: SIGTERM the stale daemon — whose shutdown handler kills its
+agents and unlinks its runtime files — then spawn the current binary. A
+protocol bump therefore terminates running agents; that is the explicit,
+intended trade-off (self-healing upgrades over cross-version compatibility).
+See `restart_daemon` in `src-tauri/src/daemon.rs`.
 
 ## Tests
 
 ```bash
-cd src-tauri && cargo test     # config resolver (6 tests)
-cd ..        && pnpm typecheck  # TS strict typecheck
+cd src-tauri
+cargo test --workspace               # app + protocol + daemon
+cargo clippy --workspace --all-targets
+```
+
+**`--workspace` is required**: bare `cargo test` / `cargo clippy` only cover
+the app crate (`taime`) and silently skip the daemon and protocol crates.
+Conversely, `cargo build -p taime` builds just the app, skipping the daemon's
+heavy `wezterm-term` git dependency.
+
+```bash
+pnpm typecheck   # TypeScript strict
+pnpm build       # vite production build
+```
+
+The daemon's integration tests exercise the full lifecycle over a real Unix
+socket (handshake → spawn → attach/resize → I/O → list → kill).
+
+## Source map
+
+```
+src/
+├── store.ts             Zustand store — all app state (frames, tasks, status)
+├── api.ts               typed invoke() wrappers over the Tauri commands
+├── pty.ts               binary terminal transport (Channel<ArrayBuffer> → xterm)
+├── components/          LaunchAgentDialog, DiffView, TaskReviewDrawer, …
+src-tauri/
+├── src/commands.rs      every #[tauri::command] the frontend calls
+├── src/daemon.rs        daemon client: spawn-detached, connect/handshake,
+│                        stale-daemon replacement, attach plumbing
+├── crates/taime-protocol/        wire types, PROTOCOL_VERSION, frame tags
+└── crates/taime-session-daemon/
+    ├── main.rs · listener.rs · conn.rs   socket setup, accept loop, per-conn RPC
+    ├── manager.rs · session.rs · runtime.rs   agent runtimes (PTY + emulator)
+    ├── emulator.rs · repaint.rs          wezterm-term grid + reattach repaint
+    ├── attribution.rs · store.rs         turn boundaries + SQLite persistence
+    ├── worktree.rs · diff.rs · fswatch.rs   isolation, review diffs, dirty state
+    ├── mcp.rs · providers/ · profiles.rs    orchestration tools, CLI adapters
+    └── workflow.rs · workflow_engine.rs · schedules.rs   Workflows, Runs, cron
 ```
