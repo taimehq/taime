@@ -64,10 +64,8 @@ pub struct DaemonSessionSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
 pub enum CleanupAction {
-    /// Delete a temp file written at spawn (e.g. a temp MCP config json). Not yet
-    /// constructed (Claude injects MCP inline); reserved for the temp-file
-    /// strategy + Phase-5 daemon-MCP config files.
-    #[allow(dead_code)]
+    /// Delete a file written at spawn (gemini's per-terminal Policy Engine
+    /// deny-rule TOML).
     RemoveFile(PathBuf),
     /// Remove named keys from `mcpServers` in a JSON settings file, deleting the
     /// `mcpServers` object if it becomes empty (gemini `~/.gemini/settings.json`).
