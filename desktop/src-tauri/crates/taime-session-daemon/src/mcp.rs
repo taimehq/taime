@@ -321,6 +321,12 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
             }
         }
         "run_workflow" => {
+            // Workflow node workers hold orchestration tools (for `share`), but
+            // must not start runs: a node recursing into its own workflow would
+            // mint agents unboundedly, outside the assign fan/depth guards.
+            if manager.is_workflow_worker(caller) {
+                return tool_err(id, "run_workflow is not available to workflow node workers");
+            }
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             // An orchestrator-started run inherits the orchestrator's task, so
             // workflow node agents land in the same Task as the rest of the team.

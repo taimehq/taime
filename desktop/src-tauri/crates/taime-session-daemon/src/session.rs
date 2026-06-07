@@ -664,17 +664,20 @@ fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
                 drain_turn_paths(st, turn);
             }
             // Persist every closed turn (durable, regardless of attach) with its
-            // REAL start: the first closed turn opened at `opened_at`; any
-            // back-to-back turns closed within this same chunk opened now.
+            // REAL start. (`feed` currently coalesces to at most one boundary
+            // per chunk; the loop stays robust if that ever changes — later
+            // boundaries in the same chunk would have opened ~now.)
             let mut started = opened_at;
             for turn in &turns {
                 persist_turn(&inner, turn, started);
                 started = now_secs;
             }
-            // Trailing output after the last boundary opens the next turn now;
-            // with no boundary in this chunk the in-flight turn keeps its open.
-            st.turn_started_unix =
-                if turns.is_empty() { Some(opened_at) } else { Some(now_secs) };
+            // After a boundary, the NEXT turn opens at the next OUTPUT — not at
+            // the boundary itself. Stamping `now` here would over-report by the
+            // whole idle-at-prompt gap; clearing instead means the next chunk's
+            // first bytes stamp the open (at worst sub-second late, never
+            // minutes early). No boundary ⇒ the in-flight turn keeps its open.
+            st.turn_started_unix = if turns.is_empty() { Some(opened_at) } else { None };
             if let Some(c) = st.attached.as_mut() {
                 let mut ok = c.out.send(encode_data(start, chunk)).is_ok();
                 for turn in turns {

@@ -554,13 +554,38 @@ impl Store {
         Ok(rows)
     }
 
-    /// Every provisioned worktree row (the GC sweep input).
-    pub fn all_worktrees(&self) -> rusqlite::Result<Vec<WorktreeRow>> {
+    /// GC-sweep candidates: ISOLATED worktree rows old enough to be safely
+    /// considered (created before `cutoff_unix`). The age gate closes the
+    /// provision→spawn TOCTOU — a row is persisted one IPC round-trip before
+    /// its agent registers as a live session, and a sweep landing in that gap
+    /// would see a fresh, clean, at-base checkout with no live agent and
+    /// delete the cwd the agent is about to spawn into. Legacy rows with NULL
+    /// created_at are treated as old.
+    pub fn gc_candidate_worktrees(&self, cutoff_unix: u64) -> rusqlite::Result<Vec<WorktreeRow>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare(&format!("SELECT {WORKTREE_COLS} FROM taime_worktrees"))?;
-        let rows = stmt.query_map([], map_worktree)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORKTREE_COLS} FROM taime_worktrees \
+             WHERE mode = 'worktree' \
+               AND (created_at IS NULL OR CAST(created_at AS INTEGER) <= ?1)"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![cutoff_unix as i64], map_worktree)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Whether `key` is the agent of a currently-running workflow node run
+    /// (the MCP recursion gate for `run_workflow`).
+    pub fn is_active_node_agent(&self, key: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM taime_workflow_node_runs \
+             WHERE agent_key = ?1 AND status = 'running'",
+            rusqlite::params![key],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
     }
 
     /// Retention pruning for the append-only history tables (startup + daily).

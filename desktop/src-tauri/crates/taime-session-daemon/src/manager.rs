@@ -47,6 +47,10 @@ pub struct Manager {
     /// Worktree rows already GC'd this daemon run (checkout removed) — skipped on
     /// subsequent sweeps so a sweep never re-shells `git` for settled rows.
     worktrees_gced: Mutex<std::collections::HashSet<String>>,
+    /// Live workflow-engine threads. Within a run the engine is sequential (one
+    /// worker at a time), but RUNS would otherwise be unbounded — each is a
+    /// thread + a stream of spawned agents outside the assign fan/depth guards.
+    active_workflow_runs: AtomicU64,
 }
 
 // LOCK DISCIPLINE: never hold two Manager mutexes at once. The canonical
@@ -214,6 +218,7 @@ impl Manager {
             assignments: Mutex::new(HashMap::new()),
             weak_self: std::sync::OnceLock::new(),
             worktrees_gced: Mutex::new(std::collections::HashSet::new()),
+            active_workflow_runs: AtomicU64::new(0),
         }
     }
 
@@ -1677,15 +1682,39 @@ impl Manager {
                 None => true,
             })
         });
+        // Cap concurrent runs: each is an engine thread spawning agents outside
+        // the assign fan/depth guards, so without a ceiling a loop (or a worker
+        // recursing into run_workflow before the MCP gate existed) could mint
+        // unbounded live agents. Slot is taken before the thread spawns and
+        // released when the engine returns (any exit path).
+        const MAX_CONCURRENT_WORKFLOW_RUNS: u64 = 8;
+        if self.active_workflow_runs.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_WORKFLOW_RUNS
+        {
+            self.active_workflow_runs.fetch_sub(1, Ordering::SeqCst);
+            return Err(format!(
+                "too many concurrent workflow runs (max {MAX_CONCURRENT_WORKFLOW_RUNS})"
+            ));
+        }
         let run_id = format!("wfrun-{}", &gen_id()[..12]);
-        store
-            .create_run(&run_id, name, now_unix(), task_id.as_deref())
-            .map_err(|e| e.to_string())?;
+        if let Err(e) = store.create_run(&run_id, name, now_unix(), task_id.as_deref()) {
+            self.active_workflow_runs.fetch_sub(1, Ordering::SeqCst);
+            return Err(e.to_string());
+        }
         let (def2, run2, caller2, task2) = (def, run_id.clone(), caller, task_id);
+        let arc2 = arc.clone();
         std::thread::spawn(move || {
             crate::workflow_engine::run(arc, def2, run2, project_root, provider, caller2, task2);
+            arc2.active_workflow_runs.fetch_sub(1, Ordering::SeqCst);
         });
         Ok(run_id)
+    }
+
+    /// Whether `key` is the agent of a currently-running workflow node. Node
+    /// workers get orchestration tools (they must `share` results), which would
+    /// otherwise include `run_workflow` — letting a node recurse into its own
+    /// workflow, unbounded. The MCP layer gates on this.
+    pub fn is_workflow_worker(&self, key: &str) -> bool {
+        self.store.as_ref().map(|s| s.is_active_node_agent(key)).unwrap_or(false)
     }
 
     /// All workflows as JSON for the app's panel: each with its graph + last run.
@@ -1952,12 +1981,14 @@ impl Manager {
             .values()
             .filter_map(|s| s.attribution_key())
             .collect();
-        let rows = store.all_worktrees().unwrap_or_default();
+        // Min-age gate (TOCTOU): a row exists one IPC round-trip before its
+        // agent registers as live — never consider rows younger than this.
+        const MIN_AGE_SECS: u64 = 600;
+        let rows = store
+            .gc_candidate_worktrees(now_unix().saturating_sub(MIN_AGE_SECS))
+            .unwrap_or_default();
         let (mut removed, mut kept) = (0usize, 0usize);
         for w in rows {
-            if w.mode.as_deref() != Some("worktree") {
-                continue; // shared mode = the user's real dir; never GC
-            }
             if live.contains(&w.terminal_id) {
                 continue;
             }
@@ -2085,6 +2116,7 @@ impl Manager {
             assignments: Mutex::new(HashMap::new()),
             weak_self: std::sync::OnceLock::new(),
             worktrees_gced: Mutex::new(std::collections::HashSet::new()),
+            active_workflow_runs: AtomicU64::new(0),
         }
     }
 
