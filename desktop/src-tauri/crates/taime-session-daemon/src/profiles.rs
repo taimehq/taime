@@ -280,7 +280,7 @@ mod tests {
         let def = ProfileDef {
             system_prompt: Some("you are a reviewer".into()),
             model: Some("from-profile".into()),
-            allowed_tools: vec!["Read".into()],
+            allowed_tools: vec!["fs_read".into()],
             orchestrator: true,
             ..Default::default()
         };
@@ -293,7 +293,7 @@ mod tests {
         apply_to(&def, &mut p, &mut inject);
         assert_eq!(p.system_prompt.as_deref(), Some("you are a reviewer"));
         assert_eq!(p.model.as_deref(), Some("app-override")); // not clobbered
-        assert_eq!(p.allowed_tools, vec!["Read".to_string()]);
+        assert_eq!(p.allowed_tools, vec!["fs_read".to_string()]);
         assert!(inject, "orchestrator profile flips injection on");
     }
 

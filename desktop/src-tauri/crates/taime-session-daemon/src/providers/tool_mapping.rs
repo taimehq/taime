@@ -20,12 +20,35 @@ const CLAUDE_CODE_MAPPING: &[(&str, &[&str])] = &[
     ("fs_*", &["Read", "Edit", "Write", "Glob", "Grep"]),
 ];
 
-/// The mapping table for a provider id. Only `claude_code` is wired so far; CAO
-/// also carried `copilot_cli`/`gemini_cli` tables — port them when those
-/// providers enforce restrictions natively.
+/// CAO's `TOOL_MAPPING["gemini_cli"]`, with the native names updated for the
+/// current gemini-cli (verified against the installed 0.45.2 bundle's builtin
+/// tool registry): CAO's table predates the `search_file_content` →
+/// `grep_search` rename and the `read_many_files` tool.
+const GEMINI_CLI_MAPPING: &[(&str, &[&str])] = &[
+    ("execute_bash", &["run_shell_command"]),
+    ("fs_read", &["read_file", "read_many_files", "list_directory", "grep_search", "glob"]),
+    ("fs_write", &["write_file", "replace"]),
+    ("fs_list", &["list_directory", "glob", "grep_search"]),
+    (
+        "fs_*",
+        &[
+            "read_file",
+            "read_many_files",
+            "write_file",
+            "replace",
+            "list_directory",
+            "grep_search",
+            "glob",
+        ],
+    ),
+];
+
+/// The mapping table for a provider id. CAO also carried a `copilot_cli` table —
+/// port it when that provider enforces restrictions natively.
 fn mapping_for(provider: &str) -> Option<&'static [(&'static str, &'static [&'static str])]> {
     match provider {
         "claude_code" => Some(CLAUDE_CODE_MAPPING),
+        "gemini_cli" => Some(GEMINI_CLI_MAPPING),
         _ => None,
     }
 }
@@ -100,6 +123,33 @@ mod tests {
             get_disallowed_tools("claude_code", &allowed(&["execute_bash", "fs_write"])),
             vec!["Glob", "Grep", "Read"]
         );
+    }
+
+    #[test]
+    fn gemini_disallowed_is_the_sorted_complement_of_allowed() {
+        assert_eq!(
+            get_disallowed_tools("gemini_cli", &allowed(&["execute_bash"])),
+            vec![
+                "glob",
+                "grep_search",
+                "list_directory",
+                "read_file",
+                "read_many_files",
+                "replace",
+                "write_file"
+            ]
+        );
+        // fs_read covers the list/search tools too (CAO table shape), so only
+        // the shell + write tools are blocked.
+        assert_eq!(
+            get_disallowed_tools("gemini_cli", &allowed(&["fs_read"])),
+            vec!["replace", "run_shell_command", "write_file"]
+        );
+        assert_eq!(
+            get_disallowed_tools("gemini_cli", &allowed(&["fs_*"])),
+            vec!["run_shell_command"]
+        );
+        assert!(get_disallowed_tools("gemini_cli", &allowed(&["*"])).is_empty());
     }
 
     #[test]
