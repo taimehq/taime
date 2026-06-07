@@ -278,6 +278,7 @@ async fn daemon_query_and_spawn_surface() {
             project_root: cwd.to_string_lossy().into_owned(),
             provider: "claude_code".into(),
             isolate: true,
+            task_id: None,
         },
     )
     .await;

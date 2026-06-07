@@ -322,7 +322,10 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
         }
         "run_workflow" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            match manager.run_workflow(name, None, Some(caller.to_string())) {
+            // An orchestrator-started run inherits the orchestrator's task, so
+            // workflow node agents land in the same Task as the rest of the team.
+            let task = manager.task_of_agent(caller);
+            match manager.run_workflow(name, None, Some(caller.to_string()), task) {
                 Ok(run_id) => tool_ok(id, json!({ "ok": true, "run_id": run_id })),
                 Err(e) => tool_err(id, &format!("run_workflow failed: {e}")),
             }

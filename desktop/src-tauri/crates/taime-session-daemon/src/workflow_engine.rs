@@ -38,9 +38,18 @@ pub fn run(
     project_root: Option<String>,
     provider: String,
     notify: Option<String>,
+    task_id: Option<String>,
 ) {
     let Some(store) = manager.store_arc() else { return };
-    let outcome = drive(&manager, &store, &def, &run_id, project_root.as_deref(), &provider);
+    let outcome = drive(
+        &manager,
+        &store,
+        &def,
+        &run_id,
+        project_root.as_deref(),
+        &provider,
+        task_id.as_deref(),
+    );
     let (status, err) = match &outcome {
         Ok(()) => ("completed", None),
         Err(e) => ("failed", Some(e.as_str())),
@@ -55,6 +64,7 @@ pub fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive(
     manager: &Arc<Manager>,
     store: &Arc<Store>,
@@ -62,6 +72,7 @@ fn drive(
     run_id: &str,
     project_root: Option<&str>,
     provider: &str,
+    task_id: Option<&str>,
 ) -> Result<(), String> {
     let mut current = def.entry.clone();
     let mut global = 0u32;
@@ -89,8 +100,13 @@ fn drive(
             node.prompt
         );
 
-        let (session_id, agent_key) =
-            match manager.spawn_workflow_node(project_root, &node_provider, &node.role, &prompt) {
+        let (session_id, agent_key) = match manager.spawn_workflow_node(
+            project_root,
+            &node_provider,
+            &node.role,
+            &prompt,
+            task_id, // node agents inherit the run's task
+        ) {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = store.insert_node_run(&node_run_id, run_id, &node.id, None, iteration, started);
