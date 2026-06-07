@@ -21,13 +21,15 @@ desktop/src-tauri/target/
 # Local tooling state
 .claude/scheduled_tasks.lock
 
-# backend/cao is its own git repo (your CAO fork). It is committed there, not
 # in this parent repo. (Convert to a submodule/subtree later if you want it
 # referenced from here.)
-backend/cao/
 
 # Playwright/test artifacts
 .playwright-mcp/
 loop-*.png
 ws-*.png
 taime-*.png
+# Daemon staging dir: ignore the staged binary, keep the dir (.gitkeep) so the
+# tauri-build resource check passes for bare `cargo build`.
+desktop/src-tauri/binaries/*
+!desktop/src-tauri/binaries/.gitkeep

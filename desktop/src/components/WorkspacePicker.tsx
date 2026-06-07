@@ -217,10 +217,12 @@ export function WorkspacePicker() {
           type="checkbox"
           checked={isolationEnabled}
           onChange={(e) => setIsolationEnabled(e.target.checked)}
-          className="accent-teal"
+          className="h-3.5 w-3.5 shrink-0 accent-teal"
         />
-        <span className="text-[11px] text-zinc-300">Isolate agents in worktrees</span>
-        <Info size={11} className="text-zinc-600" />
+        <span className="text-[11px] leading-none text-zinc-300">
+          Isolate agents in worktrees
+        </span>
+        <Info size={11} className="shrink-0 text-zinc-600" />
       </label>
     </div>
   );
@@ -245,10 +247,11 @@ function WorkspaceBadge({
   if (info.is_git) {
     return (
       <span
-        className="inline-flex shrink-0 items-center gap-1 rounded-md border border-teal-600/40 bg-teal-600/10 px-1.5 py-0.5 font-mono text-[10px] text-teal-400"
+        className="inline-flex min-w-0 max-w-[8rem] shrink items-center gap-1 rounded-md border border-teal-600/40 bg-teal-600/10 px-1.5 py-0.5 font-mono text-[10px] text-teal-400"
         title={`git · ${info.branch ?? "detached"} · agents isolate into worktrees`}
       >
-        <GitBranch size={10} /> {info.branch ?? "detached"}
+        <GitBranch size={10} className="shrink-0" />
+        <span className="truncate">{info.branch ?? "detached"}</span>
       </span>
     );
   }

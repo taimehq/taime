@@ -1,7 +1,7 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { type UnlistenFn } from "@tauri-apps/api/event";
 
-/** Mirrors the Rust `BackendState` (serde camelCase). */
+/** Backend descriptor for the status pill. The backend is now the local session
+ *  daemon (no managed sidecar), so this is effectively static. */
 export interface BackendState {
   status:
     | "starting"
@@ -29,28 +29,22 @@ export function inTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-/** One-shot pull of the current supervisor state. Never throws. */
+/** The session daemon is the backend; report healthy inside Tauri. */
 export async function getBackendStatus(): Promise<BackendState> {
-  try {
-    return await invoke<BackendState>("get_backend_status");
-  } catch {
-    return UNKNOWN_BACKEND;
-  }
+  return {
+    status: inTauri() ? "healthy" : "external",
+    detail: "taime-session-daemon",
+    external: false,
+    pid: null,
+    apiUrl: "",
+  };
 }
 
-/**
- * Subscribe to live backend-status transitions emitted by Rust.
- * Never throws: Tauri's `listen` calls `transformCallback` synchronously and
- * throws outside the webview — so an unguarded call here would crash React's
- * effect commit and blank the screen. Returns a no-op unlisten on failure.
- */
+/** No live transitions to subscribe to (the daemon isn't a supervised sidecar);
+ *  emit the current state once and return a no-op unlisten. */
 export async function onBackendStatus(
   cb: (s: BackendState) => void,
 ): Promise<UnlistenFn> {
-  try {
-    return await listen<BackendState>("backend://status", (e) => cb(e.payload));
-  } catch (e) {
-    console.warn("[taime] backend status events unavailable", e);
-    return () => {};
-  }
+  cb(await getBackendStatus());
+  return () => {};
 }

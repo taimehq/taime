@@ -1,6 +1,12 @@
 # Taime Terminal Architecture — Plan of Record
 
-**Status:** agreed direction; not yet started.
+**Status:** implemented on branch `taime/terminal-daemon-architecture` (Steps 0a,
+0b, 1, and 2; Step 2.5 SCM_RIGHTS reserved-not-built; Step 3 renderer deferred per
+plan). See [`terminal-daemon-implementation-notes.md`](./terminal-daemon-implementation-notes.md)
+for the research-backed implementation decisions, the **one deviation** (control
+messages use **postcard**, not bincode — bincode 3.0 is a non-compiling stub and
+all versions are RUSTSEC-flagged; the serde message shapes are unchanged), the
+half-open `seq_n` offset convention, and the verification status.
 **Revision (2026-06-02):** incorporated architecture review — handoff protocol,
 backpressure, daemon lifecycle/security, scoped reattach claim, OSC-as-one-signal.
 **Revision 2 (2026-06-02):** operational hardening — protocol versioning + daemon
@@ -153,10 +159,11 @@ Separate long-lived Rust binary owning `portable-pty` + headless `wezterm-term`.
 ### Transport / IPC
 
 - **Binary framing, no JSON on the hot path.** Length-prefixed frames
-  (`[len:u32][type:u8][payload]`); **bincode** for control/metadata, **raw byte
-  payloads (no base64)** for the data stream. (Not "zero-copy" — bytes still cross
-  the socket and the Tauri/webview boundary; the win is no base64 + no JSON, not
-  literal zero-copy.)
+  (`[len:u32][type:u8][payload]`); **postcard** for control/metadata (see the
+  implementation notes — bincode is a non-compiling stub / RUSTSEC-flagged, so we
+  use the serde-compatible postcard instead), **raw byte payloads (no base64)** for
+  the data stream. (Not "zero-copy" — bytes still cross the socket and the
+  Tauri/webview boundary; the win is no base64 + no JSON, not literal zero-copy.)
 - **Versioned handshake (first control exchange):** `magic`, `protocol_version`,
   `capabilities` (feature flags), `session_id`, and an `attach_token`. This is
   what makes app-update-while-old-daemon-running safe.
@@ -226,9 +233,13 @@ the cut.
 **Definition of `N` (be precise):** `N` is a **monotonically increasing byte
 offset of the single PTY stream, counted after ingestion by `wezterm-term`.** The
 daemon feeds each byte to the emulator *and* forwards it to clients from the same
-ordered stream; `N` is the cut point. The grid reflects bytes `[0..=N]`; resumed
-data carries bytes `(N..]`. This makes `prelude → repaint(grid@N) → apply bytes>N`
-provably equivalent to "xterm was fed the entire stream."
+ordered stream; `N` is the cut point. **As implemented this is the half-open
+convention** (`seq_n` = total bytes ingested): the grid reflects bytes `[0, seq_n)`
+and resumed data frames carry absolute `start_offset >= seq_n`; the client keeps
+bytes with offset `>= seq_n`, slicing a straddling frame. This makes
+`prelude → repaint(grid@seq_n) → apply bytes >= seq_n` provably equivalent to
+"xterm was fed the entire stream." (The earlier inclusive phrasing `[0..=N]` /
+`bytes>N` describes the same cut with `N = seq_n - 1`.)
 
 ### Authoritative state & attribution
 

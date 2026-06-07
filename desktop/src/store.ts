@@ -3,7 +3,6 @@ import {
   api,
   type Session,
   type SessionDetail,
-  type Terminal,
 } from "./api";
 import {
   loadRecentProjects,
@@ -12,7 +11,6 @@ import {
   saveWorkspaceDir,
   addRecent,
 } from "./lib/recentProjects";
-import { makeSessionName } from "./lib/sessionName";
 import {
   loadTerminalFontSize,
   saveTerminalFontSize,
@@ -24,10 +22,40 @@ import {
   loadSidebarCollapsed,
   saveSidebarCollapsed,
 } from "./lib/preferences";
-import { ptySpawnClaude, ptyKill, ptyCloseView } from "./pty";
+import {
+  daemonSpawnAgent,
+  daemonKill,
+  daemonCloseView,
+  type TurnEvent,
+  type DaemonSessionSummary,
+} from "./pty";
+import { providerTitle } from "./lib/providerLabel";
 
-/** Which transport carries a frame's terminal I/O. */
-export type TerminalTransport = "cao_ws" | "rust_pty";
+/** Providers the daemon can launch directly (Phase 1 of the CAO replacement). The
+ *  default-profile launch routes here; sessions / non-default profiles still go
+ *  through CAO until the daemon learns them. */
+const DAEMON_PROVIDERS = new Set(["claude_code", "codex", "gemini_cli", "grok_cli"]);
+
+/** Best-effort provider id from a daemon session's program path (for adopting a
+ *  crash-surviving session before the daemon reports provider on the wire). */
+function providerFromProgram(program: string): string {
+  const base = program.split("/").pop() ?? program;
+  if (base.includes("codex")) return "codex";
+  if (base.includes("gemini")) return "gemini_cli";
+  if (base.includes("grok")) return "grok_cli";
+  return "claude_code";
+}
+
+/** Which transport carries a frame's terminal I/O. Only `daemon` exists now (the
+ *  detached session daemon / Rust PTY path; survives crashes). `cao_ws` is a
+ *  retired legacy variant kept so older persisted state still parses. */
+export type TerminalTransport = "cao_ws" | "daemon";
+
+/** Frame transports that render in the xterm daemon view (vs the CAO WebSocket
+ *  terminal). */
+export function isDaemonTransport(t: TerminalTransport | undefined): boolean {
+  return t === "daemon";
+}
 
 /** Shell-grid layout: an auto-grid of all frames, or one focused frame with a
  *  tab strip of the rest. A view flag only — frames remain the source of truth. */
@@ -59,7 +87,7 @@ export interface Frame {
   error?: string;
   /** Transport for this frame's terminal (default cao_ws). */
   transport?: TerminalTransport;
-  /** Rust PTY session id (when transport === "rust_pty"). */
+  /** Daemon session id (when transport === "daemon"). */
   ptySessionId?: string;
   /** Model label parsed from the agent's startup banner (best-effort). */
   model?: string;
@@ -82,6 +110,8 @@ export interface RustPtyMeta {
   startedAt: number;
   /** Lifecycle: "running" (reattachable) or "exited" (process gone; dismiss only). */
   status: RustPtyStatus;
+  /** The owning transport — always the daemon now (kept for forward-compat). */
+  transport?: "daemon";
 }
 
 /** Dirty-state surfaced by the Rust file watcher (step 4). */
@@ -144,6 +174,9 @@ interface Store {
   /** Known Rust-PTY agents keyed by ptySessionId — survives frame close so a
    * detached (still-running) agent can be listed + reopened (close ≠ kill). */
   rustPtySessions: Record<string, RustPtyMeta>;
+  /** Attribution turn boundaries pushed by the daemon, keyed by frame key
+   *  (most recent last, capped). The flagship substrate landing in the app. */
+  frameTurns: Record<string, TurnEvent[]>;
   dirty: Record<string, DirtyState>;
   /** Per-terminal attributed file-change timeline (most recent last). */
   timeline: Record<string, TimelineEvent[]>;
@@ -185,7 +218,8 @@ interface Store {
   refreshStatuses: () => Promise<void>;
   /** Poll per-session terminal statuses and rebuild the collapsed-row rollups. */
   refreshSessionRollups: () => Promise<void>;
-  /** Delete a CAO session (terminates its tmux + agents) and close its frames. */
+  /** Legacy session-removal hook (no daemon equivalent — agents are standalone);
+   *  kept for the pipeline UI's empty session list. */
   killSession: (name: string) => Promise<void>;
 
   // grid actions
@@ -200,12 +234,30 @@ interface Store {
     agentProfile?: string | null;
     sessionName?: string | null;
   }) => void;
-  /** Launch Claude on the Rust-owned PTY transport (CAO path untouched). */
-  launchClaudeRustPty: () => Promise<void>;
+  /** Launch a provider on the detached session daemon (the Rust PTY path; survives
+   *  app crashes). `profile` is the daemon profile name (`~/.taime/agents/*.toml`
+   *  + built-in `default`/`orchestrator`); the daemon resolves it to fill the
+   *  system prompt / model / tools and injects the MCP orchestration tools for a
+   *  supervisor role. `sessionName` (optional) is the display label of the workspace
+   *  session the agent joins; `projectRoot` (optional) is that session's root to
+   *  provision the worktree from — so the daemon actually groups the agent there,
+   *  not just labels it (defaults to the active `workspaceDir`). Returns true on
+   *  success. */
+  launchAgentDaemon: (
+    provider: string,
+    profile?: string,
+    sessionName?: string | null,
+    projectRoot?: string | null,
+  ) => Promise<boolean>;
   /** Reopen a detached (still-running) Rust-PTY agent in a new frame. */
-  reopenRustPty: (ptySessionId: string) => void;
+  reopenRustPty: (ptySessionId: string, opts?: { focus?: boolean }) => void;
   /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
   markRustPtyExited: (ptySessionId: string) => void;
+  /** Adopt a daemon session discovered at boot (crash survival): populate the
+   *  registry so it appears in the detached panel and can be reopened. */
+  adoptDaemonSession: (summary: DaemonSessionSummary) => void;
+  /** Record a daemon-emitted attribution turn boundary against a frame. */
+  recordTurn: (frameKey: string, turn: TurnEvent) => void;
   /** Explicitly terminate a Rust-PTY agent (distinct from closing its frame). */
   killRustPty: (key: string) => Promise<void>;
   /** Drop a Rust-PTY session from the registry (kill if alive). */
@@ -240,6 +292,12 @@ interface Store {
 
   // misc
   setTerminalStatus: (id: string, status: string | null) => void;
+  /** Mirror a daemon status PUSH (Phase 4) for `sessionId` into the badge map,
+   *  resolving its attribution-keyed terminalId via `rustPtySessions`. */
+  setDaemonSessionStatus: (sessionId: string, status: string | null) => void;
+  /** Mirror a daemon fs-dirty PUSH (Phase 6) for `sessionId`: the full set of
+   *  paths its per-session watcher has seen change since the last review. */
+  markDaemonFsDirty: (sessionId: string, paths: string[]) => void;
   /** Record the model parsed from a frame's startup banner. */
   setFrameModel: (key: string, model: string) => void;
   showSnackbar: (s: Snackbar) => void;
@@ -265,6 +323,7 @@ export const useStore = create<Store>((set, get) => ({
   activeFrameKey: null,
   layoutMode: "grid",
   rustPtySessions: {},
+  frameTurns: {},
   dirty: {},
   timeline: {},
   dismissedTerminalIds: new Set(),
@@ -336,9 +395,9 @@ export const useStore = create<Store>((set, get) => ({
 
   refreshStatuses: async () => {
     const ids = get()
-      // Rust-PTY frames carry a CAO terminalId only for the attribution surface
+      // Daemon frames carry a CAO terminalId only for the attribution surface
       // (it's a provisioned worktree id, not a tmux terminal). Their lifecycle
-      // comes from ptyList via useRustPtyReconcile — polling CAO /terminals/{id}
+      // comes from daemon_list via useRustPtyReconcile — polling CAO /terminals/{id}
       // for them just 404s every tick. Skip them here.
       .frames.filter((f) => !f.ptySessionId)
       .map((f) => f.terminalId)
@@ -364,20 +423,15 @@ export const useStore = create<Store>((set, get) => ({
       }
       return;
     }
-    // No session endpoint returns per-terminal status, so fan out: list each
-    // session's terminals, then fetch each terminal's status, and bucket. Failed
-    // sessions are simply omitted from the rebuilt map (stale row clears).
-    // TODO: useTerminalReconcile also getSession()s these every 10s — a shared
-    // pass could halve the calls, but the two loops schedule independently today.
+    // Bucket each session's agents by their LIVE status — the push-maintained
+    // `terminalStatuses` map (Phase 4), NOT the retired per-terminal status call.
+    // Query each session's detail by its UNIQUE root id (not the basename) so two
+    // same-basename workspaces never merge. Unreachable sessions are omitted.
     const results = await Promise.all(
       sessions.map(async (sess) => {
         try {
-          const detail = await api.getSession(sess.name);
-          const statuses = await Promise.all(
-            detail.terminals.map((t) =>
-              api.getTerminalStatus(t.id).catch(() => null),
-            ),
-          );
+          const detail = await api.getSession(sess.id);
+          const statuses = get().terminalStatuses;
           const roll: SessionStatusRollup = {
             working: 0,
             needsYou: 0,
@@ -386,8 +440,8 @@ export const useStore = create<Store>((set, get) => ({
             idle: 0,
             total: detail.terminals.length,
           };
-          for (const st of statuses) {
-            switch ((st ?? "").toUpperCase()) {
+          for (const t of detail.terminals) {
+            switch ((statuses[t.id] ?? "").toUpperCase()) {
               case "PROCESSING":
                 roll.working++;
                 break;
@@ -405,7 +459,7 @@ export const useStore = create<Store>((set, get) => ({
                 break;
             }
           }
-          return [sess.name, roll] as const;
+          return [sess.id, roll] as const;
         } catch {
           return null; // skip unreachable session
         }
@@ -439,104 +493,30 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   launchAgent: async (provider, agentProfile, opts) => {
-    // Optimistic: show a pending frame immediately.
-    const key = nextKey();
-    const placeholder: Frame = {
-      key,
-      terminalId: null,
-      provider,
-      agentProfile,
-      sessionName: opts?.sessionName ?? null,
-      pending: true,
-    };
-    set((s) => ({
-      frames: [...s.frames, placeholder],
-      activeFrameKey: key,
-    }));
-
-    const projectRoot = opts?.workingDirectory ?? get().workspaceDir ?? undefined;
-    // Request worktree isolation when enabled and we have a project root; the
-    // backend transparently falls back to the shared dir for non-git projects.
-    const isolate = get().isolationEnabled && !!projectRoot;
-    const isolation = { isolate, projectRoot };
-    // When isolating, the backend resolves the worktree path itself, so we don't
-    // also pin working_directory; in shared mode it uses project_root as the cwd.
-    const workingDirectory = isolate ? undefined : projectRoot;
-    try {
-      let terminal: Terminal;
-      if (opts?.sessionName) {
-        terminal = await api.addTerminal(
-          opts.sessionName,
-          provider,
-          agentProfile,
-          workingDirectory,
-          isolation,
-        );
-      } else {
-        // Name new sessions after the project folder so the pipeline reads
-        // "myproject-a1b2" instead of an opaque "cao-cea61400" hash.
-        terminal = await api.createSession(
-          provider,
-          agentProfile,
-          makeSessionName(projectRoot),
-          workingDirectory,
-          isolation,
-        );
-      }
-      // Resolve the placeholder to the real terminal.
-      set((s) => {
-        // A reconcile tick may have opened a frame for this terminal while
-        // addTerminal was in flight: the placeholder's terminalId was null, so
-        // the reconciler couldn't see the collision and openTerminalFrame's
-        // existing-check couldn't either. If a frame now holds the resolved id,
-        // drop our placeholder and keep that one — strictly one frame per id.
-        const dup = s.frames.find(
-          (f) => f.key !== key && f.terminalId === terminal.id,
-        );
-        if (dup) {
-          const frames = s.frames.filter((f) => f.key !== key);
-          return {
-            frames,
-            activeFrameKey: s.activeFrameKey === key ? dup.key : s.activeFrameKey,
-          };
-        }
-        return {
-          frames: s.frames.map((f) =>
-            f.key === key
-              ? {
-                  ...f,
-                  terminalId: terminal.id,
-                  sessionName: terminal.session_name,
-                  agentProfile: terminal.agent_profile,
-                  pending: false,
-                }
-              : f,
-          ),
-        };
-      });
-      get().showSnackbar({
-        type: "success",
-        message: `${provider} launched`,
-      });
-      await get().fetchSessions();
-    } catch (e) {
-      // Rollback: drop the placeholder, surface the error.
-      const msg = e instanceof Error ? e.message : "launch failed";
-      set((s) => {
-        const frames = s.frames.filter((f) => f.key !== key);
-        return {
-          frames,
-          activeFrameKey:
-            s.activeFrameKey === key
-              ? (frames[frames.length - 1]?.key ?? null)
-              : s.activeFrameKey,
-        };
-      });
-      get().showSnackbar({
-        type: "error",
-        message: `Launch failed: ${msg}`,
-      });
+    // Daemon-only after the CAO/tmux removal: every supported CLI launches on the
+    // detached session daemon (the Rust PTY path), in its own worktree. The
+    // chosen profile name flows to the daemon, which resolves it against its
+    // profile store (~/.taime/agents/*.toml + built-in default/orchestrator) to
+    // fill the system prompt / model / tools and inject orchestration for a
+    // supervisor role.
+    if (!DAEMON_PROVIDERS.has(provider)) {
+      get().showSnackbar({ type: "error", message: `Unknown provider ${provider}` });
+      return;
     }
+    // launchAgentDaemon reports its own (real) error on failure. `workingDirectory`
+    // (the selected session's root) routes provisioning so "Add to session" is real
+    // grouping, not just a label.
+    // Open the (non-disruptive) team drawer on the FIRST agent so the team view is
+    // discovered, then leave it to the user — repeat launches just update the
+    // "Team N" badge in the title bar rather than popping the panel each time.
+    const firstAgent = Object.keys(get().rustPtySessions).length === 0;
+    const ok = await get().launchAgentDaemon(
+      provider,
+      agentProfile || "default",
+      opts?.sessionName ?? null,
+      opts?.workingDirectory ?? null,
+    );
+    if (ok && firstAgent) get().setGraphOpen(true);
   },
 
   openTerminalFrame: ({ terminalId, provider, agentProfile, sessionName }) => {
@@ -573,61 +553,103 @@ export const useStore = create<Store>((set, get) => ({
     }));
   },
 
-  launchClaudeRustPty: async () => {
-    const dir = get().workspaceDir;
+  launchAgentDaemon: async (provider, profile = "default", sessionName = null, projectRoot = null) => {
+    // Provision from the selected session's root when "Add to session" was chosen,
+    // else the active workspace — so the daemon groups the agent under the right
+    // project (session_root_of keys off the worktree's project_root).
+    const dir = projectRoot ?? get().workspaceDir;
+    // The built-in "orchestrator" role is a supervisor; the daemon also infers
+    // this from a file profile's `orchestrator = true`, but pass the hint so a
+    // pre-resolution path still injects the tools.
+    const orchestrate = profile === "orchestrator";
     try {
-      // Provision a worktree FIRST so the Rust-PTY agent gets the same
-      // attribution surface (dirty/diff/timeline/graph) as a CAO terminal —
-      // all of which key off this terminalId. Claude runs in the worktree path.
+      // Provision a daemon-owned worktree first (git worktree in Rust, persisted
+      // to the app-data store) so dirty/diff/graph key off this terminalId, and
+      // pass it to the daemon as the attribution_key so turn events carry it.
+      // `api.provisionWorktree` routes to the daemon (daemonProvisionWorktree).
       let terminalId: string | null = null;
       let cwd = dir;
       let branch: string | null = null;
       if (dir) {
         const wt = await api.provisionWorktree({
           project_root: dir,
-          provider: "claude_code",
+          provider,
           isolate: get().isolationEnabled,
         });
         terminalId = wt.terminal_id;
         cwd = wt.worktree_path;
         branch = wt.branch;
       }
-      const sessionId = await ptySpawnClaude(cwd, 24, 80);
+      const sessionId = await daemonSpawnAgent(
+        provider,
+        cwd,
+        24,
+        80,
+        terminalId,
+        null,
+        orchestrate,
+        profile,
+      );
       const key = nextKey();
-      set((s) => ({
-        frames: [
-          ...s.frames,
-          {
-            key,
-            terminalId, // = provisioned worktree id → attribution lights up
-            provider: "claude_code",
-            agentProfile: null,
-            sessionName: null,
-            pending: false,
-            transport: "rust_pty",
-            ptySessionId: sessionId,
-          },
-        ],
-        activeFrameKey: key,
-        rustPtySessions: terminalId
+      set((s) => {
+        // If the reconcile tick already surfaced this freshly-spawned session as a
+        // frame (a concurrent daemonList can list it before this set() runs), reuse
+        // that frame instead of adding a duplicate — just focus it + label its role.
+        const existing = s.frames.find((f) => f.ptySessionId === sessionId);
+        const frames = existing
+          ? s.frames.map((f) =>
+              f.key === existing.key
+                ? { ...f, agentProfile: profile, sessionName: sessionName ?? null }
+                : f,
+            )
+          : [
+              ...s.frames,
+              {
+                key,
+                terminalId,
+                provider,
+                agentProfile: profile,
+                sessionName: sessionName ?? null,
+                pending: false,
+                transport: "daemon" as const,
+                ptySessionId: sessionId,
+              },
+            ];
+        return {
+          frames,
+          activeFrameKey: existing ? existing.key : key,
+          rustPtySessions: terminalId
           ? {
               ...s.rustPtySessions,
               [sessionId]: {
                 ptySessionId: sessionId,
                 terminalId,
-                provider: "claude_code",
+                provider,
                 branch,
                 cwd,
                 startedAt: Date.now(),
                 status: "running",
+                transport: "daemon",
               },
             }
-          : s.rustPtySessions,
-      }));
-      get().showSnackbar({ type: "success", message: "Claude launched (Rust PTY)" });
+            : s.rustPtySessions,
+        };
+      });
+      get().showSnackbar({
+        type: "success",
+        message: `${providerTitle(provider)} launched`,
+      });
+      return true;
     } catch (e) {
+      // Surface the REAL error (provision/spawn failure) — the daemon is the only
+      // backend now, so there's no silent fallback.
       const msg = e instanceof Error ? e.message : String(e);
-      get().showSnackbar({ type: "error", message: `Rust PTY launch failed: ${msg}` });
+      console.warn("[taime] daemon launch failed", e);
+      get().showSnackbar({
+        type: "error",
+        message: `Launch failed: ${msg}`,
+      });
+      return false;
     }
   },
 
@@ -643,12 +665,39 @@ export const useStore = create<Store>((set, get) => ({
       };
     }),
 
-  reopenRustPty: (ptySessionId) => {
+  adoptDaemonSession: (summary) =>
+    set((s) => {
+      // Don't clobber a session we already track (this run or a prior adopt).
+      if (s.rustPtySessions[summary.id]) return s;
+      const meta: RustPtyMeta = {
+        ptySessionId: summary.id,
+        terminalId: summary.attribution_key ?? "",
+        // Daemon-reported provider (Phase 4); fall back to program inference for
+        // a pre-Phase-4 daemon that doesn't report it.
+        provider: summary.provider ?? providerFromProgram(summary.program),
+        branch: null,
+        cwd: summary.cwd || null,
+        startedAt: summary.created_at_unix ? summary.created_at_unix * 1000 : Date.now(),
+        status: summary.alive ? "running" : "exited",
+        transport: "daemon",
+      };
+      return { rustPtySessions: { ...s.rustPtySessions, [summary.id]: meta } };
+    }),
+
+  recordTurn: (frameKey, turn) =>
+    set((s) => {
+      const prev = s.frameTurns[frameKey] ?? [];
+      const next = [...prev, turn].slice(-100); // cap retained turns per frame
+      return { frameTurns: { ...s.frameTurns, [frameKey]: next } };
+    }),
+
+  reopenRustPty: (ptySessionId, opts) => {
+    const focus = opts?.focus ?? true;
     const meta = get().rustPtySessions[ptySessionId];
     if (!meta || meta.status === "exited") return;
     const existing = get().frames.find((f) => f.ptySessionId === ptySessionId);
     if (existing) {
-      set({ activeFrameKey: existing.key });
+      if (focus) set({ activeFrameKey: existing.key });
       return;
     }
     const key = nextKey();
@@ -662,18 +711,21 @@ export const useStore = create<Store>((set, get) => ({
           agentProfile: null,
           sessionName: null,
           pending: false,
-          transport: "rust_pty",
+          // Reattach via the backend that owns the session (daemon vs in-app),
+          // or the in-app default for pre-existing records without a transport.
+          transport: "daemon",
           ptySessionId,
         },
       ],
-      activeFrameKey: key,
+      // Auto-surfaced workers don't steal focus from the agent you're typing in.
+      activeFrameKey: focus ? key : s.activeFrameKey,
     }));
   },
 
   killRustPty: async (key) => {
     const frame = get().frames.find((f) => f.key === key);
     const sid = frame?.ptySessionId;
-    if (sid) await ptyKill(sid);
+    if (sid) await daemonKill(sid);
     set((s) => {
       const frames = s.frames.filter((f) => f.key !== key);
       const rustPtySessions = { ...s.rustPtySessions };
@@ -688,7 +740,8 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   forgetRustPty: async (ptySessionId) => {
-    await ptyKill(ptySessionId); // safe even if already exited
+    // Connect-only; safe even if the session already exited (won't spawn a daemon).
+    await daemonKill(ptySessionId);
     set((s) => {
       const rustPtySessions = { ...s.rustPtySessions };
       delete rustPtySessions[ptySessionId];
@@ -705,7 +758,7 @@ export const useStore = create<Store>((set, get) => ({
       // immediately reopen them. Rust-PTY frames are excluded — they have their
       // own detached-agent lifecycle (close detaches, doesn't kill).
       const dismissedTerminalIds =
-        frame && frame.transport !== "rust_pty" && frame.terminalId
+        frame && !isDaemonTransport(frame.transport) && frame.terminalId
           ? new Set(s.dismissedTerminalIds).add(frame.terminalId)
           : s.dismissedTerminalIds;
       return {
@@ -717,10 +770,10 @@ export const useStore = create<Store>((set, get) => ({
             : s.activeFrameKey,
       };
     });
-    // Rust-PTY: detach the view but KEEP the agent running + its registry entry,
-    // so it shows up under "detached" and can be reopened. (close ≠ kill.)
-    if (frame?.transport === "rust_pty" && frame.ptySessionId) {
-      await ptyCloseView(frame.ptySessionId);
+    // Daemon: detach the view but KEEP the agent running (it survives even an
+    // app crash) + its registry entry, so it shows under "detached" and reopens.
+    if (isDaemonTransport(frame?.transport) && frame?.ptySessionId) {
+      await daemonCloseView(frame.ptySessionId);
     }
     // Best-effort clear dirty marker for the closed terminal.
     if (frame?.terminalId) get().clearDirty(frame.terminalId);
@@ -740,13 +793,19 @@ export const useStore = create<Store>((set, get) => ({
       return { dirty: { ...s.dirty, [terminalId]: dirty } };
     }),
 
-  clearDirty: (terminalId) =>
+  clearDirty: (terminalId) => {
+    // Also reset the daemon's accumulated set so its next FsDirty push doesn't
+    // re-surface already-reviewed paths (best-effort; the daemon owns the watch).
+    api.clearDaemonDirty(terminalId).catch(() => {
+      /* daemon may be down; the local clear below still applies */
+    });
     set((s) => {
       if (!s.dirty[terminalId]) return s;
       const next = { ...s.dirty };
       delete next[terminalId];
       return { dirty: next };
-    }),
+    });
+  },
 
   appendTimeline: (terminalId, events) =>
     set((s) => {
@@ -836,6 +895,36 @@ export const useStore = create<Store>((set, get) => ({
       return {
         terminalStatuses: { ...s.terminalStatuses, [id]: normalized },
       };
+    }),
+
+  setDaemonSessionStatus: (sessionId, status) =>
+    set((s) => {
+      const tid = s.rustPtySessions[sessionId]?.terminalId;
+      if (!tid) return s;
+      const normalized = status ? status.toUpperCase() : "UNKNOWN";
+      if (s.terminalStatuses[tid] === normalized) return s;
+      // Keep the daemon-session map's own status field coherent too (used by the
+      // Agents panel), mapping the inferred status onto the lifecycle label.
+      const m = s.rustPtySessions[sessionId];
+      const lifecycle = normalized === "EXITED" ? "exited" : m.status === "exited" ? "exited" : "running";
+      return {
+        terminalStatuses: { ...s.terminalStatuses, [tid]: normalized },
+        rustPtySessions:
+          m.status === lifecycle
+            ? s.rustPtySessions
+            : { ...s.rustPtySessions, [sessionId]: { ...m, status: lifecycle } },
+      };
+    }),
+
+  markDaemonFsDirty: (sessionId, paths) =>
+    set((s) => {
+      const tid = s.rustPtySessions[sessionId]?.terminalId;
+      if (!tid || paths.length === 0) return s;
+      const prev = s.dirty[tid];
+      if (prev && prev.count === paths.length && prev.paths.join(" ") === paths.join(" ")) {
+        return s;
+      }
+      return { dirty: { ...s.dirty, [tid]: { count: paths.length, paths } } };
     }),
 
   setFrameModel: (key, model) =>

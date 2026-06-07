@@ -69,7 +69,27 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
       .catch(() => setProfiles([]));
   }, []);
 
-  const activeProfile = profiles.find((p) => p.name === profile);
+  // The daemon's profile store already includes the built-in default/orchestrator
+  // roles, but guarantee they exist (and aren't duplicated) so the select is
+  // never empty mid-load.
+  const byName = new Map(profiles.map((p) => [p.name, p]));
+  if (!byName.has("default"))
+    byName.set("default", {
+      name: "default",
+      description: "Plain agent — no orchestration tools.",
+      source: "builtin",
+    });
+  if (!byName.has("orchestrator"))
+    byName.set("orchestrator", {
+      name: "orchestrator",
+      description: "Can assign / handoff to other agents.",
+      source: "builtin",
+    });
+  const displayProfiles = [...byName.values()];
+  const supervisors = displayProfiles.filter(isSupervisor);
+  const workers = displayProfiles.filter((p) => !isSupervisor(p));
+
+  const activeProfile = displayProfiles.find((p) => p.name === profile);
   const profileIsSupervisor = activeProfile
     ? isSupervisor(activeProfile)
     : false;
@@ -78,8 +98,12 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
     if (!selected) return;
     setBusy(true);
     onClose(); // optimistic: close immediately, frame appears as pending
+    // The dropdown value is the session's unique root (id); resolve its display
+    // name and pass the root so provisioning actually joins that session.
+    const sess = sessions.find((s) => s.id === sessionName);
     await launchAgent(selected, profile, {
-      sessionName: sessionName || undefined,
+      sessionName: sess?.name || undefined,
+      workingDirectory: sess?.id || undefined,
     });
   };
 
@@ -149,19 +173,18 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
           onChange={(e) => setProfile(e.target.value)}
           className="mb-1.5 w-full rounded-lg border border-ink-500 bg-ink-700 px-3 py-2 text-sm text-zinc-200"
         >
-          <option value="default">default — plain agent (no orchestration)</option>
-          {profiles.some(isSupervisor) && (
+          {supervisors.length > 0 && (
             <optgroup label="Supervisors (orchestrate other agents)">
-              {profiles.filter(isSupervisor).map((p) => (
+              {supervisors.map((p) => (
                 <option key={p.name} value={p.name}>
                   {p.name}
                 </option>
               ))}
             </optgroup>
           )}
-          {profiles.some((p) => !isSupervisor(p)) && (
+          {workers.length > 0 && (
             <optgroup label="Workers / specialists">
-              {profiles.filter((p) => !isSupervisor(p)).map((p) => (
+              {workers.map((p) => (
                 <option key={p.name} value={p.name}>
                   {p.name}
                 </option>
@@ -175,9 +198,20 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
           {profile === "default" ? (
             <p className="text-[11px] leading-relaxed text-zinc-500">
               A standalone agent. It won&apos;t spawn or coordinate other agents.
-              Pick a <span className="text-zinc-300">supervisor</span> profile to
-              orchestrate a team.
+              Pick <span className="text-zinc-300">orchestrator</span> to let it
+              assign work to a team.
             </p>
+          ) : profile === "orchestrator" ? (
+            <div className="flex items-start gap-2">
+              <Users size={13} className="mt-0.5 shrink-0 text-teal-400" />
+              <p className="text-[11px] leading-relaxed text-zinc-400">
+                Gets the daemon&apos;s MCP tools (<span className="text-zinc-300">list_agents</span>,{" "}
+                <span className="text-zinc-300">send_message</span>,{" "}
+                <span className="text-zinc-300">handoff</span>,{" "}
+                <span className="text-zinc-300">assign</span>) so it can spawn and
+                coordinate other agents.
+              </p>
+            </div>
           ) : (
             <div className="flex items-start gap-2">
               {profileIsSupervisor ? (
@@ -212,7 +246,7 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
             >
               <option value="">New session</option>
               {sessions.map((s) => (
-                <option key={s.name} value={s.name}>
+                <option key={s.id} value={s.id}>
                   Add to {prettySessionText(s.name)}
                 </option>
               ))}

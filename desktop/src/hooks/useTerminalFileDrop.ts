@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { inTauri } from "../backend";
-import { useStore } from "../store";
+import { useStore, isDaemonTransport } from "../store";
 import {
   sendToTerminal,
   formatDroppedPaths,
@@ -29,7 +29,7 @@ export function useTerminalFileDrop() {
       const s = useStore.getState();
       const f = s.frames.find((fr) => fr.key === s.activeFrameKey);
       if (!f) return null;
-      return (f.transport === "rust_pty" ? f.ptySessionId : f.terminalId) ?? null;
+      return (isDaemonTransport(f.transport) ? f.ptySessionId : f.terminalId) ?? null;
     };
 
     // Find the frame under a drop point. Tauri's position is physical pixels and

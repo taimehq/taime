@@ -1,10 +1,8 @@
-import { useStore, type Frame } from "../store";
-import { TerminalView } from "../components/TerminalView";
+import { useStore, isDaemonTransport, type Frame } from "../store";
 import { TerminalViewRustPty } from "../components/TerminalViewRustPty";
 import { StatusBadge, statusDotClass } from "../components/StatusBadge";
 import { prettySessionText } from "../lib/sessionName";
 import { providerTitle } from "../lib/providerLabel";
-import { useFsWatch } from "../hooks/useFsWatch";
 import { Loader2, X, TerminalSquare, Power, LayoutGrid } from "lucide-react";
 
 /** CSS grid template that keeps frames roughly square as count grows. */
@@ -177,10 +175,11 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
     frame.terminalId ? s.dirty[frame.terminalId] : undefined,
   );
 
-  const isRustPty = frame.transport === "rust_pty" && !!frame.ptySessionId;
+  const isRustPty = isDaemonTransport(frame.transport) && !!frame.ptySessionId;
 
-  // Watch this terminal's working dir while the frame is mounted (CAO path).
-  useFsWatch(frame.terminalId);
+  // (Filesystem watching now lives in the session daemon — it streams dirty
+  // paths over the attach channel as `FsDirty`, so React no longer mounts a
+  // watcher per frame.)
 
   const active = activeFrameKey === frame.key;
   const title = providerTitle(frame.provider);
@@ -288,9 +287,9 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
       </header>
 
       <div className="min-h-0 flex-1">
-        {isRustPty ? (
-          <TerminalViewRustPty sessionId={frame.ptySessionId!} frameKey={frame.key} />
-        ) : frame.pending || !frame.terminalId ? (
+        {isRustPty && frame.ptySessionId ? (
+          <TerminalViewRustPty sessionId={frame.ptySessionId} frameKey={frame.key} />
+        ) : (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-zinc-500">
             <Loader2 size={20} className="animate-spin text-teal-400" />
             <span className="text-xs">Starting {title}…</span>
@@ -298,8 +297,6 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
               cold-starting the CLI
             </span>
           </div>
-        ) : (
-          <TerminalView terminalId={frame.terminalId} frameKey={frame.key} />
         )}
       </div>
     </div>
