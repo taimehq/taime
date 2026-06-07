@@ -78,7 +78,7 @@ export function TerminalFindBar({
         : "0/0";
 
   return (
-    <div className="absolute right-3 top-2 z-10 flex items-center gap-1 rounded-md border border-ink-500 bg-ink-800/95 px-1.5 py-1 shadow-lg backdrop-blur">
+    <div className="absolute right-3 top-2 z-10 flex items-center gap-1 rounded-md border border-ink-500 bg-ink-800/95 px-1.5 py-1 shadow-lg backdrop-blur focus-within:border-accent/60">
       <input
         ref={inputRef}
         value={query}

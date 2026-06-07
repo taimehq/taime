@@ -20,13 +20,7 @@ import {
   type FileContributor,
 } from "../api";
 import { useStore } from "../store";
-
-const PROVIDER_NAME: Record<string, string> = {
-  claude_code: "Claude Code",
-  codex: "Codex CLI",
-  gemini_cli: "Gemini CLI",
-  grok_cli: "Grok Build CLI",
-};
+import { providerTitle } from "../lib/providerLabel";
 
 /** Stable color per team member, so authorship reads at a glance in the diff. */
 const AUTHOR_COLORS = [
@@ -43,7 +37,7 @@ function authorName(
   c: { provider: string | null; agent_id: string } | null | undefined,
 ): string {
   if (!c) return "unattributed";
-  return PROVIDER_NAME[c.provider ?? ""] ?? c.provider ?? c.agent_id.slice(0, 6);
+  return c.provider ? providerTitle(c.provider) : c.agent_id.slice(0, 6);
 }
 
 function langForPath(path: string): string {
@@ -180,12 +174,12 @@ export function DiffView() {
     attribution?.files[path]?.hunks?.[String(index)] ?? null;
 
   const agentName =
-    (frame && (PROVIDER_NAME[frame.provider] ?? frame.provider)) ??
+    (frame && providerTitle(frame.provider)) ??
     worktree?.provider ??
     "agent";
 
   // Sibling agents = same Task (the membership grouping; Uncategorized agents
-  // don't cross-link). Replaces the legacy sessionName label match.
+  // don't cross-link).
   const otherAgents = frames.filter(
     (f) =>
       f.terminalId &&
@@ -295,7 +289,7 @@ export function DiffView() {
             {contended.has(f.path) && (
               <span className="shrink-0 text-[10px] font-semibold text-rose-400">contended</span>
             )}
-            <span className="shrink-0 font-mono text-[10px]">
+            <span className="shrink-0 font-mono text-[10px] tabular-nums">
               <span className="text-emerald-400">+{f.additions}</span>
               <span className="text-rose-400"> -{f.deletions}</span>
             </span>
@@ -371,8 +365,8 @@ export function DiffView() {
               team · {attribution?.team.length} agents
             </span>
           )}
-          <span className="shrink-0 text-zinc-500">{files.length} files</span>
-          <span className="shrink-0 font-mono text-[11px]">
+          <span className="shrink-0 text-zinc-500 tabular-nums">{files.length} files</span>
+          <span className="shrink-0 font-mono text-[11px] tabular-nums">
             <span className="text-emerald-400">+{totalAdd}</span>{" "}
             <span className="text-rose-400">-{totalDel}</span>
           </span>
@@ -390,7 +384,7 @@ export function DiffView() {
               <option value="main">main</option>
               {otherAgents.map((a) => (
                 <option key={a.terminalId!} value={a.terminalId!}>
-                  {PROVIDER_NAME[a.provider] ?? a.provider} ({a.terminalId!.slice(0, 6)})
+                  {providerTitle(a.provider)} ({a.terminalId!.slice(0, 6)})
                 </option>
               ))}
             </select>
@@ -496,7 +490,7 @@ export function DiffView() {
                 {current && !current.binary && (
                   <DiffEditor
                     key={current.path}
-                    theme="vs-dark"
+                    theme="taime-dark"
                     language={langForPath(current.path)}
                     original={current.original}
                     modified={current.modified}
@@ -505,6 +499,8 @@ export function DiffView() {
                       renderSideBySide: true,
                       minimap: { enabled: false },
                       fontSize: 12,
+                      fontFamily:
+                        "'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
                       scrollBeyondLastLine: false,
                     }}
                   />
@@ -563,7 +559,7 @@ export function DiffView() {
                   <span className="truncate font-mono text-[11px] text-zinc-400">
                     {h.header}
                   </span>
-                  <span className="ml-auto shrink-0 font-mono text-[10px]">
+                  <span className="ml-auto shrink-0 font-mono text-[10px] tabular-nums">
                     <span className="text-emerald-400">+{h.additions}</span>
                     <span className="text-rose-400"> -{h.deletions}</span>
                   </span>

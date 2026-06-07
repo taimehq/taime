@@ -12,12 +12,12 @@
 /** xterm search-match highlight colors (decorations are also what makes the
  *  resultCount in `onDidChangeResults` accurate, so always pass them). */
 export const SEARCH_DECORATIONS = {
-  matchBackground: "#4493f855",
-  matchBorder: "#4493f800",
-  matchOverviewRuler: "#4493f8",
-  activeMatchBackground: "#d29922aa",
-  activeMatchBorder: "#d29922",
-  activeMatchColorOverviewRuler: "#d29922",
+  matchBackground: "#5b8def55",
+  matchBorder: "#5b8def00",
+  matchOverviewRuler: "#5b8def",
+  activeMatchBackground: "#e3a93aaa",
+  activeMatchBorder: "#e3a93a",
+  activeMatchColorOverviewRuler: "#e3a93a",
 } as const;
 
 export interface TerminalController {

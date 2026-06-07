@@ -7,15 +7,7 @@ import {
   type TaskInfo,
 } from "../api";
 import { useStore } from "../store";
-
-/** Canonical target providers, in display order, with friendly labels. */
-const TARGETS: Record<string, { name: string; vendor: string }> = {
-  claude_code: { name: "Claude Code", vendor: "Anthropic" },
-  codex: { name: "Codex CLI", vendor: "OpenAI" },
-  gemini_cli: { name: "Gemini CLI", vendor: "Google" },
-  grok_cli: { name: "Grok Build CLI", vendor: "xAI" },
-};
-const ORDER = ["claude_code", "codex", "gemini_cli", "grok_cli"];
+import { providerTitle, PROVIDER_VENDOR, PROVIDER_ORDER } from "../lib/providerLabel";
 
 /** Heuristic: does this profile orchestrate other agents? */
 function isSupervisor(p: AgentProfileInfo): boolean {
@@ -50,12 +42,12 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
       .then((list) => {
         const installed = list.filter((p) => p.installed);
         const ordered = [...installed].sort((a, b) => {
-          const ai = ORDER.indexOf(a.name);
-          const bi = ORDER.indexOf(b.name);
+          const ai = PROVIDER_ORDER.indexOf(a.name);
+          const bi = PROVIDER_ORDER.indexOf(b.name);
           return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
         });
         setProviders(ordered);
-        const firstTarget = ordered.find((p) => ORDER.includes(p.name));
+        const firstTarget = ordered.find((p) => PROVIDER_ORDER.includes(p.name));
         setSelected(firstTarget?.name ?? ordered[0]?.name ?? null);
       })
       .catch(() => setProviders([]));
@@ -85,7 +77,7 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
   }, [workspaceDir]);
 
   // The daemon's profile store already includes the built-in default/orchestrator
-  // roles, but guarantee they exist (and aren't duplicated) so the select is
+  // profiles, but guarantee they exist (and aren't duplicated) so the select is
   // never empty mid-load.
   const byName = new Map(profiles.map((p) => [p.name, p]));
   if (!byName.has("default"))
@@ -176,7 +168,7 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
             </p>
           )}
           {providers?.map((p) => {
-            const friendly = TARGETS[p.name];
+            const vendor = PROVIDER_VENDOR[p.name];
             const active = selected === p.name;
             return (
               <button
@@ -189,10 +181,10 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
                 }`}
               >
                 <span className="text-sm text-zinc-100">
-                  {friendly?.name ?? p.name}
+                  {providerTitle(p.name)}
                 </span>
                 <span className="font-mono text-[11px] text-zinc-500">
-                  {friendly?.vendor ? `${friendly.vendor} · ` : ""}
+                  {vendor ? `${vendor} · ` : ""}
                   {p.binary}
                 </span>
               </button>
@@ -200,9 +192,9 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
           })}
         </div>
 
-        {/* Profile / role */}
+        {/* Profile */}
         <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">
-          Role / profile
+          Profile
         </label>
         <select
           value={profile}
@@ -324,7 +316,7 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
           <button
             onClick={submit}
             disabled={!selected || busy}
-            className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-primary-hover disabled:opacity-50"
+            className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:opacity-50"
           >
             Launch
           </button>

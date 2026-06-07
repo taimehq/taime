@@ -27,27 +27,29 @@ interface Props {
   onConnectionChange?: (state: "open" | "closed") => void;
 }
 
+// Console well sits below the surface ladder (#070809 — darkest, slightly
+// warmer black per the design system's "console is darkest" rule).
 const THEME = {
-  background: "#0a0a0a",
-  foreground: "#ededed",
+  background: "#070809",
+  foreground: "#c8c7c2",
   cursor: "#c8c7c2",
-  cursorAccent: "#0a0a0a",
-  selectionBackground: "#33363b",
-  black: "#0a0a0a",
-  red: "#f85149",
-  green: "#3fb950",
-  yellow: "#d29922",
-  blue: "#4493f8",
-  magenta: "#bc8cff",
-  cyan: "#39d3c2",
-  white: "#ededed",
-  brightBlack: "#6f6f6f",
+  cursorAccent: "#070809",
+  selectionBackground: "#2f4a7a",
+  black: "#070809",
+  red: "#ef5b50",
+  green: "#46c46e",
+  yellow: "#e3a93a",
+  blue: "#5b8def",
+  magenta: "#9a7cf0",
+  cyan: "#8db1f5",
+  white: "#c8c7c2",
+  brightBlack: "#6f7681",
 };
 
 /**
- * Terminal view for the session-daemon transport (the Rust PTY path for Claude).
- * Same xterm UX as the CAO `TerminalView`; only the transport differs — raw bytes
- * in over a binary `Channel`, `daemon_write`/`daemon_resize` out.
+ * Terminal view for the session-daemon transport (the Rust PTY path, every
+ * provider) — raw bytes in over a binary `Channel`, `daemon_write`/
+ * `daemon_resize` out.
  *
  * Mount protocol: fit xterm to the container, then `daemon_attach` with the real
  * viewport so the daemon resizes + sends a grid repaint matching it (handoff step
@@ -110,7 +112,7 @@ export function TerminalViewRustPty({
       // effect below so this mount effect isn't keyed on font size.
       fontSize: useStore.getState().terminalFontSize,
       fontFamily:
-        "ui-monospace, 'JetBrains Mono', SFMono-Regular, Menlo, Monaco, monospace",
+        "'Geist Mono', ui-monospace, 'JetBrains Mono', SFMono-Regular, Menlo, Monaco, monospace",
       scrollback: 10000,
       allowProposedApi: true,
       macOptionClickForcesSelection: true,

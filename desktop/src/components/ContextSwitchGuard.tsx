@@ -1,12 +1,6 @@
 import { useStore } from "../store";
 import { AlertTriangle, Eye, ArrowRight } from "lucide-react";
-
-const TARGET_NAME: Record<string, string> = {
-  claude_code: "Claude Code",
-  codex: "Codex CLI",
-  gemini_cli: "Gemini CLI",
-  grok_cli: "Grok Build CLI",
-};
+import { providerTitle } from "../lib/providerLabel";
 
 /**
  * Raised when switching execution context away from an agent that left
@@ -31,11 +25,8 @@ export function ContextSwitchGuard({
   const d = current?.terminalId ? dirty[current.terminalId] : undefined;
   if (!current || !d) return null;
 
-  const fromName =
-    TARGET_NAME[current.provider] ?? current.provider.replace(/_/g, " ");
-  const toName = next
-    ? (TARGET_NAME[next.provider] ?? next.provider.replace(/_/g, " "))
-    : "another agent";
+  const fromName = providerTitle(current.provider);
+  const toName = next ? providerTitle(next.provider) : "another agent";
 
   // Contended files: paths this agent changed that ANOTHER live agent also has
   // dirty — a real cross-agent collision signal, surfaced before the switch.
