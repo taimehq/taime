@@ -70,6 +70,9 @@ pub enum CleanupAction {
     /// Remove named keys from `mcpServers` in a JSON settings file, deleting the
     /// `mcpServers` object if it becomes empty (gemini `~/.gemini/settings.json`).
     RemoveJsonMcpServers { path: PathBuf, names: Vec<String> },
+    /// Remove named `[mcp_servers.<name>]` sections from a TOML config file,
+    /// deleting the parent table if it becomes empty (grok `~/.grok/config.toml`).
+    RemoveTomlMcpServers { path: PathBuf, names: Vec<String> },
     /// Recursively remove a per-terminal workspace dir (gemini `GEMINI.md` home).
     RemoveDir(PathBuf),
 }
@@ -98,6 +101,9 @@ impl Cleanup {
                 }
                 CleanupAction::RemoveJsonMcpServers { path, names } => {
                     let _ = config::remove_json_mcp_servers(path, names);
+                }
+                CleanupAction::RemoveTomlMcpServers { path, names } => {
+                    let _ = config::remove_toml_mcp_servers(path, names);
                 }
             }
         }

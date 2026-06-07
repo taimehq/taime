@@ -43,12 +43,32 @@ const GEMINI_CLI_MAPPING: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Grok has no CAO table (CAO never enforced restrictions on grok). This maps
+/// CAO vocabulary to grok's `--deny <RULE>` **ToolPrefix** vocabulary, which
+/// deliberately mirrors Claude Code's (verified against the installed 0.2.32
+/// binary's embedded docs: `Bash`/`Edit`/`Write`/`Read`/`Grep`/`WebFetch`/
+/// `MCPTool`; a bare prefix matches all invocations of that type). There is no
+/// `Glob` prefix — `Grep(...)` covers search operations — so `fs_list` maps to
+/// `Grep` alone. NOTE: these are deny-rule prefixes, not builtin tool ids
+/// (`--disallowed-tools` takes the ids but is headless-only and silently
+/// ignored in the TUI the daemon drives; `--deny` works in both modes and
+/// "always wins" — it is checked before approval modes like
+/// `--always-approve`).
+const GROK_CLI_MAPPING: &[(&str, &[&str])] = &[
+    ("execute_bash", &["Bash"]),
+    ("fs_read", &["Read"]),
+    ("fs_write", &["Edit", "Write"]),
+    ("fs_list", &["Grep"]),
+    ("fs_*", &["Read", "Edit", "Write", "Grep"]),
+];
+
 /// The mapping table for a provider id. CAO also carried a `copilot_cli` table —
 /// port it when that provider enforces restrictions natively.
 fn mapping_for(provider: &str) -> Option<&'static [(&'static str, &'static [&'static str])]> {
     match provider {
         "claude_code" => Some(CLAUDE_CODE_MAPPING),
         "gemini_cli" => Some(GEMINI_CLI_MAPPING),
+        "grok_cli" => Some(GROK_CLI_MAPPING),
         _ => None,
     }
 }
@@ -150,6 +170,20 @@ mod tests {
             vec!["run_shell_command"]
         );
         assert!(get_disallowed_tools("gemini_cli", &allowed(&["*"])).is_empty());
+    }
+
+    #[test]
+    fn grok_disallowed_is_the_sorted_complement_of_allowed() {
+        assert_eq!(
+            get_disallowed_tools("grok_cli", &allowed(&["fs_read"])),
+            vec!["Bash", "Edit", "Grep", "Write"]
+        );
+        assert_eq!(
+            get_disallowed_tools("grok_cli", &allowed(&["execute_bash", "fs_write"])),
+            vec!["Grep", "Read"]
+        );
+        assert_eq!(get_disallowed_tools("grok_cli", &allowed(&["fs_*"])), vec!["Bash"]);
+        assert!(get_disallowed_tools("grok_cli", &allowed(&["*"])).is_empty());
     }
 
     #[test]

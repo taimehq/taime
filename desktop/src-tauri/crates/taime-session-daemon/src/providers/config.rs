@@ -1,5 +1,6 @@
 //! TOML-backed provider defaults (`~/.taime/providers.toml`) over a built-in
-//! baseline, plus the gemini `settings.json` mutate/restore helpers.
+//! baseline, plus the gemini `settings.json` and grok `config.toml`
+//! mutate/restore helpers.
 //!
 //! The TOML holds only the **data** worth overriding per machine: the binary
 //! (path or PATH name), the static base args, the model flag, and any extra env.
@@ -229,6 +230,79 @@ pub fn remove_json_mcp_servers(path: &Path, names: &[String]) -> io::Result<()> 
     std::fs::write(path, pretty)
 }
 
+/// Merge `[mcp_servers.<name>]` sections into a TOML config file (grok
+/// `~/.grok/config.toml`), creating the file and parent dir if needed. Edited
+/// with `toml_edit` so the user's existing keys, comments, and formatting
+/// survive. Unlike the JSON twin, an UNPARSEABLE existing file is an error,
+/// not a clobber — config.toml carries user models/API keys, so we must never
+/// rewrite it from scratch. Serialized via [`lock_settings`].
+pub fn merge_toml_mcp_servers(
+    path: &Path,
+    servers: &[taime_protocol::McpServerConfig],
+) -> io::Result<()> {
+    use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
+    let _lock = lock_settings(path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{path:?}: {e}")))?;
+    if !doc.contains_key("mcp_servers") || !doc["mcp_servers"].is_table() {
+        let mut t = Table::new();
+        // Implicit: render only the `[mcp_servers.<name>]` child headers (the
+        // shape `grok mcp add` writes), not a bare `[mcp_servers]`.
+        t.set_implicit(true);
+        doc.insert("mcp_servers", Item::Table(t));
+    }
+    let mcp = doc["mcp_servers"].as_table_mut().expect("mcp_servers table");
+    for s in servers {
+        let mut t = Table::new();
+        t.insert("command", toml_edit::value(s.command.clone()));
+        let mut args = Array::new();
+        for a in &s.args {
+            args.push(a.clone());
+        }
+        t.insert("args", toml_edit::value(args));
+        let mut env = InlineTable::new();
+        for (k, v) in &s.env {
+            env.insert(k, Value::from(v.clone()));
+        }
+        t.insert("env", toml_edit::value(env));
+        mcp.insert(&s.name, Item::Table(t));
+    }
+    std::fs::write(path, doc.to_string())
+}
+
+/// Remove named `[mcp_servers.<name>]` sections from a TOML config file; drop
+/// the parent table if it becomes empty. No-op if the file is gone or
+/// unparseable. (Inverse of [`merge_toml_mcp_servers`] — the grok cleanup.)
+pub fn remove_toml_mcp_servers(path: &Path, names: &[String]) -> io::Result<()> {
+    use toml_edit::DocumentMut;
+    let _lock = lock_settings(path)?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let mut doc: DocumentMut = match text.parse() {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+    let now_empty = if let Some(mcp) = doc.get_mut("mcp_servers").and_then(|i| i.as_table_mut()) {
+        for n in names {
+            mcp.remove(n);
+        }
+        mcp.is_empty()
+    } else {
+        false
+    };
+    if now_empty {
+        doc.remove("mcp_servers");
+    }
+    std::fs::write(path, doc.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +350,44 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(restored["theme"], "dark");
         assert!(restored.get("mcpServers").is_none(), "empty mcpServers removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_then_remove_roundtrips_grok_config_toml() {
+        let dir = std::env::temp_dir().join(format!("taime-cfg-toml-{}", unsafe { libc::getpid() }));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // User content — including a comment — must survive byte-for-byte.
+        let user = "# my settings\n[ui]\nyolo = false # keep\n";
+        std::fs::write(&path, user).unwrap();
+
+        let servers = vec![taime_protocol::McpServerConfig {
+            name: "taime".into(),
+            command: "/bin/taime-session-daemon".into(),
+            args: vec!["--mcp-stdio".into()],
+            env: vec![
+                ("TAIME_MCP_TOKEN".into(), "tok".into()),
+                ("CAO_TERMINAL_ID".into(), "t1".into()),
+            ],
+        }];
+        merge_toml_mcp_servers(&path, &servers).unwrap();
+        let merged = std::fs::read_to_string(&path).unwrap();
+        assert!(merged.starts_with(user), "user content + formatting preserved:\n{merged}");
+        assert!(merged.contains("[mcp_servers.taime]"), "section header shape:\n{merged}");
+        assert!(merged.contains("command = \"/bin/taime-session-daemon\""));
+        assert!(merged.contains("args = [\"--mcp-stdio\"]"));
+        assert!(merged.contains("TAIME_MCP_TOKEN = \"tok\""));
+        assert!(merged.contains("CAO_TERMINAL_ID = \"t1\""));
+
+        remove_toml_mcp_servers(&path, &["taime".to_string()]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), user, "restored exactly");
+
+        // An unparseable config must error, never be clobbered.
+        std::fs::write(&path, "this is [not toml").unwrap();
+        assert!(merge_toml_mcp_servers(&path, &servers).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "this is [not toml");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

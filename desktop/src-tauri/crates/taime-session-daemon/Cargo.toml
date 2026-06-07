@@ -22,10 +22,13 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1", features = ["use-std"] }
 # Provider registry: serde_json for claude `--mcp-config` JSON + gemini
-# settings.json merge; toml for `~/.taime/providers.toml` defaults; regex for the
-# per-provider status/approval heuristics ported from CAO.
+# settings.json merge; toml for `~/.taime/providers.toml` defaults; toml_edit
+# for the grok `~/.grok/config.toml` MCP merge (format-preserving — that file
+# is user-owned, comments must survive); regex for the per-provider
+# status/approval heuristics ported from CAO.
 serde_json = "1"
 toml = "0.8"
+toml_edit = "0.23"
 regex = "1"
 # Durable orchestration store (Phase 3): SQLite via rusqlite in the app-data dir,
 # schema mirroring CAO's so the Phase-7 import is a row copy. `bundled` compiles
