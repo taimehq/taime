@@ -45,7 +45,6 @@ fn main() {
             commands::daemon_close_view,
             commands::daemon_kill,
             commands::daemon_list,
-            commands::daemon_available,
             commands::set_clipboard_image_from_path
         ])
         .run(tauri::generate_context!())
