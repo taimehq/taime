@@ -77,11 +77,11 @@ const EXAMPLE_FEATURE_REVIEW: &str = r#"{
   "entry": "implement",
   "max_iterations": 12,
   "nodes": [
-    { "id": "implement", "role": "feature-builder",
+    { "id": "implement", "profile": "feature-builder",
       "prompt": "Implement the feature described by the user or orchestrator in this workspace, matching the existing patterns. Add or update tests." },
-    { "id": "test", "role": "default",
+    { "id": "test", "profile": "default",
       "prompt": "Run the project's test suite. Start your shared result with PASS if everything passes, or FAIL (listing what failed) otherwise." },
-    { "id": "review", "role": "security-reviewer",
+    { "id": "review", "profile": "security-reviewer",
       "prompt": "Review the implemented changes for correctness and security; summarize findings and severity." }
   ],
   "edges": [
@@ -99,9 +99,9 @@ const EXAMPLE_FIX_VERIFY: &str = r#"{
   "entry": "fix",
   "max_iterations": 10,
   "nodes": [
-    { "id": "fix", "role": "bug-fixer",
+    { "id": "fix", "profile": "bug-fixer",
       "prompt": "Reproduce and fix the bug described by the user or orchestrator. Add a regression test." },
-    { "id": "verify", "role": "default",
+    { "id": "verify", "profile": "default",
       "prompt": "Run the tests, including the new regression test. Start your shared result with PASS if they all pass, or FAIL with details otherwise." }
   ],
   "edges": [
@@ -139,11 +139,14 @@ fn run_script_gate(script: &str) -> bool {
 }
 
 /// The FIXED, injection-safe `[[var]]` allowlist for a schedule prompt.
+/// `[[schedule_name]]` is canonical; `[[flow_name]]` substitutes forever as the
+/// legacy alias (both resolve to the schedule name).
 fn schedule_vars(name: &str) -> HashMap<&'static str, String> {
     let now = chrono::Local::now();
     let mut m: HashMap<&'static str, String> = HashMap::new();
     m.insert("date", now.format("%Y-%m-%d").to_string());
     m.insert("time", now.format("%H:%M").to_string());
+    m.insert("schedule_name", name.to_string());
     m.insert("flow_name", name.to_string());
     m
 }
@@ -1567,15 +1570,15 @@ impl Manager {
     }
 
     /// Spawn one workflow-node worker: a worktree off `project_root` (if any), the
-    /// agent under `role`/`provider` WITH orchestration tools (so it can `share` its
-    /// result), seeded with `prompt`. Returns `(session_id, agent_id)`. Not
+    /// agent under `profile`/`provider` WITH orchestration tools (so it can `share`
+    /// its result), seeded with `prompt`. Returns `(session_id, agent_id)`. Not
     /// subject to the `assign` fan/depth limits — the workflow's own iteration
     /// guards bound it.
     pub fn spawn_workflow_node(
         &self,
         project_root: Option<&str>,
         provider: &str,
-        role: &str,
+        profile: &str,
         prompt: &str,
         task_id: Option<&str>,
     ) -> Result<(String, String), String> {
@@ -1594,7 +1597,7 @@ impl Manager {
         };
         let spec = AgentSpawnSpec {
             provider: provider.to_string(),
-            profile: AgentProfile { name: role.to_string(), ..Default::default() },
+            profile: AgentProfile { name: profile.to_string(), ..Default::default() },
             cwd,
             rows: 24,
             cols: 80,

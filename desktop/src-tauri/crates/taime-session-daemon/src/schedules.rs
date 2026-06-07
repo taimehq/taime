@@ -6,12 +6,18 @@
 //! ---
 //! name: nightly-review
 //! schedule: "0 2 * * *"        # 5-field POSIX cron (Sun=0)
-//! agent_profile: security-reviewer
+//! profile: security-reviewer
 //! provider: claude_code
 //! script: ./health-check.sh    # optional gate; non-zero exit = skip this run
 //! ---
 //! Review yesterday's changes and open issues for anything risky.
 //! ```
+//!
+//! Canonical keys are `profile` and `workspace_root`; the legacy spellings
+//! `agent_profile` and `workspace` are accepted forever as aliases (user-authored
+//! files never break). `task_mode: uncategorized` is accepted as the explicit
+//! spelling of the absent default. The serializer ([`to_markdown`]) emits only
+//! the canonical spellings.
 //!
 //! The body (after the closing `---`) is the prompt fed to the agent when the cron
 //! fires. `[[var]]` placeholders in the prompt are substituted from a fixed,
@@ -26,15 +32,18 @@ use std::collections::HashMap;
 pub struct ScheduleDef {
     pub name: String,
     pub schedule: String,
+    /// The launch Profile (front-matter `profile:`; legacy alias `agent_profile:`).
     pub agent_profile: String,
     pub provider: String,
     pub script: Option<String>,
     pub prompt: String,
-    /// Workspace the fire runs in (front-matter `workspace:`). Without one the
-    /// agent runs in the daemon's cwd and task targeting is unavailable.
+    /// Workspace the fire runs in (front-matter `workspace_root:`; legacy alias
+    /// `workspace:`). Without one the agent runs in the daemon's cwd and task
+    /// targeting is unavailable.
     pub workspace_root: Option<String>,
-    /// Explicit task behavior (front-matter `task_mode:`): absent = uncategorized,
-    /// `fixed` = attach runs to `task_id`, `per_run` = create a task per fire.
+    /// Explicit task behavior (front-matter `task_mode:`): absent or explicit
+    /// `uncategorized` = uncategorized (stored as `None`), `fixed` = attach runs
+    /// to `task_id`, `per_run` = create a task per fire.
     pub task_mode: Option<String>,
     /// The target task for `task_mode: fixed` (front-matter `task_id:`).
     pub task_id: Option<String>,
@@ -102,11 +111,16 @@ pub fn parse_schedule(text: &str) -> Result<ScheduleDef, String> {
     let get = |k: &str| fields.get(k).cloned().filter(|s| !s.is_empty());
     let name = get("name").ok_or("front-matter missing `name`")?;
     let schedule = get("schedule").ok_or("front-matter missing `schedule`")?;
-    let agent_profile = get("agent_profile").unwrap_or_else(|| "default".to_string());
+    // Canonical `profile:`; `agent_profile:` accepted forever as a legacy alias.
+    let agent_profile = get("profile")
+        .or_else(|| get("agent_profile"))
+        .unwrap_or_else(|| "default".to_string());
     let provider = get("provider").unwrap_or_else(|| "claude_code".to_string());
     let script = get("script").or(script_block).filter(|s| !s.is_empty());
-    let workspace_root = get("workspace");
-    let task_mode = get("task_mode");
+    // Canonical `workspace_root:`; `workspace:` accepted forever as a legacy alias.
+    let workspace_root = get("workspace_root").or_else(|| get("workspace"));
+    // Explicit `uncategorized` is the spelled-out absent default.
+    let task_mode = get("task_mode").filter(|m| m != "uncategorized");
     let task_id = get("task_id");
     if prompt.is_empty() {
         return Err("schedule has no prompt body (after the closing `---`)".to_string());
@@ -116,10 +130,12 @@ pub fn parse_schedule(text: &str) -> Result<ScheduleDef, String> {
     }
     if let Some(mode) = task_mode.as_deref() {
         if mode != "fixed" && mode != "per_run" {
-            return Err(format!("invalid task_mode {mode:?} (expected fixed | per_run)"));
+            return Err(format!(
+                "invalid task_mode {mode:?} (expected uncategorized | fixed | per_run)"
+            ));
         }
         if workspace_root.is_none() {
-            return Err("task_mode requires a `workspace:` target".to_string());
+            return Err("task_mode requires a `workspace_root:` target".to_string());
         }
         if mode == "fixed" && task_id.is_none() {
             return Err("task_mode `fixed` requires `task_id:`".to_string());
@@ -168,18 +184,19 @@ pub fn substitute_vars(prompt: &str, vars: &HashMap<&str, String>) -> String {
 }
 
 /// Render a schedule back to its markdown form (for writing UI-created schedules
-/// to `~/.taime/schedules/<name>.md`).
+/// to `~/.taime/schedules/<name>.md`). Emits only the canonical key spellings
+/// (`profile:`, `workspace_root:`), never the legacy aliases.
 pub fn to_markdown(def: &ScheduleDef) -> String {
     let mut s = String::from("---\n");
     s.push_str(&format!("name: {}\n", def.name));
     s.push_str(&format!("schedule: \"{}\"\n", def.schedule));
-    s.push_str(&format!("agent_profile: {}\n", def.agent_profile));
+    s.push_str(&format!("profile: {}\n", def.agent_profile));
     s.push_str(&format!("provider: {}\n", def.provider));
     if let Some(script) = &def.script {
         s.push_str(&format!("script: {script}\n"));
     }
     if let Some(root) = &def.workspace_root {
-        s.push_str(&format!("workspace: {root}\n"));
+        s.push_str(&format!("workspace_root: {root}\n"));
     }
     if let Some(mode) = &def.task_mode {
         s.push_str(&format!("task_mode: {mode}\n"));
@@ -198,15 +215,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_a_full_schedule() {
-        let md = "---\nname: nightly-review\nschedule: \"0 2 * * *\"\nagent_profile: security-reviewer\nprovider: claude_code\n---\nReview yesterday's changes for anything risky.";
+    fn parses_a_full_schedule_with_canonical_keys() {
+        let md = "---\nname: nightly-review\nschedule: \"0 2 * * *\"\nprofile: security-reviewer\nprovider: claude_code\nworkspace_root: /projects/app\n---\nReview yesterday's changes for anything risky.";
         let def = parse_schedule(md).unwrap();
         assert_eq!(def.name, "nightly-review");
         assert_eq!(def.schedule, "0 2 * * *");
         assert_eq!(def.agent_profile, "security-reviewer");
         assert_eq!(def.provider, "claude_code");
+        assert_eq!(def.workspace_root.as_deref(), Some("/projects/app"));
         assert!(def.script.is_none());
         assert!(def.prompt.contains("Review yesterday's"));
+    }
+
+    #[test]
+    fn legacy_key_aliases_still_parse() {
+        // `agent_profile:` and `workspace:` are accepted forever as aliases.
+        let md = "---\nname: nightly-review\nschedule: \"0 2 * * *\"\nagent_profile: security-reviewer\nworkspace: /projects/app\n---\nbody";
+        let def = parse_schedule(md).unwrap();
+        assert_eq!(def.agent_profile, "security-reviewer");
+        assert_eq!(def.workspace_root.as_deref(), Some("/projects/app"));
+
+        // Canonical spelling wins when both are present.
+        let both = "---\nname: x\nschedule: \"0 2 * * *\"\nprofile: new\nagent_profile: old\nworkspace_root: /new\nworkspace: /old\n---\nbody";
+        let def = parse_schedule(both).unwrap();
+        assert_eq!(def.agent_profile, "new");
+        assert_eq!(def.workspace_root.as_deref(), Some("/new"));
+    }
+
+    #[test]
+    fn explicit_uncategorized_task_mode_equals_absent() {
+        // `task_mode: uncategorized` is the spelled-out default: parses to None
+        // and requires no workspace.
+        let md = "---\nname: x\nschedule: \"0 2 * * *\"\ntask_mode: uncategorized\n---\nbody";
+        let def = parse_schedule(md).unwrap();
+        assert_eq!(def.task_mode, None);
     }
 
     #[test]
@@ -240,6 +282,17 @@ mod tests {
         vars.insert("flow_name", "nightly".to_string());
         let out = substitute_vars("run [[flow_name]] but keep [[unknown]]", &vars);
         assert_eq!(out, "run nightly but keep [[unknown]]");
+    }
+
+    #[test]
+    fn schedule_name_and_legacy_flow_name_both_substitute() {
+        // The daemon's allowlist carries both spellings: [[schedule_name]] is
+        // canonical, [[flow_name]] substitutes forever as the legacy alias.
+        let mut vars = HashMap::new();
+        vars.insert("schedule_name", "nightly".to_string());
+        vars.insert("flow_name", "nightly".to_string());
+        let out = substitute_vars("[[schedule_name]] == [[flow_name]]", &vars);
+        assert_eq!(out, "nightly == nightly");
     }
 
     #[test]
