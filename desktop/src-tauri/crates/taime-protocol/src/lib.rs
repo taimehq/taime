@@ -33,9 +33,15 @@ pub mod paths;
 pub const MAGIC: u32 = 0x7461_696d;
 
 /// Protocol version. Bump on any incompatible change to message shapes/framing.
-/// The app's daemon-upgrade policy keys off this: a daemon whose version differs
-/// (or is missing a required capability) is *adopted read-only* for its existing
-/// sessions (List + Kill) rather than killed.
+///
+/// UPGRADE POLICY (explicit): a daemon whose version differs is **replaced**:
+/// the app SIGTERMs it via the lock-file PID, removes its socket/token, and
+/// spawns the current binary — which terminates that daemon's running agents
+/// (its SIGTERM handler kills children; orphaned PTYs would be worse).
+/// "Agents survive app restarts/crashes" therefore holds across same-version
+/// restarts ONLY; a protocol-bumping upgrade is a deliberate, loud exception.
+/// Adopt-read-only is NOT possible here: the handshake is strict equality and
+/// postcard is positional, so a mismatched daemon can't answer even `List`.
 ///
 /// v2: `SessionSummary` gained `provider` + `status` (Phase 4 status inference).
 /// v3: added `ProvisionWorktree`/`Worktree` (Phase 3 daemon-owned worktrees).

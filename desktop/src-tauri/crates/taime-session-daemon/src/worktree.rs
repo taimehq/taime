@@ -74,6 +74,74 @@ fn shared(project_root: &str, terminal_key: &str, error: Option<String>) -> Work
     }
 }
 
+/// Outcome of a GC attempt on one provisioned worktree.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GcOutcome {
+    /// Checkout (+ branch) removed — provably worthless: clean tree, branch tip
+    /// still at the provision base.
+    Removed,
+    /// Kept: uncommitted changes or commits beyond base — that is the user's
+    /// unreviewed work, and review-before-merge is the product.
+    KeptHasWork,
+    /// Kept: state couldn't be verified (git error). Never delete what we
+    /// can't prove worthless.
+    KeptUnverified(String),
+}
+
+/// Garbage-collect ONE dead agent's isolated worktree, conservatively.
+/// Removes the checkout and its `taime/…` branch ONLY when both are provably
+/// worthless: `git status --porcelain` is empty AND the branch tip still
+/// equals `base_sha`. Shared-mode rows must never reach here (the "worktree
+/// path" is the user's real project dir) — callers gate on `mode`.
+pub fn gc_one(
+    worktree_path: &str,
+    repo_root: &str,
+    branch: Option<&str>,
+    base_sha: Option<&str>,
+) -> GcOutcome {
+    let wt = Path::new(worktree_path);
+    let repo = Path::new(repo_root);
+    if !repo.is_dir() {
+        return GcOutcome::KeptUnverified("repo root missing".into());
+    }
+    if !wt.exists() {
+        // Checkout already gone (manual delete / lost disk): prune git's stale
+        // bookkeeping, and drop the branch only when it's still at base.
+        let _ = run_git(repo, &["worktree", "prune"]);
+        if let (Some(b), Some(base)) = (branch, base_sha) {
+            if git_stdout(repo, &["rev-parse", b]).as_deref() == Some(base) {
+                let _ = run_git(repo, &["branch", "-D", b]);
+            }
+        }
+        return GcOutcome::Removed;
+    }
+    // Uncommitted or untracked changes → user work; keep.
+    let status = match run_git(wt, &["status", "--porcelain"]) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return GcOutcome::KeptUnverified("git status failed".into()),
+    };
+    if !status.is_empty() {
+        return GcOutcome::KeptHasWork;
+    }
+    // Commits beyond the provision base → user work; keep.
+    if let (Some(b), Some(base)) = (branch, base_sha) {
+        match git_stdout(repo, &["rev-parse", b]) {
+            Some(tip) if tip == base => {}
+            Some(_) => return GcOutcome::KeptHasWork,
+            None => return GcOutcome::KeptUnverified("branch tip unreadable".into()),
+        }
+    }
+    if !matches!(run_git(repo, &["worktree", "remove", worktree_path]), Ok(o) if o.status.success())
+    {
+        return GcOutcome::KeptUnverified("git worktree remove failed".into());
+    }
+    if let Some(b) = branch {
+        // Tip == base verified above, so -D destroys nothing.
+        let _ = run_git(repo, &["branch", "-D", b]);
+    }
+    GcOutcome::Removed
+}
+
 /// Provision (or idempotently resolve) an isolated worktree for `terminal_key`.
 /// Branch is `taime/<provider>-<terminal_key>`, matching CAO.
 pub fn provision(
@@ -224,5 +292,55 @@ mod tests {
         let _ = run_git(&repo, &["worktree", "remove", "--force", &info.worktree_path]);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(Path::new(&info.worktree_path).parent().unwrap());
+    }
+
+    #[test]
+    fn gc_removes_clean_keeps_dirty_and_forked() {
+        let repo = temp_repo();
+        let root = repo.to_str().unwrap();
+
+        // Clean + unforked → removed (checkout AND branch).
+        let a = provision(root, "claude_code", true, "gcaaaaaa");
+        assert_eq!(a.mode, "worktree");
+        assert_eq!(
+            gc_one(&a.worktree_path, root, a.branch.as_deref(), a.base_sha.as_deref()),
+            GcOutcome::Removed
+        );
+        assert!(!Path::new(&a.worktree_path).exists(), "clean checkout deleted");
+        assert!(
+            git_stdout(&repo, &["rev-parse", a.branch.as_deref().unwrap()]).is_none(),
+            "base-only branch deleted"
+        );
+
+        // Uncommitted changes → kept untouched.
+        let b = provision(root, "claude_code", true, "gcbbbbbb");
+        std::fs::write(Path::new(&b.worktree_path).join("wip.txt"), "unreviewed").unwrap();
+        assert_eq!(
+            gc_one(&b.worktree_path, root, b.branch.as_deref(), b.base_sha.as_deref()),
+            GcOutcome::KeptHasWork
+        );
+        assert!(Path::new(&b.worktree_path).join("wip.txt").exists(), "dirty work preserved");
+
+        // Committed-beyond-base (clean tree) → kept: the branch IS the work.
+        let c = provision(root, "claude_code", true, "gccccccc");
+        let cwt = Path::new(&c.worktree_path);
+        std::fs::write(cwt.join("done.txt"), "committed").unwrap();
+        git(cwt, &["add", "-A"]);
+        git(cwt, &["commit", "-qm", "agent work"]);
+        assert_eq!(
+            gc_one(&c.worktree_path, root, c.branch.as_deref(), c.base_sha.as_deref()),
+            GcOutcome::KeptHasWork
+        );
+        assert!(cwt.exists(), "forked checkout preserved");
+
+        // Cleanup.
+        for info in [&b, &c] {
+            let _ = run_git(&repo, &["worktree", "remove", "--force", &info.worktree_path]);
+        }
+        let wt_parent = Path::new(&b.worktree_path).parent().map(|p| p.to_path_buf());
+        let _ = std::fs::remove_dir_all(&repo);
+        if let Some(p) = wt_parent {
+            let _ = std::fs::remove_dir_all(p);
+        }
     }
 }

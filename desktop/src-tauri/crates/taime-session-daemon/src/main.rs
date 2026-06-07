@@ -59,7 +59,16 @@ fn run_mcp_shim() -> anyhow::Result<()> {
     fn read_frame(s: &mut UnixStream) -> std::io::Result<BytesMut> {
         let mut len = [0u8; 4];
         s.read_exact(&mut len)?;
-        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+        let n = u32::from_be_bytes(len) as usize;
+        // Same cap as the main codec — a garbage/hostile peer must not make the
+        // shim allocate unbounded memory from a forged length prefix.
+        if n > taime_protocol::MAX_FRAME_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("frame length {n} exceeds cap"),
+            ));
+        }
+        let mut buf = vec![0u8; n];
         s.read_exact(&mut buf)?;
         Ok(BytesMut::from(&buf[..]))
     }
@@ -78,7 +87,19 @@ fn run_mcp_shim() -> anyhow::Result<()> {
     })
     .map_err(|e| anyhow::anyhow!("encode hello: {e}"))?;
     write_frame(&mut stream, &hello)?;
-    let _ = read_frame(&mut stream)?; // HelloOk / HelloRejected
+    // A rejected handshake (version/token mismatch after a partial upgrade)
+    // must be LOUD: silently proceeding leaves the agent's MCP tools failing
+    // with no diagnostic anywhere.
+    let first = read_frame(&mut stream)?;
+    if let Ok(Frame::Control(body)) = parse_frame(first) {
+        if let Ok(ServerMsg::HelloRejected { reason }) = decode_server(&body) {
+            eprintln!(
+                "[taime-mcp] daemon rejected handshake: {reason} \
+                 (app/daemon protocol mismatch? relaunch the agent)"
+            );
+            std::process::exit(1);
+        }
+    }
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -189,6 +210,15 @@ async fn main() -> anyhow::Result<()> {
     manager.load_schedules_on_start();
     manager.seed_example_workflows();
     manager.load_workflow_files();
+    // Startup maintenance, off the accept path: GC clean dead worktrees (the
+    // pre-fix leak left checkouts behind forever) + prune aged history rows.
+    {
+        let m = manager.clone();
+        tokio::task::spawn_blocking(move || {
+            m.sweep_worktrees();
+            m.prune_history();
+        });
+    }
     eprintln!("[taime-daemon] listening on {:?}", paths.socket);
 
     // Signal handler: unlink socket + token, kill children, exit.
@@ -241,6 +271,16 @@ async fn main() -> anyhow::Result<()> {
                 if n % 120 == 0 {
                     let m = mgr.clone();
                     tokio::task::spawn_blocking(move || m.check_schedules());
+                }
+                // Worktree GC every ~10min (shells out to git → spawn_blocking).
+                if n % 2400 == 0 {
+                    let m = mgr.clone();
+                    tokio::task::spawn_blocking(move || m.sweep_worktrees());
+                }
+                // History retention pruning daily.
+                if n % 345_600 == 0 {
+                    let m = mgr.clone();
+                    tokio::task::spawn_blocking(move || m.prune_history());
                 }
             }
         });
