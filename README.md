@@ -42,7 +42,6 @@ desktop/                 the product (Tauri app + workspace root for all crates)
 ├── src/                 React frontend
 ├── src-tauri/           Rust app crate + the two crates above
 └── docs/                architecture-lexicon.md (canonical), packaging.md, plans
-tests/                   headless end-to-end proof of the attribution loop
 ```
 
 ## Quickstart

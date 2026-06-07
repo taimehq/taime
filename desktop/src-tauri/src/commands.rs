@@ -51,8 +51,8 @@ pub fn workspace_info(path: String) -> WorkspaceInfo {
 // PTY path). The daemon owns the PTY + an authoritative wezterm-term grid and
 // survives app crashes; output streams as RAW BYTES over a per-session binary
 // `Channel<InvokeResponseBody>` (no base64). The app's `DaemonClient` bridges the
-// socket to the per-session channel. CAO/tmux remains for the other CLIs and as
-// the launch-failure fallback for Claude until the daemon ships bundled.
+// socket to the per-session channel. The daemon is the ONLY transport — every
+// supported CLI launches through it (CAO/tmux are deleted).
 // ---------------------------------------------------------------------------
 
 use crate::daemon::DaemonClient;
@@ -262,9 +262,9 @@ pub async fn daemon_list(daemon: State<'_, DaemonClient>) -> Result<Vec<SessionS
 }
 
 /// Whether the daemon transport is usable: the daemon binary is resolvable
-/// (so we can spawn it) or one is already running. The frontend uses this to
-/// route Claude through the daemon when available, falling back to CAO when not
-/// (e.g. an unbundled build) — so Claude launches never hard-fail.
+/// (so we can spawn it) or one is already running. The frontend gates launch
+/// affordances on this (there is no fallback transport — the daemon is the
+/// only backend).
 #[tauri::command]
 pub async fn daemon_available(daemon: State<'_, DaemonClient>) -> Result<bool, String> {
     Ok(daemon.available().await)
