@@ -77,9 +77,9 @@ impl Provider for GeminiProvider {
                 ));
                 cwd = Some(ws.to_string_lossy().into_owned());
                 cleanup.push(CleanupAction::RemoveDir(ws));
-                // NOTE(phase1): CAO also pre-trusts the workspace parent; with
-                // --yolo + --sandbox false the trust prompt is bypassed for the
-                // default flow. Restricted/policy launches still route via CAO.
+                // CAO also pre-trusted the workspace parent dir; that pre-trust
+                // was not ported — the `--yolo` + `--sandbox false` base args
+                // bypass the trust prompt for every daemon launch instead.
             }
         }
 

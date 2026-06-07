@@ -31,9 +31,8 @@ import {
 } from "./pty";
 import { providerTitle } from "./lib/providerLabel";
 
-/** Providers the daemon can launch directly (Phase 1 of the CAO replacement). The
- *  default-profile launch routes here; sessions / non-default profiles still go
- *  through CAO until the daemon learns them. */
+/** Providers the daemon can launch via its provider registry. Every launch —
+ *  any profile — routes through the daemon; it is the only transport. */
 const DAEMON_PROVIDERS = new Set(["claude_code", "codex", "gemini_cli", "grok_cli"]);
 
 /** Best-effort provider id from a daemon session's program path (for adopting a
@@ -488,8 +487,9 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   killSession: async (name) => {
-    // Close any open frames for this session first (UI only); the delete below
-    // is what actually terminates the tmux session + its agents on the backend.
+    // Close any open frames for this session first (UI only). The session-delete
+    // below is a no-op stub since the CAO removal (tmux-shaped sessions are
+    // gone) — daemon agents are killed per-frame, not per-session.
     const victims = get().frames.filter((f) => f.sessionName === name);
     for (const f of victims) await get().closeFrame(f.key);
     try {

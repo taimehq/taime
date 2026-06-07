@@ -32,6 +32,7 @@ mod config;
 mod gemini;
 mod grok;
 mod status_util;
+mod tool_mapping;
 
 pub use config::ProvidersConfig;
 

@@ -2,11 +2,11 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { inTauri } from "./backend";
 
 /**
- * Bridge to the detached **session daemon** — the one Rust PTY path for Claude.
- * The daemon owns the PTY + an authoritative wezterm-term grid and survives app
- * crashes; output streams as RAW BYTES over a per-session `Channel` (ArrayBuffer,
- * no base64), with exit/turn as small JSON control objects on the same channel.
- * (CAO/tmux remains for the other CLIs and as the launch fallback for Claude.)
+ * Bridge to the detached **session daemon** — the one Rust PTY path for every
+ * supported CLI (the only transport; CAO/tmux are deleted). The daemon owns the
+ * PTY + an authoritative wezterm-term grid and survives app crashes; output
+ * streams as RAW BYTES over a per-session `Channel` (ArrayBuffer, no base64),
+ * with exit/turn as small JSON control objects on the same channel.
  */
 
 /** A message on the per-session data channel: raw output bytes, or a control
@@ -55,8 +55,8 @@ export interface DaemonSessionSummary {
 /**
  * Launch any supported CLI (`claude_code`/`codex`/`gemini_cli`/`grok_cli`) on the
  * detached session daemon via its provider registry (the daemon owns the launch
- * recipe + MCP injection). The default (unrestricted) profile is used; richer
- * profiles still route through CAO until the daemon learns them.
+ * recipe + MCP injection). The named profile is resolved daemon-side — including
+ * restricted (tool-limited) profiles, enforced in the provider's launch args.
  */
 export async function daemonSpawnAgent(
   provider: string,
@@ -241,17 +241,6 @@ export async function daemonList(): Promise<DaemonSessionSummary[]> {
     return await invoke<DaemonSessionSummary[]>("daemon_list");
   } catch {
     return [];
-  }
-}
-
-/** Whether the daemon transport is usable (binary resolvable or already
- *  running). The launcher routes Claude → daemon when true, else CAO. */
-export async function daemonAvailable(): Promise<boolean> {
-  if (!inTauri()) return false;
-  try {
-    return await invoke<boolean>("daemon_available");
-  } catch {
-    return false;
   }
 }
 

@@ -261,15 +261,6 @@ pub async fn daemon_list(daemon: State<'_, DaemonClient>) -> Result<Vec<SessionS
     daemon.list().await
 }
 
-/// Whether the daemon transport is usable: the daemon binary is resolvable
-/// (so we can spawn it) or one is already running. The frontend gates launch
-/// affordances on this (there is no fallback transport — the daemon is the
-/// only backend).
-#[tauri::command]
-pub async fn daemon_available(daemon: State<'_, DaemonClient>) -> Result<bool, String> {
-    Ok(daemon.available().await)
-}
-
 /// Load an image FILE into the macOS system clipboard (as image data), so a
 /// dragged image can be ingested by a CLI that reads clipboard images on paste
 /// (e.g. Claude Code's Ctrl+V image paste → `[Image #N]`). A web terminal can't

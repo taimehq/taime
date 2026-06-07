@@ -25,8 +25,8 @@ use taime_protocol::{AgentProfile, AgentStatus, McpServerConfig};
 
 use super::config::ProviderDefaults;
 use super::{
-    with_terminal_id, ApprovalPrompt, Cleanup, DaemonSessionSpec, GridView, LaunchOpts, Prepared,
-    Provider,
+    tool_mapping, with_terminal_id, ApprovalPrompt, Cleanup, DaemonSessionSpec, GridView,
+    LaunchOpts, Prepared, Provider,
 };
 
 /// Inherited `CLAUDE*` vars that are SAFE to keep (auth + user preference).
@@ -117,10 +117,17 @@ impl Provider for ClaudeProvider {
                 args.push("--append-system-prompt".into());
                 args.push(escape_system_prompt(sp));
             }
-            // NOTE(phase1): per-tool `--disallowedTools` derivation needs the CAO
-            // tool_mapping table; restricted Claude profiles still go through CAO
-            // until that table is ported. Default (unrestricted) launches are
-            // unaffected.
+        }
+        // Tool restrictions as per-tool `--disallowedTools` pairs (ported from
+        // CAO's claude_code.py:154-159, derived via [`tool_mapping`]): skipping
+        // the permission prompts bypasses *prompts*, but `--disallowedTools`
+        // still blocks the tools entirely — the enforcement lives here, not in
+        // the permission mode. Applies to both routing paths, as in CAO.
+        if tools_restricted(profile) {
+            for tool in tool_mapping::get_disallowed_tools(self.id(), &profile.allowed_tools) {
+                args.push("--disallowedTools".into());
+                args.push(tool);
+            }
         }
         args.extend(self.defaults.base_args.iter().cloned());
 
@@ -272,13 +279,65 @@ mod tests {
     #[test]
     fn restricted_profile_with_mode_uses_permission_mode() {
         let mut prof = profile();
-        prof.allowed_tools = vec!["read".into()];
+        prof.allowed_tools = vec!["fs_read".into()];
         prof.permission_mode = Some("acceptEdits".into());
         let p = ClaudeProvider::new(ProviderDefaults { binary: "claude".into(), base_args: vec![], model_flag: "--model".into(), env: Default::default() });
         let prepared = p.build(&prof, &opts()).unwrap();
         let a = &prepared.spec.args;
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
         assert!(!a.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn restricted_profile_appends_sorted_disallowed_tools() {
+        let mut prof = profile();
+        prof.allowed_tools = vec!["fs_read".into()];
+        prof.permission_mode = Some("acceptEdits".into());
+        let p = ClaudeProvider::new(ProviderDefaults { binary: "claude".into(), base_args: vec![], model_flag: "--model".into(), env: Default::default() });
+        let a = p.build(&prof, &opts()).unwrap().spec.args;
+        // Permission-mode args byte-identical to the pre-disallowedTools build,
+        // then the full sorted complement (all native − Read) as ordered pairs —
+        // and nothing else.
+        let expected: Vec<String> = [
+            "--permission-mode", "acceptEdits",
+            "--disallowedTools", "Bash",
+            "--disallowedTools", "Edit",
+            "--disallowedTools", "Glob",
+            "--disallowedTools", "Grep",
+            "--disallowedTools", "Write",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn restricted_profile_without_mode_keeps_skip_permissions() {
+        // CAO posture: skipping the prompts is unchanged — `--disallowedTools`
+        // IS the enforcement. `fs_*` hits its literal mapping entry → only Bash.
+        let mut prof = profile();
+        prof.allowed_tools = vec!["fs_*".into()];
+        let p = ClaudeProvider::new(ProviderDefaults { binary: "claude".into(), base_args: vec![], model_flag: "--model".into(), env: Default::default() });
+        let a = p.build(&prof, &opts()).unwrap().spec.args;
+        let expected: Vec<String> = ["--dangerously-skip-permissions", "--disallowedTools", "Bash"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn unrestricted_profiles_get_no_disallowed_tools() {
+        // Both unrestricted shapes (empty allow-list, `*` wildcard) build the
+        // exact pre-change arg list: skip-permissions and nothing more.
+        for allowed in [Vec::new(), vec!["*".to_string()]] {
+            let mut prof = profile();
+            prof.allowed_tools = allowed;
+            let p = ClaudeProvider::new(ProviderDefaults { binary: "claude".into(), base_args: vec![], model_flag: "--model".into(), env: Default::default() });
+            let a = p.build(&prof, &opts()).unwrap().spec.args;
+            assert_eq!(a, vec!["--dangerously-skip-permissions".to_string()]);
+        }
     }
 
     #[test]
