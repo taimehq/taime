@@ -77,6 +77,10 @@ struct SessionState {
     last_output: Instant,
     /// Output seen since the last turn boundary (gates the quiet-window close).
     turn_dirty: bool,
+    /// Wall-clock open time of the in-flight turn (set on the first output
+    /// after a boundary, cleared at close). The durable turn record's REAL
+    /// `started_at` — attribution is the thesis; `now, now` was meaningless.
+    turn_started_unix: Option<u64>,
     /// Last status pushed to the attached client (Phase 4 push) — push only on
     /// change.
     last_status: Option<AgentStatus>,
@@ -241,6 +245,7 @@ impl Session {
                 cols: spec.cols,
                 last_output: Instant::now(),
                 turn_dirty: false,
+                turn_started_unix: None,
                 last_status: None,
                 fs_turn_dirty: BTreeSet::new(),
                 fs_all_dirty: BTreeSet::new(),
@@ -374,7 +379,8 @@ impl Session {
         if let Some(mut turn) = st.attr.checkpoint(off) {
             st.turn_dirty = false;
             drain_turn_paths(&mut st, &mut turn);
-            persist_turn(&self.inner, &turn);
+            let started = st.turn_started_unix.take().unwrap_or_else(now_unix_secs);
+            persist_turn(&self.inner, &turn, started);
             if let (Some(c), Ok(frame)) = (
                 st.attached.as_ref(),
                 encode_server(&ServerMsg::TurnBoundary { turn }),
@@ -395,7 +401,8 @@ impl Session {
         if let Some(mut turn) = st.attr.quiet(off) {
             st.turn_dirty = false;
             drain_turn_paths(&mut st, &mut turn);
-            persist_turn(&self.inner, &turn);
+            let started = st.turn_started_unix.take().unwrap_or_else(now_unix_secs);
+            persist_turn(&self.inner, &turn, started);
             if let (Some(c), Ok(frame)) = (
                 st.attached.as_ref(),
                 encode_server(&ServerMsg::TurnBoundary { turn }),
@@ -557,11 +564,19 @@ impl Session {
 
 /// Persist a closed attribution turn to the durable store (best-effort) so the
 /// flagship turn substrate — including its files-touched — survives restarts and
-/// feeds the graph/attribution surface even with the app closed.
-fn persist_turn(inner: &SessionInner, turn: &TurnInfo) {
+/// feeds the graph/attribution surface even with the app closed. `started_at`
+/// is the turn's real wall-clock open (tracked in `SessionState`), so the
+/// record supports chronological analysis of agent work bursts.
+fn persist_turn(inner: &SessionInner, turn: &TurnInfo, started_at_unix: u64) {
     if let (Some(store), Some(key)) = (&inner.store, &inner.attribution_key) {
-        let now = now_unix_secs();
-        let _ = store.record_turn(&gen_event_id(), key, turn.epoch, now, now, &turn.fs_dirty_paths);
+        let _ = store.record_turn(
+            &gen_event_id(),
+            key,
+            turn.epoch,
+            started_at_unix,
+            now_unix_secs(),
+            &turn.fs_dirty_paths,
+        );
     }
 }
 
@@ -636,6 +651,10 @@ fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
             st.term.advance_bytes(chunk);
             let start = st.out_offset;
             let end = start + n as u64;
+            let now_secs = now_unix_secs();
+            // The wall-clock open of the turn this chunk belongs to: the stored
+            // open time, or — first output after a boundary — this instant.
+            let opened_at = st.turn_started_unix.unwrap_or(now_secs);
             let mut turns = st.attr.feed(chunk, end);
             st.out_offset = end;
             st.last_output = Instant::now();
@@ -644,10 +663,18 @@ fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
             if let Some(turn) = turns.last_mut() {
                 drain_turn_paths(st, turn);
             }
-            // Persist every closed turn (durable, regardless of attach).
+            // Persist every closed turn (durable, regardless of attach) with its
+            // REAL start: the first closed turn opened at `opened_at`; any
+            // back-to-back turns closed within this same chunk opened now.
+            let mut started = opened_at;
             for turn in &turns {
-                persist_turn(&inner, turn);
+                persist_turn(&inner, turn, started);
+                started = now_secs;
             }
+            // Trailing output after the last boundary opens the next turn now;
+            // with no boundary in this chunk the in-flight turn keeps its open.
+            st.turn_started_unix =
+                if turns.is_empty() { Some(opened_at) } else { Some(now_secs) };
             if let Some(c) = st.attached.as_mut() {
                 let mut ok = c.out.send(encode_data(start, chunk)).is_ok();
                 for turn in turns {

@@ -535,17 +535,60 @@ impl Store {
     }
 
     /// Inter-agent edges for the activity graph: `(kind, source, target)` from the
-    /// recorded message/request/reply/handoff/assign events (Phase 6), oldest first.
+    /// recorded message/request/reply/handoff/assign events (Phase 6), oldest
+    /// first. Bounded to the most recent window — this runs on every graph
+    /// fetch, and the events table grows with normal use (one row per fs event
+    /// per agent); an unbounded scan would degrade into multi-second queries.
     pub fn activity_edges(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT kind, terminal_id, target_terminal_id FROM taime_activity_events \
-             WHERE target_terminal_id IS NOT NULL ORDER BY ts ASC",
+            "SELECT kind, terminal_id, target_terminal_id FROM ( \
+               SELECT kind, terminal_id, target_terminal_id, ts \
+               FROM taime_activity_events WHERE target_terminal_id IS NOT NULL \
+               ORDER BY CAST(ts AS INTEGER) DESC LIMIT 2000 \
+             ) ORDER BY CAST(ts AS INTEGER) ASC",
         )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Every provisioned worktree row (the GC sweep input).
+    pub fn all_worktrees(&self) -> rusqlite::Result<Vec<WorktreeRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare(&format!("SELECT {WORKTREE_COLS} FROM taime_worktrees"))?;
+        let rows = stmt.query_map([], map_worktree)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Retention pruning for the append-only history tables (startup + daily).
+    /// Windows: activity events + interactions + delivered inbox 30d; turns 90d
+    /// (turns are the attribution substrate — keep the longest useful window).
+    /// Worktree rows are NEVER pruned here (durable Agent-ID anchors).
+    pub fn prune_history(&self, now_unix: u64) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let d30 = now_unix.saturating_sub(30 * 86_400);
+        let d90 = now_unix.saturating_sub(90 * 86_400);
+        let mut n = conn.execute(
+            "DELETE FROM taime_activity_events WHERE CAST(ts AS INTEGER) < ?1",
+            rusqlite::params![d30 as i64],
+        )?;
+        n += conn.execute(
+            "DELETE FROM taime_agent_turns WHERE CAST(ended_at AS INTEGER) < ?1",
+            rusqlite::params![d90 as i64],
+        )?;
+        n += conn.execute(
+            "DELETE FROM taime_interactions WHERE created_at < ?1",
+            rusqlite::params![d30 as i64],
+        )?;
+        // Pending messages are never pruned — only consumed/failed ones age out.
+        n += conn.execute(
+            "DELETE FROM inbox WHERE status != 'pending' AND CAST(created_at AS INTEGER) < ?1",
+            rusqlite::params![d30 as i64],
+        )?;
+        Ok(n)
     }
 
     /// The worktree `(path, base_sha, mode)` for an attribution key — the daemon

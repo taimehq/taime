@@ -44,7 +44,15 @@ pub struct Manager {
     /// Weak handle to our own `Arc`, set once at startup, so methods that spawn a
     /// background driver thread (the Workflow engine) can hand it an owned `Arc`.
     weak_self: std::sync::OnceLock<std::sync::Weak<Manager>>,
+    /// Worktree rows already GC'd this daemon run (checkout removed) — skipped on
+    /// subsequent sweeps so a sweep never re-shells `git` for settled rows.
+    worktrees_gced: Mutex<std::collections::HashSet<String>>,
 }
+
+// LOCK DISCIPLINE: never hold two Manager mutexes at once. The canonical
+// pattern is snapshot-under-one-lock, release, then act (see `broadcast`,
+// `gc_tick`). `sessions` is the hottest lock — in particular, never do SQLite
+// writes or shell out while holding it.
 
 /// One node in the assignment tree: who spawned this worker, and how deep it sits
 /// (a top-level orchestrator is depth 0; its workers depth 1; …).
@@ -205,6 +213,7 @@ impl Manager {
             roles: Mutex::new(HashMap::new()),
             assignments: Mutex::new(HashMap::new()),
             weak_self: std::sync::OnceLock::new(),
+            worktrees_gced: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1057,20 +1066,27 @@ impl Manager {
     /// only those whose role (profile name) matches `role`. Returns the count
     /// enqueued.
     pub fn broadcast(&self, sender: &str, body: &str, role: Option<&str>) -> usize {
-        let roles = self.roles.lock().unwrap();
-        let receivers: Vec<String> = self
+        // Two sequential lock scopes, never nested (see the lock-discipline note
+        // on `Manager`) — holding `roles` across `sessions` was a latent
+        // inversion waiting for any future sessions→roles path to deadlock it.
+        let candidates: Vec<String> = self
             .sessions
             .lock()
             .unwrap()
             .values()
             .filter_map(|s| s.attribution_key())
             .filter(|k| k != sender)
-            .filter(|k| match role {
-                Some(want) => roles.get(k).map(|r| r == want).unwrap_or(false),
-                None => true,
-            })
             .collect();
-        drop(roles);
+        let receivers: Vec<String> = {
+            let roles = self.roles.lock().unwrap();
+            candidates
+                .into_iter()
+                .filter(|k| match role {
+                    Some(want) => roles.get(k).map(|r| r == want).unwrap_or(false),
+                    None => true,
+                })
+                .collect()
+        };
         let mut n = 0;
         for r in receivers {
             if self.enqueue_message(sender.to_string(), r.clone(), body.to_string()).is_ok() {
@@ -1916,21 +1932,96 @@ impl Manager {
         }
     }
 
+    /// Garbage-collect dead agents' isolated worktrees (startup + every ~10min,
+    /// off the hot loop via spawn_blocking — this shells out to git). DELETION
+    /// IS CONSERVATIVE: only checkouts with a clean tree AND a branch still at
+    /// its provision base are removed (plus their `taime/…` branch). Anything
+    /// with uncommitted or committed work is the user's unreviewed output and
+    /// is kept — review-before-merge is the product. Shared-mode rows (the
+    /// user's real project dir) and live agents are never touched. The
+    /// `taime_worktrees` ROW always survives: it's the durable Agent-ID anchor
+    /// for attribution history.
+    pub fn sweep_worktrees(&self) {
+        let Some(store) = &self.store else { return };
+        // Snapshot live keys under the sessions lock, then release (lock
+        // discipline: never shell out under it).
+        let live: std::collections::HashSet<String> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|s| s.attribution_key())
+            .collect();
+        let rows = store.all_worktrees().unwrap_or_default();
+        let (mut removed, mut kept) = (0usize, 0usize);
+        for w in rows {
+            if w.mode.as_deref() != Some("worktree") {
+                continue; // shared mode = the user's real dir; never GC
+            }
+            if live.contains(&w.terminal_id) {
+                continue;
+            }
+            if self.worktrees_gced.lock().unwrap().contains(&w.terminal_id) {
+                continue;
+            }
+            let Some(repo) = w.repo_root.as_deref() else { continue };
+            match crate::worktree::gc_one(
+                &w.worktree_path,
+                repo,
+                w.branch.as_deref(),
+                w.base_sha.as_deref(),
+            ) {
+                crate::worktree::GcOutcome::Removed => {
+                    removed += 1;
+                    self.worktrees_gced.lock().unwrap().insert(w.terminal_id.clone());
+                }
+                crate::worktree::GcOutcome::KeptHasWork => kept += 1,
+                crate::worktree::GcOutcome::KeptUnverified(_) => {}
+            }
+        }
+        if removed > 0 {
+            eprintln!(
+                "[taime-daemon] worktree gc: removed {removed} clean checkout(s), \
+                 kept {kept} with work"
+            );
+        }
+    }
+
+    /// Retention pruning for the history tables (startup + daily; see
+    /// `Store::prune_history` for the windows).
+    pub fn prune_history(&self) {
+        if let Some(store) = &self.store {
+            match store.prune_history(now_unix()) {
+                Ok(n) if n > 0 => eprintln!("[taime-daemon] pruned {n} aged history row(s)"),
+                Ok(_) => {}
+                Err(e) => eprintln!("[taime-daemon] history prune failed: {e}"),
+            }
+        }
+    }
+
     /// Periodic maintenance. Reaps dead sessions (never a live agent), runs the
     /// quiet-window attribution check, and returns `true` when the daemon should
     /// shut down (no sessions + no connected client + idle past `idle_grace`).
     pub fn gc_tick(&self, quiet_threshold: Duration, idle_grace: Duration) -> bool {
         // Reap only DEAD sessions; record their exit + drop their MCP tokens.
+        // Removal happens under the sessions lock; the SQLite writes happen
+        // AFTER it drops — a contended DB write must never block list/attach/
+        // spawn behind this 250ms tick.
         {
-            let mut map = self.sessions.lock().unwrap();
-            let dead: Vec<(String, Option<String>)> = map
-                .iter()
-                .filter(|(_, s)| !s.is_alive())
-                .map(|(k, s)| (k.clone(), s.attribution_key()))
-                .collect();
+            let dead: Vec<(String, Option<String>)> = {
+                let mut map = self.sessions.lock().unwrap();
+                let dead: Vec<(String, Option<String>)> = map
+                    .iter()
+                    .filter(|(_, s)| !s.is_alive())
+                    .map(|(k, s)| (k.clone(), s.attribution_key()))
+                    .collect();
+                for (k, _) in &dead {
+                    map.remove(k);
+                }
+                dead
+            };
             let mut dead_akeys: Vec<String> = Vec::new();
             for (k, akey) in dead {
-                map.remove(&k);
                 if let Some(store) = &self.store {
                     let _ = store.set_session_status(&k, "exited");
                 }
@@ -1938,7 +2029,6 @@ impl Manager {
                     dead_akeys.push(a);
                 }
             }
-            drop(map);
             if !dead_akeys.is_empty() {
                 self.tokens.lock().unwrap().retain(|_, v| !dead_akeys.contains(v));
                 for akey in &dead_akeys {
@@ -1994,6 +2084,7 @@ impl Manager {
             roles: Mutex::new(HashMap::new()),
             assignments: Mutex::new(HashMap::new()),
             weak_self: std::sync::OnceLock::new(),
+            worktrees_gced: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
