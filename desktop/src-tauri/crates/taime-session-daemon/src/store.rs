@@ -256,7 +256,8 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
              ON CONFLICT(terminal_id) DO UPDATE SET \
                worktree_path = excluded.worktree_path, branch = excluded.branch, \
-               base_sha = excluded.base_sha, mode = excluded.mode",
+               base_sha = excluded.base_sha, mode = excluded.mode, \
+               created_at = excluded.created_at",
             rusqlite::params![
                 info.terminal_key,
                 info.project_root,
