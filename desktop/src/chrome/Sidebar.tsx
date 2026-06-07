@@ -5,6 +5,8 @@ import {
   ChevronRight,
   Cpu,
   Folder,
+  Info,
+  Palette,
   Plus,
   type LucideIcon,
 } from "lucide-react";
@@ -143,36 +145,14 @@ const TASK_GROUPS: { status: string; label: string; defaultOpen: boolean }[] = [
 function TaskFirstPanel() {
   const workspaceDir = useStore((s) => s.workspaceDir);
   const connected = useStore((s) => s.connected);
-  const { tasks, reload } = useTasks(workspaceDir);
-  const [draft, setDraft] = useState<string | null>(null); // null = closed
-  const [creating, setCreating] = useState(false);
-
-  const submitNewTask = async () => {
-    const title = draft?.trim();
-    if (!title || !workspaceDir || creating) return;
-    setCreating(true);
-    try {
-      const t = await api.createTask(workspaceDir, title);
-      if (t) {
-        setDraft(null);
-        reload();
-        useStore.getState().selectTask(t.id);
-      } else {
-        useStore.getState().showSnackbar({
-          type: "error",
-          message: "Task create failed — daemon unreachable",
-        });
-      }
-    } finally {
-      setCreating(false);
-    }
-  };
+  const setNewTaskOpen = useStore((s) => s.setNewTaskOpen);
+  const { tasks } = useTasks(workspaceDir);
 
   return (
     <>
       <SidebarHead title="Tasks">
         <button
-          onClick={() => setDraft("")}
+          onClick={() => setNewTaskOpen(true)}
           disabled={!workspaceDir || !connected}
           title={
             workspaceDir ? "New task" : "Open a workspace to create tasks"
@@ -185,21 +165,6 @@ function TaskFirstPanel() {
       </SidebarHead>
 
       <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-2">
-        {draft !== null && (
-          <input
-            autoFocus
-            value={draft}
-            disabled={creating}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void submitNewTask();
-              if (e.key === "Escape") setDraft(null);
-            }}
-            placeholder="Task title — Enter to create"
-            className="mb-1 w-full rounded-md border border-ink-500 bg-ink-700 px-2 py-1.5 text-xs text-zinc-200 placeholder:text-zinc-600 disabled:opacity-60"
-          />
-        )}
-
         {TASK_GROUPS.map((g) => {
           const group = tasks.filter((t) => t.status === g.status);
           return (
@@ -517,6 +482,8 @@ function SchedulesSidebar() {
   const [schedules, setSchedules] = useState<ScheduleInfo[]>([]);
   const selected = useStore((s) => s.selectedSchedule);
   const setSelectedSchedule = useStore((s) => s.setSelectedSchedule);
+  const setNewScheduleOpen = useStore((s) => s.setNewScheduleOpen);
+  const connected = useStore((s) => s.connected);
 
   useEffect(() => {
     let alive = true;
@@ -537,7 +504,17 @@ function SchedulesSidebar() {
 
   return (
     <>
-      <SidebarHead title="Schedules" />
+      <SidebarHead title="Schedules">
+        <button
+          onClick={() => setNewScheduleOpen(true)}
+          disabled={!connected}
+          title={connected ? "New schedule" : "Daemon unreachable"}
+          aria-label="New schedule"
+          className="rounded p-1 text-zinc-500 hover:bg-ink-600 hover:text-zinc-200 disabled:cursor-default disabled:opacity-40"
+        >
+          <Plus size={13} />
+        </button>
+      </SidebarHead>
       <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-2">
         {schedules.length === 0 ? (
           <p className="px-2 py-1 text-[11px] text-zinc-600">
@@ -576,6 +553,8 @@ const SETTINGS_NAV: { id: string; icon: LucideIcon; label: string }[] = [
   { id: "workspace", icon: Folder, label: "Workspace" },
   { id: "providers", icon: Cpu, label: "Providers" },
   { id: "profiles", icon: Bot, label: "Agent profiles" },
+  { id: "appearance", icon: Palette, label: "Appearance" },
+  { id: "about", icon: Info, label: "About" },
 ];
 
 function SettingsSidebar() {

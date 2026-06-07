@@ -71,9 +71,13 @@ interface Placed {
  */
 export function WorkflowGraph({
   workflow,
+  taskId = null,
   onClose,
 }: {
   workflow: WorkflowInfo;
+  /** Run scope: the Task new runs (and their node agents) join — the screen's
+   *  run-scope selector threads it here so the drawer's Run matches. */
+  taskId?: string | null;
   onClose: () => void;
 }) {
   const [runId, setRunId] = useState<string | null>(workflow.last_run?.id ?? null);
@@ -127,7 +131,11 @@ export function WorkflowGraph({
     setStarting(true);
     setStartError(null);
     try {
-      const res = await api.runWorkflow(workflow.name, useStore.getState().workspaceDir);
+      const res = await api.runWorkflow(
+        workflow.name,
+        useStore.getState().workspaceDir,
+        taskId,
+      );
       if (!mounted.current) return;
       if (res.error || !res.run_id) {
         setStartError(res.error ?? "Failed to start run");
@@ -140,7 +148,7 @@ export function WorkflowGraph({
     } finally {
       if (mounted.current) setStarting(false);
     }
-  }, [workflow.name]);
+  }, [workflow.name, taskId]);
 
   const nodeStates: Record<string, WorkflowNodeState> = run?.node_states ?? {};
 
@@ -216,7 +224,7 @@ export function WorkflowGraph({
   const pill = statusPill(run?.status);
 
   return (
-    <aside className="fixed right-0 top-12 bottom-0 z-40 flex w-[460px] flex-col border-l border-t border-ink-600 bg-ink-900 shadow-2xl">
+    <aside className="fixed right-0 top-10 bottom-0 z-40 flex w-[460px] flex-col border-l border-t border-ink-600 bg-ink-900 shadow-2xl">
       {/* Header */}
       <div className="flex items-center gap-2 border-b border-ink-600 bg-ink-800 px-3 py-2.5">
         <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -368,6 +376,8 @@ export function WorkflowGraph({
               const style = nodeStyle(st?.status);
               const clickable = !!st?.agent_id;
               const iter = st && st.iteration > 1 ? `×${st.iteration}` : "";
+              // The daemon serializes `profile`; `role` is the legacy alias.
+              const profileLabel = n.profile ?? n.role ?? "default";
               return (
                 <g
                   key={n.id}
@@ -398,7 +408,9 @@ export function WorkflowGraph({
                     {n.id.length > 18 ? `${n.id.slice(0, 17)}…` : n.id}
                   </text>
                   <text x="13" y="34" fontSize="9" fill="#8a919d">
-                    {n.role.length > 22 ? `${n.role.slice(0, 21)}…` : n.role}
+                    {profileLabel.length > 22
+                      ? `${profileLabel.slice(0, 21)}…`
+                      : profileLabel}
                   </text>
                   {iter && (
                     <text

@@ -17,7 +17,7 @@ import { basename, dirname } from "../lib/recentProjects";
 import { pickDirectory } from "../lib/pickDirectory";
 import { useFullscreen } from "../hooks/useFullscreen";
 import { useTasks } from "../hooks/useTasks";
-import { NotificationsDrawer } from "./NotificationsDrawer";
+import { NotificationsDrawer } from "../components/NotificationsDrawer";
 
 /**
  * The 40px unified macOS title bar: [traffic-light reserve + workspace

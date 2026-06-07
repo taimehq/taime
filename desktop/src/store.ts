@@ -299,6 +299,14 @@ interface Store {
   /** When true, the launch-agent dialog is open. Store-owned so both the
    *  sidebar button and the command palette can open it. */
   launchOpen: boolean;
+  /** Task the launch dialog should preselect (set alongside launchOpen by the
+   *  Task screen's "Launch one" buttons; null ⇒ Uncategorized default). The
+   *  dialog consumes it at mount; closing the dialog clears it. */
+  launchPresetTaskId: string | null;
+  /** When true, the New-task dialog is open (palette / sidebar "+"). */
+  newTaskOpen: boolean;
+  /** When true, the Add-schedule dialog is open (palette / schedules "+"). */
+  newScheduleOpen: boolean;
   snackbar: Snackbar | null;
 
   // preferences (persisted via lib/preferences.ts)
@@ -319,6 +327,9 @@ interface Store {
   selectTask: (taskId: string, tab?: TaskTab) => void;
   /** The Task screen consumes the one-shot deep-link tab, then clears it. */
   clearTaskInitialTab: () => void;
+  /** Clear the task selection (after a successful delete — the row is gone, so
+   *  the screen returns to its select-a-task hint instead of "not found"). */
+  clearSelectedTask: () => void;
   setSelectedWorkflow: (id: string | null) => void;
   setSelectedSchedule: (id: string | null) => void;
   setSettingsTab: (tab: string) => void;
@@ -400,7 +411,11 @@ interface Store {
   closeDiff: () => void;
   setGraphOpen: (open: boolean) => void;
   setCommandPaletteOpen: (open: boolean) => void;
-  setLaunchOpen: (open: boolean) => void;
+  /** Open/close the launch dialog. `presetTaskId` preselects the Task step
+   *  (the Task screen's "Launch one" path); ignored on close, always cleared. */
+  setLaunchOpen: (open: boolean, presetTaskId?: string | null) => void;
+  setNewTaskOpen: (open: boolean) => void;
+  setNewScheduleOpen: (open: boolean) => void;
   setLayoutMode: (mode: LayoutMode) => void;
   toggleLayoutMode: () => void;
 
@@ -481,6 +496,9 @@ export const useStore = create<Store>((set, get) => ({
   graphOpen: false,
   commandPaletteOpen: false,
   launchOpen: false,
+  launchPresetTaskId: null,
+  newTaskOpen: false,
+  newScheduleOpen: false,
   snackbar: null,
 
   setConnected: (connected) => {
@@ -522,6 +540,8 @@ export const useStore = create<Store>((set, get) => ({
   clearTaskInitialTab: () => {
     if (get().taskInitialTab !== null) set({ taskInitialTab: null });
   },
+
+  clearSelectedTask: () => set({ selectedTaskId: null, taskInitialTab: null }),
 
   setSelectedWorkflow: (selectedWorkflow) => set({ selectedWorkflow }),
   setSelectedSchedule: (selectedSchedule) => set({ selectedSchedule }),
@@ -1012,7 +1032,10 @@ export const useStore = create<Store>((set, get) => ({
   // Mutually exclusive with the Task Review drawer (same right-edge geometry).
   setGraphOpen: (graphOpen) => set(graphOpen ? { graphOpen, taskReviewId: null } : { graphOpen }),
   setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
-  setLaunchOpen: (launchOpen) => set({ launchOpen }),
+  setLaunchOpen: (launchOpen, presetTaskId) =>
+    set({ launchOpen, launchPresetTaskId: launchOpen ? (presetTaskId ?? null) : null }),
+  setNewTaskOpen: (newTaskOpen) => set({ newTaskOpen }),
+  setNewScheduleOpen: (newScheduleOpen) => set({ newScheduleOpen }),
   setLayoutMode: (layoutMode) => set({ layoutMode }),
   toggleLayoutMode: () =>
     set((s) => ({ layoutMode: s.layoutMode === "grid" ? "focus" : "grid" })),

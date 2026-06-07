@@ -18,6 +18,8 @@ import { WorkflowsScreen } from "./screens/WorkflowsScreen";
 import { SchedulesScreen } from "./screens/SchedulesScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
 import { LaunchAgentDialog } from "./components/LaunchAgentDialog";
+import { NewTaskDialog } from "./components/NewTaskDialog";
+import { AddScheduleDialog } from "./components/AddScheduleDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { Snackbar } from "./components/Snackbar";
 import { ContextSwitchGuard } from "./components/ContextSwitchGuard";
@@ -26,19 +28,16 @@ import { useRustPtyReconcile } from "./hooks/useRustPtyReconcile";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
 
 // Defer the Monaco-heavy overlays out of the initial bundle — they load only
-// when the user opens a diff or the activity graph.
+// when the user opens a diff or the activity graph. (The old TaskReviewDrawer
+// mount is gone: the Tasks screen's Review tab is the task review surface.)
 const DiffView = lazy(() =>
   import("./components/DiffView").then((m) => ({ default: m.DiffView })),
 );
 const ActivityGraph = lazy(() =>
   import("./components/ActivityGraph").then((m) => ({ default: m.ActivityGraph })),
 );
-const TaskReviewDrawer = lazy(() =>
-  import("./components/TaskReviewDrawer").then((m) => ({ default: m.TaskReviewDrawer })),
-);
 
-/** Section → screen. Agents = the working shell grid; the other screens are
- *  placeholders the Screens phase replaces. */
+/** Section → screen. */
 function Screen({ section }: { section: Section }) {
   switch (section) {
     case "tasks":
@@ -62,6 +61,10 @@ export default function App() {
   // it too (not just the sidebar button).
   const launchOpen = useStore((s) => s.launchOpen);
   const setLaunchOpen = useStore((s) => s.setLaunchOpen);
+  const newTaskOpen = useStore((s) => s.newTaskOpen);
+  const setNewTaskOpen = useStore((s) => s.setNewTaskOpen);
+  const newScheduleOpen = useStore((s) => s.newScheduleOpen);
+  const setNewScheduleOpen = useStore((s) => s.setNewScheduleOpen);
   const connected = useStore((s) => s.connected);
   const openDiff = useStore((s) => s.openDiff);
   const section = useStore((s) => s.section);
@@ -111,12 +114,19 @@ export default function App() {
         </main>
       </div>
       {launchOpen && <LaunchAgentDialog onClose={() => setLaunchOpen(false)} />}
+      {newTaskOpen && <NewTaskDialog onClose={() => setNewTaskOpen(false)} />}
+      {newScheduleOpen && (
+        // The 5s schedule polls (sidebar + screen) surface the new row.
+        <AddScheduleDialog
+          onClose={() => setNewScheduleOpen(false)}
+          onSaved={() => {}}
+        />
+      )}
       <CommandPalette />
       <ContextSwitchGuard onReview={openDiff} />
       <Suspense fallback={null}>
         <DiffView />
         <ActivityGraph />
-        <TaskReviewDrawer />
       </Suspense>
       <Snackbar />
     </div>
