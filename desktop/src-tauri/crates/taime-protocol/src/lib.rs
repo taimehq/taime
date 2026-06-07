@@ -45,9 +45,11 @@ pub const MAGIC: u32 = 0x7461_696d;
 /// v6: added `GetGraph`/`Graph` (Phase 6 daemon-side activity graph).
 /// v7: added `Query`/`QueryResult` (Phase 6 daemon query RPC: diff/contention/
 ///     sessions/worktree/attribution — the route-layer migration).
+/// v8: parity pass — `StatusChanged` push (Phase 4), `FsDirty` push +
+///     `TurnInfo.fs_dirty_paths` populated (Phase 6 daemon fs-watch).
 /// Postcard is positional, so these are wire-layout changes — a stale older
 /// daemon is rejected at handshake and the app falls back rather than misparsing.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Feature flags negotiated in the handshake (`capabilities` bitset). Reserving
 /// the bits now keeps app-update-while-old-daemon-running safe.
@@ -312,6 +314,13 @@ pub enum ServerMsg {
     Exited { code: Option<i32> },
     /// Attribution: a turn boundary was detected.
     TurnBoundary { turn: TurnInfo },
+    /// Push: the attached session's inferred status changed (Phase 4) — so the
+    /// badge updates instantly instead of waiting for the next `daemon_list` poll.
+    StatusChanged { status: AgentStatus },
+    /// Push: filesystem paths the daemon's per-session watcher saw change since
+    /// the last push (Phase 6 daemon-owned fs attribution) — drives the dirty
+    /// badge without an app-side watcher.
+    FsDirty { paths: Vec<String> },
     /// Ranged history response (reserved; unimplemented in Step 2).
     HistoryLines { session_id: String, lines: Vec<String>, base_seq: u64 },
     Heartbeat,
@@ -392,7 +401,8 @@ pub struct TurnInfo {
     pub ended_cause: Cause,
     /// Exit code if this turn ended on an OSC 133 ;D with a status.
     pub command_exit: Option<i32>,
-    /// Filesystem paths reported dirty during this turn (correlated by the app).
+    /// Filesystem paths the daemon's per-session watcher saw change during this
+    /// turn (Phase 6 — daemon-owned fs attribution).
     pub fs_dirty_paths: Vec<String>,
 }
 

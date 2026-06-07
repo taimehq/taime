@@ -3,10 +3,8 @@
 
 mod commands;
 mod daemon;
-mod fs_watch;
 
 use daemon::DaemonClient;
-use fs_watch::FsWatchState;
 
 fn main() {
     println!("[taime] backend: taime-session-daemon (detached; CAO/tmux removed)");
@@ -16,7 +14,6 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             use tauri::Manager;
-            app.manage(FsWatchState::new());
             // App-side client to the detached session daemon — the one (and only)
             // backend now. Resolved next to the app exe (dev) or in Resources
             // (bundle); the daemon OUTLIVES the app (not a supervised sidecar —
@@ -35,9 +32,6 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::workspace_info,
-            commands::watch_terminal,
-            commands::unwatch_terminal,
-            commands::clear_dirty,
             commands::daemon_spawn_agent,
             commands::daemon_provision_worktree,
             commands::daemon_send_message,

@@ -80,6 +80,17 @@ pub fn acquire_lock(path: &Path) -> io::Result<Option<LockGuard>> {
         .open(path)?;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
+        // Record our pid in the lock file (best-effort) so a client that hits a
+        // protocol-version mismatch after an app upgrade can target THIS daemon for
+        // replacement. The flock — not the pid — remains the liveness source of
+        // truth; the pid is read only right after a confirmed live handshake, so
+        // it's the current lock holder (no PID-reuse ambiguity).
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = file;
+        let _ = file.set_len(0);
+        let _ = file.seek(SeekFrom::Start(0));
+        let _ = writeln!(file, "{}", std::process::id());
+        let _ = file.flush();
         Ok(Some(LockGuard { _file: file }))
     } else {
         let err = io::Error::last_os_error();
@@ -113,6 +124,21 @@ mod tests {
     fn default_paths_fit_sun_path() {
         let p = default_paths().unwrap();
         assert!(p.socket.as_os_str().len() < SUN_PATH_MAX);
+    }
+
+    #[test]
+    fn acquire_lock_records_our_pid() {
+        // The pid is written so a client hitting a protocol mismatch can target
+        // this daemon for replacement after an app upgrade.
+        let dir = std::env::temp_dir().join(format!("taime-pid-test-{}", unsafe { libc::getpid() }));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("x.lock");
+        let g = acquire_lock(&lock).unwrap();
+        assert!(g.is_some());
+        let recorded: i32 = std::fs::read_to_string(&lock).unwrap().trim().parse().unwrap();
+        assert_eq!(recorded, unsafe { libc::getpid() });
+        drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

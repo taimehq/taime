@@ -125,8 +125,14 @@ pub async fn handle(stream: UnixStream, manager: Arc<Manager>, token: String) {
                 }
             }
             ClientMsg::SendMessage { req_id, sender, receiver, message } => {
-                match manager.enqueue_message(sender, receiver, message) {
-                    Ok(id) => send(&out_tx, &ServerMsg::MessageQueued { req_id, id }).await,
+                match manager.enqueue_message(sender.clone(), receiver.clone(), message) {
+                    Ok(id) => {
+                        // Record the message as a graph edge too (parity with the
+                        // MCP send_message path), so the ops/app message path is
+                        // attributed in the activity graph.
+                        manager.record_edge("message", &sender, &receiver);
+                        send(&out_tx, &ServerMsg::MessageQueued { req_id, id }).await
+                    }
                     Err(e) => send(&out_tx, &ServerMsg::Error { message: e }).await,
                 }
             }

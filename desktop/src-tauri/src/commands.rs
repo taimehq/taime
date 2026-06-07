@@ -1,9 +1,7 @@
 //! Tauri IPC commands — the Rust↔React bridge.
 
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{AppHandle, State};
-
-use crate::fs_watch::FsWatchState;
+use tauri::State;
 
 /// Probe a candidate project dir for the workspace picker. Done **app-side** (a
 /// direct git read) rather than via the daemon, so the badge resolves on first
@@ -47,29 +45,6 @@ pub fn workspace_info(path: String) -> WorkspaceInfo {
     }
 }
 
-/// Start watching `dir` for the given terminal; dirty-state events are emitted
-/// as `terminal://{id}/fs-dirty`.
-#[tauri::command]
-pub fn watch_terminal(
-    app: AppHandle,
-    fs: State<'_, FsWatchState>,
-    terminal_id: String,
-    dir: String,
-) -> Result<(), String> {
-    fs.watch_terminal(&app, terminal_id, dir)
-}
-
-/// Stop watching for the given terminal (e.g. when its frame closes).
-#[tauri::command]
-pub fn unwatch_terminal(fs: State<'_, FsWatchState>, terminal_id: String) {
-    fs.unwatch_terminal(terminal_id);
-}
-
-/// Clear accumulated dirty state for a terminal (e.g. after the user reviews).
-#[tauri::command]
-pub fn clear_dirty(fs: State<'_, FsWatchState>, terminal_id: String) {
-    fs.clear_dirty(terminal_id);
-}
 
 // ---------------------------------------------------------------------------
 // Claude terminal transport: the detached `taime-session-daemon` (the ONE Rust
@@ -109,11 +84,15 @@ fn default_agent_spec(
     model: Option<String>,
     permission_mode: Option<String>,
     inject_orchestration: bool,
+    profile: String,
 ) -> AgentSpawnSpec {
     AgentSpawnSpec {
         provider,
         profile: AgentProfile {
-            name: "default".to_string(),
+            // The daemon resolves this name against its profile store
+            // (~/.taime/agents/*.toml + built-ins) and fills system_prompt/model/
+            // tools when we leave them unset.
+            name: profile,
             model,
             permission_mode,
             ..Default::default()
@@ -182,6 +161,7 @@ pub async fn daemon_spawn_agent(
     permission_mode: Option<String>,
     attribution_key: Option<String>,
     inject_orchestration: Option<bool>,
+    profile: Option<String>,
 ) -> Result<String, String> {
     let spec = default_agent_spec(
         provider,
@@ -192,6 +172,7 @@ pub async fn daemon_spawn_agent(
         model,
         permission_mode,
         inject_orchestration.unwrap_or(false),
+        profile.unwrap_or_else(|| "default".to_string()),
     );
     daemon.spawn_agent(spec).await
 }

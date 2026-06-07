@@ -6,7 +6,8 @@
 //! Boundary signals are **plural**, ranked by trust (the plan): app checkpoints
 //! (strongest, spoof-proof — the app knows when it pressed Enter / launched an
 //! agent), then OSC 133 semantic prompts, then output quiet-windows, then
-//! fs-event correlation (done app-side), then process lifecycle.
+//! process lifecycle. Each closed turn's `fs_dirty_paths` is filled by the
+//! session from its daemon-owned fs-watcher (Phase 6).
 //!
 //! We run a **parallel `termwiz` escape parser tap** over the same byte stream
 //! the emulator sees, because `wezterm-term` parses then *discards* the OSC 133
@@ -60,7 +61,9 @@ impl Attribution {
             started_cause: self.started_cause,
             ended_cause,
             command_exit: exit,
-            fs_dirty_paths: Vec::new(), // filled app-side by fs-event correlation
+            // Filled by the session from its fs-watcher's per-turn set right after
+            // this turn closes (Phase 6 daemon-owned fs attribution).
+            fs_dirty_paths: Vec::new(),
         };
         // Open the next turn.
         self.epoch += 1;
