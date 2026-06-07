@@ -1703,8 +1703,18 @@ impl Manager {
         let (def2, run2, caller2, task2) = (def, run_id.clone(), caller, task_id);
         let arc2 = arc.clone();
         std::thread::spawn(move || {
+            // Drop guard so the slot releases on ANY exit — including a panic
+            // unwinding out of the engine (a poisoned store mutex is the live
+            // candidate). A leaked slot would consume the cap until daemon
+            // restart; eight leaks would reject workflows forever.
+            struct Slot(Arc<Manager>);
+            impl Drop for Slot {
+                fn drop(&mut self) {
+                    self.0.active_workflow_runs.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _slot = Slot(arc2);
             crate::workflow_engine::run(arc, def2, run2, project_root, provider, caller2, task2);
-            arc2.active_workflow_runs.fetch_sub(1, Ordering::SeqCst);
         });
         Ok(run_id)
     }
