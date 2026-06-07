@@ -116,7 +116,7 @@ export function SchedulesScreen() {
   return (
     <div className="flex h-full flex-col overflow-hidden">
       {!connected && (
-        <div className="shrink-0 border-b border-ink-600 bg-ink-800 px-4 py-1.5 text-[11px] text-amber">
+        <div className="shrink-0 border-b border-amber/30 bg-amber/10 px-4 py-1 text-[11px] text-amber">
           daemon unreachable · retrying
         </div>
       )}
@@ -164,7 +164,7 @@ function CenterNote({
             onClick={action.onClick}
             disabled={!action.enabled}
             title={action.enabled ? action.label : "Daemon unreachable"}
-            className="flex items-center gap-1 rounded-lg border border-ink-500 px-2.5 py-1 text-xs text-zinc-300 hover:bg-ink-600 disabled:cursor-default disabled:opacity-50"
+            className="flex items-center gap-1 rounded-md border border-ink-500 px-2.5 py-1 text-xs text-zinc-300 hover:bg-ink-600 disabled:cursor-default disabled:opacity-50"
           >
             <Plus size={12} />
             {action.label}
@@ -405,7 +405,7 @@ function ScheduleDetail({
 
           {/* Task behavior */}
           <section>
-            <h2 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+            <h2 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
               Task behavior on fire
             </h2>
             <TaskBehavior sc={sc} fixedTaskTitle={fixedTaskTitle} />
@@ -419,7 +419,7 @@ function ScheduleDetail({
           {/* Definition body */}
           <section>
             <div className="mb-2 flex items-baseline gap-2">
-              <h2 className="text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+              <h2 className="text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
                 Definition body
               </h2>
               <span className="min-w-0 truncate font-mono text-[10px] text-zinc-700">
@@ -459,7 +459,7 @@ function MetaCard({
 }) {
   return (
     <div className="rounded-lg border border-ink-600 bg-ink-800 px-3 py-2.5">
-      <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+      <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
         <Icon size={11} className="shrink-0" />
         {label}
       </div>

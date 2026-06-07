@@ -3,6 +3,7 @@ import {
   api,
   type AgentSummary,
 } from "./api";
+import { inTauri } from "./backend";
 import {
   loadRecentProjects,
   saveRecentProjects,
@@ -381,10 +382,6 @@ interface Store {
   /** Refresh each tracked agent's Task membership from a daemon list (the
    *  reconcile tick) — keeps the sidebar grouping fresh after reassignment. */
   syncDaemonTaskIds: (sessions: DaemonSessionSummary[]) => void;
-  /** Task whose review drawer is open (null = closed). */
-  taskReviewId: string | null;
-  openTaskReview: (taskId: string) => void;
-  closeTaskReview: () => void;
   /** Reopen a detached (still-running) Rust-PTY agent in a new frame. */
   reopenRustPty: (ptySessionId: string, opts?: { focus?: boolean }) => void;
   /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
@@ -635,6 +632,10 @@ export const useStore = create<Store>((set, get) => ({
   setIsolationEnabled: (isolationEnabled) => set({ isolationEnabled }),
 
   fetchAgents: async () => {
+    // Outside Tauri, daemonQuery answers with its static fallback — that proves
+    // nothing about the daemon, so never let it claim reachability. The whole
+    // UI then presents its designed daemon-down surfaces (the honest state).
+    if (!inTauri()) return;
     try {
       const agents = await api.listAgents();
       const prev = get();
@@ -849,12 +850,6 @@ export const useStore = create<Store>((set, get) => ({
       };
     }),
 
-  taskReviewId: null,
-  // The two right drawers (Task Review / Team graph) share the same geometry —
-  // opening one closes the other so they never stack invisibly.
-  openTaskReview: (taskId) => set({ taskReviewId: taskId, graphOpen: false }),
-  closeTaskReview: () => set({ taskReviewId: null }),
-
   recordTurn: (frameKey, turn) =>
     set((s) => {
       const prev = s.frameTurns[frameKey] ?? [];
@@ -1029,8 +1024,7 @@ export const useStore = create<Store>((set, get) => ({
 
   openDiff: (terminalId) => set({ diffTerminalId: terminalId }),
   closeDiff: () => set({ diffTerminalId: null }),
-  // Mutually exclusive with the Task Review drawer (same right-edge geometry).
-  setGraphOpen: (graphOpen) => set(graphOpen ? { graphOpen, taskReviewId: null } : { graphOpen }),
+  setGraphOpen: (graphOpen) => set({ graphOpen }),
   setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
   setLaunchOpen: (launchOpen, presetTaskId) =>
     set({ launchOpen, launchPresetTaskId: launchOpen ? (presetTaskId ?? null) : null }),

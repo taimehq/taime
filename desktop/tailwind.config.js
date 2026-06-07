@@ -83,6 +83,15 @@ export default {
       borderColor: {
         hairline: "rgba(255, 255, 255, 0.08)",
       },
+      // The design system's small-radius family (xs 3 / sm 5 / md 7 / lg 10)
+      // mapped onto the existing utility names: chips `rounded`, controls
+      // `rounded-md`, cards/panels `rounded-lg`, dialogs `rounded-xl`.
+      borderRadius: {
+        DEFAULT: "3px",
+        md: "5px",
+        lg: "7px",
+        xl: "10px",
+      },
       fontFamily: {
         sans: [
           "Geist",

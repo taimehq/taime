@@ -53,7 +53,7 @@ export function DiffPanel({ agentId }: { agentId: string | null }) {
   return (
     <div className="flex h-full flex-col">
       <div className="flex shrink-0 items-center gap-2 border-b border-ink-600 px-3 py-1.5">
-        <span className="text-[10px] uppercase tracking-wide text-zinc-600">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
           Changes vs base
         </span>
         {files && files.length > 0 && (
@@ -75,7 +75,7 @@ export function DiffPanel({ agentId }: { agentId: string | null }) {
         </button>
         <button
           onClick={() => openDiff(agentId)}
-          className="flex items-center gap-1.5 rounded-md bg-teal-600 px-2.5 py-1 text-[11px] font-medium text-white hover:brightness-110"
+          className="flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1 text-[11px] font-medium text-white hover:bg-primary-hover"
         >
           <GitMerge size={12} />
           Open full review

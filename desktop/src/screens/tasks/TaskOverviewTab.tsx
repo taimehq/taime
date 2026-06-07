@@ -109,7 +109,7 @@ export function TaskOverviewTab({
     <div className="h-full space-y-5 overflow-y-auto p-4">
       {/* Description */}
       <section>
-        <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+        <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
           Description
         </h3>
         {task.description ? (
@@ -185,7 +185,7 @@ export function TaskOverviewTab({
 
       {/* Member agents — attribution stays per Agent ID; click → terminal */}
       <section>
-        <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+        <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
           Member agents
         </h3>
         {members.length === 0 ? (
@@ -194,7 +194,7 @@ export function TaskOverviewTab({
             <button
               onClick={() => setLaunchOpen(true, taskId)}
               disabled={!connected}
-              className="flex items-center gap-1.5 rounded-lg border border-ink-500 px-3 py-1.5 text-xs text-zinc-300 hover:bg-ink-600 disabled:cursor-default disabled:opacity-40"
+              className="flex items-center gap-1.5 rounded-md border border-ink-500 px-3 py-1.5 text-xs text-zinc-300 hover:bg-ink-600 disabled:cursor-default disabled:opacity-40"
             >
               <Plus size={13} />
               Launch one
@@ -202,7 +202,7 @@ export function TaskOverviewTab({
           </div>
         ) : (
           <div className="max-w-3xl overflow-hidden rounded-lg border border-ink-600">
-            <div className="grid grid-cols-[110px_minmax(0,1fr)_110px_120px_56px] gap-2 border-b border-ink-600 bg-ink-800 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+            <div className="grid grid-cols-[110px_minmax(0,1fr)_110px_120px_56px] gap-2 border-b border-ink-600 bg-ink-800 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
               <span>Status</span>
               <span>Agent</span>
               <span>Profile</span>
@@ -259,7 +259,7 @@ export function TaskOverviewTab({
         <button
           onClick={() => void onDelete()}
           disabled={deleting || !connected}
-          className="rounded-lg border border-rose-500/50 px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40"
+          className="rounded-md border border-rose-500/50 px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40"
         >
           {deleting
             ? "Deleting…"

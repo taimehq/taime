@@ -15,9 +15,10 @@ interface FeedItem {
   subTitle?: string;
 }
 
+// Mirrors the bell drawer's attention grammar — blocked amber, review accent.
 const KIND_DOT: Record<string, string> = {
   blocked: "bg-amber",
-  review: "bg-amber",
+  review: "bg-accent",
   error: "bg-red-400",
   exited: "bg-zinc-600",
 };
