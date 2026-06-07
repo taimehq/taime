@@ -21,13 +21,16 @@ const LABEL: Record<BackendState["status"], string> = {
 export function BackendStatusPill({ state }: { state: BackendState }) {
   return (
     <div
-      className="no-drag flex items-center gap-2.5 rounded-full border border-ink-500 bg-ink-700 px-3.5 py-1.5 text-xs"
+      className="no-drag flex h-[26px] min-w-0 items-center gap-2 rounded-full border border-ink-500 bg-ink-700 px-2.5 text-[11px]"
       title={state.detail}
     >
-      <span className={`h-2 w-2 rounded-full ${DOT[state.status]}`} />
-      <span className="text-zinc-200">{LABEL[state.status]}</span>
+      <span className={`h-2 w-2 shrink-0 rounded-full ${DOT[state.status]}`} />
+      {/* Truncation contract: status labels never wrap — truncate at min width. */}
+      <span className="min-w-0 truncate whitespace-nowrap text-zinc-200">
+        {LABEL[state.status]}
+      </span>
       {state.external && (
-        <span className="rounded bg-ink-500 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-400">
+        <span className="shrink-0 rounded bg-ink-500 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-400">
           ext
         </span>
       )}

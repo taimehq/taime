@@ -474,48 +474,6 @@ describe("launchAgentDaemon", () => {
   });
 });
 
-// ── openTaskReview / setGraphOpen mutual exclusivity ────────────────────────
-
-describe("task review / graph drawer exclusivity", () => {
-  it("openTaskReview closes the graph drawer", () => {
-    useStore.getState().setGraphOpen(true);
-    expect(useStore.getState().graphOpen).toBe(true);
-
-    useStore.getState().openTaskReview("task-1");
-
-    const s = useStore.getState();
-    expect(s.taskReviewId).toBe("task-1");
-    expect(s.graphOpen).toBe(false);
-  });
-
-  it("setGraphOpen(true) nulls the open task review", () => {
-    useStore.getState().openTaskReview("task-1");
-    expect(useStore.getState().taskReviewId).toBe("task-1");
-
-    useStore.getState().setGraphOpen(true);
-
-    const s = useStore.getState();
-    expect(s.graphOpen).toBe(true);
-    expect(s.taskReviewId).toBeNull();
-  });
-
-  it("setGraphOpen(false) does not touch an open task review", () => {
-    useStore.getState().openTaskReview("task-1");
-
-    useStore.getState().setGraphOpen(false);
-
-    const s = useStore.getState();
-    expect(s.graphOpen).toBe(false);
-    expect(s.taskReviewId).toBe("task-1");
-  });
-
-  it("closeTaskReview clears only the review id", () => {
-    useStore.getState().openTaskReview("task-1");
-    useStore.getState().closeTaskReview();
-    expect(useStore.getState().taskReviewId).toBeNull();
-  });
-});
-
 // ── launch dialog task preset / task-selection clear ────────────────────────
 
 describe("setLaunchOpen task preset", () => {

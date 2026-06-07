@@ -220,7 +220,7 @@ export function AgentDiffSection({
           {member.agent_id}
         </span>
         {worktree?.branch && (
-          <span className="flex shrink-0 items-center gap-1 rounded border border-ink-600 px-1.5 py-0.5 font-mono text-[10px] text-accent-300">
+          <span className="flex shrink-0 items-center gap-1 rounded border border-ink-600 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">
             <GitBranch size={10} />
             <span title={worktree.branch} className="max-w-[180px] truncate whitespace-nowrap">
               {worktree.branch}
@@ -277,7 +277,7 @@ export function AgentDiffSection({
         <button
           disabled={busy !== null || selectionCount === 0}
           onClick={() => void apply("merge")}
-          className="flex shrink-0 items-center gap-1 rounded bg-teal-600 px-2 py-1 text-[11px] font-medium text-white hover:brightness-110 disabled:cursor-default disabled:opacity-40"
+          className="flex shrink-0 items-center gap-1 rounded-md bg-primary px-2 py-1 text-[11px] font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40"
         >
           <GitMerge size={11} />
           {busy === "merge" ? "Merging…" : `Merge${selectionCount > 0 ? ` ${selectionCount}` : ""}`}
@@ -285,7 +285,7 @@ export function AgentDiffSection({
         <button
           disabled={busy !== null || selectionCount === 0}
           onClick={() => void apply("revert")}
-          className="flex shrink-0 items-center gap-1 rounded border border-rose-500/50 px-2 py-1 text-[11px] text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40"
+          className="flex shrink-0 items-center gap-1 rounded-md border border-rose-500/50 px-2 py-1 text-[11px] text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40"
         >
           <Undo2 size={11} />
           {busy === "revert" ? "Reverting…" : "Revert"}
@@ -293,7 +293,7 @@ export function AgentDiffSection({
         <button
           onClick={onMarkReviewed}
           title="Acknowledge this agent's changes (clears its dirty set)"
-          className="flex shrink-0 items-center gap-1 rounded bg-emerald-600/90 px-2 py-1 text-[11px] font-medium text-white hover:brightness-110"
+          className="flex shrink-0 items-center gap-1 rounded-md bg-emerald-600/90 px-2 py-1 text-[11px] font-medium text-white hover:brightness-110"
         >
           <Check size={11} />
           Mark reviewed

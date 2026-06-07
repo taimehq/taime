@@ -116,7 +116,7 @@ export function WorkflowsScreen() {
   return (
     <div className="flex h-full flex-col overflow-hidden">
       {!connected && (
-        <div className="shrink-0 border-b border-ink-600 bg-ink-800 px-4 py-1.5 text-[11px] text-amber">
+        <div className="shrink-0 border-b border-amber/30 bg-amber/10 px-4 py-1 text-[11px] text-amber">
           daemon unreachable · retrying
         </div>
       )}
@@ -313,7 +313,7 @@ function WorkflowDetail({ wf, connected }: { wf: WorkflowInfo; connected: boolea
         <div className="flex shrink-0 items-center gap-2">
           <label
             htmlFor="wf-run-scope"
-            className="text-[10px] font-semibold uppercase tracking-wide text-zinc-600"
+            className="text-[10px] font-semibold uppercase tracking-wider text-zinc-600"
           >
             Run scope
           </label>
@@ -335,7 +335,7 @@ function WorkflowDetail({ wf, connected }: { wf: WorkflowInfo; connected: boolea
             onClick={onRun}
             disabled={running || !connected}
             title={connected ? "Run this workflow now" : "Daemon unreachable"}
-            className="flex items-center gap-1 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-50"
+            className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-50"
           >
             {running ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
             {running ? "Starting…" : "Run"}
@@ -470,7 +470,7 @@ function DefinitionTab({
     <div className="flex max-w-3xl flex-col gap-4">
       {/* Run-scope inheritance banner */}
       <div
-        className={`flex items-start gap-2 rounded-md border px-3 py-2.5 ${
+        className={`flex items-start gap-2 rounded-lg border px-3 py-2.5 ${
           scopeTask ? "border-accent/30 bg-accent/10" : "border-ink-600 bg-ink-800"
         }`}
       >
@@ -497,7 +497,7 @@ function DefinitionTab({
       {/* Graph */}
       <section>
         <div className="mb-2 flex items-center gap-2">
-          <h2 className="text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+          <h2 className="text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
             Execution graph
           </h2>
         </div>
@@ -519,12 +519,12 @@ function DefinitionTab({
 
       {/* Node table */}
       <section>
-        <h2 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+        <h2 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
           Nodes
         </h2>
         <div className="overflow-hidden rounded-lg border border-ink-600">
           <table className="w-full text-left text-xs">
-            <thead className="bg-ink-800 text-[10px] uppercase tracking-wide text-zinc-600">
+            <thead className="bg-ink-800 text-[10px] uppercase tracking-wider text-zinc-600">
               <tr>
                 <th className="px-3 py-2 font-semibold">Node</th>
                 <th className="px-3 py-2 font-semibold">Profile</th>

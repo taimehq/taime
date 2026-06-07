@@ -54,17 +54,20 @@ export function TitleBar({ backend }: { backend: BackendState }) {
   return (
     <header
       data-tauri-drag-region
-      className="titlebar-drag relative z-30 grid h-10 shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-3 border-b border-ink-600 bg-ink-800 pr-3.5"
+      className="titlebar-drag relative z-30 grid h-10 shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-3 border-b border-ink-600 bg-ink-800 px-3.5"
     >
       {/* Left: traffic-light reserve (collapses with the lights in fullscreen) + workspace */}
-      <div
-        data-tauri-drag-region
-        className="flex min-w-0 items-center justify-self-start"
-      >
+      {/* Side columns stretch to their tracks (no justify-self): a self-aligned
+          grid item sizes to max-content and overflows its track instead of
+          letting the pill/chip truncate. Alignment lives on the flex content. */}
+      <div data-tauri-drag-region className="flex min-w-0 items-center">
+        {/* Widths are net of the bar's px-3.5 (14px) so the lights reserve stays
+            88px from the window edge and the grid padding stays symmetric —
+            symmetric padding is what keeps the center column window-centered. */}
         <div
           data-tauri-drag-region
           aria-hidden
-          className={`shrink-0 ${fullscreen ? "w-3" : "w-[88px]"}`}
+          className={`shrink-0 ${fullscreen ? "w-0" : "w-[74px]"}`}
         />
         <WorkspaceSwitcher />
       </div>
@@ -75,7 +78,7 @@ export function TitleBar({ backend }: { backend: BackendState }) {
       {/* Right: daemon pill · selected-agent status · clock · search · bell */}
       <div
         data-tauri-drag-region
-        className="flex min-w-0 items-center gap-2 justify-self-end"
+        className="flex min-w-0 items-center justify-end gap-2"
       >
         <BackendStatusPill state={backend} />
         {activeFrame && <StatusBadge status={rawStatus} />}

@@ -214,13 +214,14 @@ export function DashboardScreen() {
   return (
     <div className="flex h-full flex-col overflow-hidden">
       {/* ── Header ───────────────────────────────────────────────────── */}
-      <div className="flex shrink-0 items-center gap-3 px-6 pb-3 pt-5">
+      <div className="flex shrink-0 items-center gap-3 px-4 pb-3 pt-4">
         <div className="flex min-w-0 flex-1 items-baseline gap-2">
           <h1 className="shrink-0 text-sm font-medium text-zinc-100">
             Dashboard
           </h1>
           <span className="truncate text-[11px] text-zinc-500">
-            {agents.length} agent{plural(agents.length)} ·{" "}
+            <span className="tnum">{agents.length}</span> agent
+            {plural(agents.length)} ·{" "}
             <span className="tnum">{runningAgents.length}</span> running
           </span>
           {!connected && (
@@ -256,7 +257,7 @@ export function DashboardScreen() {
       </div>
 
       {/* ── Stat cards ───────────────────────────────────────────────── */}
-      <div className="flex shrink-0 flex-wrap gap-2 px-6 pb-2">
+      <div className="flex shrink-0 flex-wrap gap-2 px-4 pb-2">
         <StatCard
           label="Active tasks"
           value={!connected ? "—" : !tasksLoaded ? "…" : activeTasks.length}
@@ -266,14 +267,14 @@ export function DashboardScreen() {
         />
         <StatCard
           label="Running agents"
-          value={runningAgents.length}
+          value={!connected ? "—" : runningAgents.length}
           icon={Activity}
           valueClass="text-emerald-400"
           glowClass="bg-emerald-400"
         />
         <StatCard
           label="Needs review"
-          value={needsReview}
+          value={!connected ? "—" : needsReview}
           icon={Eye}
           valueClass="text-amber"
           glowClass="bg-amber"
@@ -287,7 +288,7 @@ export function DashboardScreen() {
         />
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-6">
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-6">
         {/* ── Tasks ──────────────────────────────────────────────────── */}
         <section className="mt-3">
           <div className="mb-2 flex items-center gap-2">
@@ -331,7 +332,7 @@ export function DashboardScreen() {
               return (
                 <div key={g.status} className="mb-3">
                   <div className="mb-1.5 flex items-center gap-1.5">
-                    <span className="text-[10px] font-medium uppercase tracking-wide text-zinc-600">
+                    <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-600">
                       {g.label}
                     </span>
                     <span className="tnum text-[10px] text-zinc-700">
@@ -385,10 +386,12 @@ export function DashboardScreen() {
 
           {uncategorized.length === 0 ? (
             <p className="py-2 text-[11px] text-zinc-600">
-              No uncategorized agents — all agents are assigned to tasks.
+              {connected
+                ? "No uncategorized agents — all agents are assigned to tasks."
+                : "Unknown until the daemon answers."}
             </p>
           ) : (
-            <div className="divide-y divide-ink-600 overflow-hidden rounded-md border border-ink-600 bg-ink-700/40">
+            <div className="divide-y divide-ink-600 overflow-hidden rounded-lg border border-ink-600 bg-ink-700">
               {uncatFiltered.length === 0 ? (
                 <p className="px-3 py-3 text-center text-[11px] text-zinc-600">
                   No agents match filter.
@@ -432,7 +435,7 @@ function StatCard({
   glowClass: string;
 }) {
   return (
-    <div className="relative min-w-[150px] flex-1 overflow-hidden rounded-md border border-ink-600 bg-ink-700 px-3 py-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+    <div className="relative min-w-[150px] flex-1 overflow-hidden rounded-lg border border-ink-600 bg-ink-700 px-3 py-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
       <span
         aria-hidden
         className={`pointer-events-none absolute -right-4 -top-4 h-14 w-14 rounded-full opacity-[0.18] blur-xl ${glowClass}`}
@@ -490,7 +493,7 @@ function TaskCard({
     <button
       onClick={onOpen}
       title={task.title}
-      className="flex flex-col gap-2 rounded-md border border-ink-600 bg-ink-700 p-3 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] hover:border-ink-400 hover:bg-ink-600"
+      className="flex flex-col gap-2 rounded-lg border border-ink-600 bg-ink-700 p-3 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] hover:border-ink-400 hover:bg-ink-600"
     >
       <div className="flex w-full items-start justify-between gap-2">
         <span className="min-w-0 flex-1 truncate text-xs font-medium text-zinc-100">

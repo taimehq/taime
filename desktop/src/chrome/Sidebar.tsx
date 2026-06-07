@@ -34,7 +34,7 @@ export function Sidebar() {
   return (
     <aside
       style={{ width }}
-      className="relative flex shrink-0 flex-col border-r border-ink-600 bg-ink-800/40"
+      className="relative flex shrink-0 flex-col border-r border-ink-600 bg-ink-800"
     >
       {section === "workflows" ? (
         <WorkflowsSidebar />
@@ -207,7 +207,7 @@ function TaskRow({ task, dim }: { task: TaskInfo; dim: boolean }) {
     <button
       onClick={() => selectTask(task.id)}
       title={task.title}
-      className={`relative flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left ${
+      className={`relative flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left ${
         selected ? "bg-ink-500" : "hover:bg-ink-600/60"
       } ${dim ? "opacity-60" : ""}`}
     >
@@ -295,7 +295,7 @@ function AgentsCollapsible({ tasks }: { tasks: TaskInfo[] }) {
 
       {/* Uncategorized — always visible (taskId strictly null). */}
       <div className="flex flex-col gap-0.5">
-        <span className="px-2 pt-1 text-[10px] font-medium uppercase tracking-wide text-zinc-600">
+        <span className="px-2 pt-1 text-[10px] font-medium uppercase tracking-wider text-zinc-600">
           Uncategorized · {uncategorized.length}
         </span>
         {uncategorized.length === 0 ? (
@@ -307,7 +307,7 @@ function AgentsCollapsible({ tasks }: { tasks: TaskInfo[] }) {
 
       {foreign.length > 0 && (
         <div className="flex flex-col gap-0.5">
-          <span className="px-2 pt-1 text-[10px] font-medium uppercase tracking-wide text-zinc-600">
+          <span className="px-2 pt-1 text-[10px] font-medium uppercase tracking-wider text-zinc-600">
             Other workspaces
           </span>
           {foreign.map((m) => (
@@ -319,7 +319,7 @@ function AgentsCollapsible({ tasks }: { tasks: TaskInfo[] }) {
       <button
         onClick={() => setLaunchOpen(true)}
         disabled={!connected}
-        className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs text-zinc-500 hover:bg-ink-600/60 hover:text-zinc-300 disabled:cursor-default disabled:opacity-40"
+        className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs text-zinc-500 hover:bg-ink-600/60 hover:text-zinc-300 disabled:cursor-default disabled:opacity-40"
       >
         <Plus size={12} className="shrink-0" />
         Launch agent
@@ -382,7 +382,7 @@ function AgentRow({ meta }: { meta: RustPtyMeta }) {
       title={`${providerTitle(meta.provider)} · ${meta.terminalId}${
         meta.branch ? ` · ${meta.branch}` : ""
       }`}
-      className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-ink-600/60 disabled:cursor-default disabled:opacity-50 ${
+      className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-ink-600/60 disabled:cursor-default disabled:opacity-50 ${
         exited ? "opacity-60" : ""
       }`}
     >

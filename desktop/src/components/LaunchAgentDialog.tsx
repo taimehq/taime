@@ -573,7 +573,10 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
           ) : (
             <button
               onClick={() => void submit()}
-              disabled={!selected || busy}
+              // The dialog owns this gate: palette/shortcut entry points don't
+              // go through the (already-gated) sidebar/dashboard buttons.
+              disabled={!selected || busy || !connected}
+              title={connected ? undefined : "Daemon unreachable"}
               className={`rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:opacity-50 ${FOCUS_RING}`}
             >
               {busy ? "Launching…" : "Launch"}
