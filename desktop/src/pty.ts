@@ -40,7 +40,8 @@ export interface DaemonSessionSummary {
   rows: number;
   cols: number;
   created_at_unix: number;
-  attribution_key: string | null;
+  /** The agent's identity — the attribution anchor (dirty/diff/graph key). */
+  agent_id: string | null;
   /** Provider id (`claude_code`/…) — daemon-reported (Phase 4), else null. */
   provider: string | null;
   /** Inferred status in CAO vocabulary (IDLE/PROCESSING/WAITING_USER_ANSWER/
@@ -63,7 +64,7 @@ export async function daemonSpawnAgent(
   cwd: string | null,
   rows: number,
   cols: number,
-  attributionKey: string | null,
+  agentId: string | null,
   model: string | null = null,
   injectOrchestration = false,
   profile = "default",
@@ -75,7 +76,7 @@ export async function daemonSpawnAgent(
     cols,
     model: model ?? null,
     permissionMode: null,
-    attributionKey: attributionKey ?? null,
+    agentId: agentId ?? null,
     injectOrchestration,
     // The daemon resolves this name against its profile store
     // (~/.taime/agents/*.toml + built-ins) to fill system_prompt/model/tools.
@@ -84,15 +85,15 @@ export async function daemonSpawnAgent(
 }
 
 /** Daemon-owned worktree provisioning result (Phase 3). snake_case to match the
- *  Rust `WorktreeInfo`; `terminal_key` is the attribution id. */
+ *  Rust `WorktreeInfo`; `agent_id` is the agent's identity (attribution anchor). */
 export interface DaemonWorktreeInfo {
-  terminal_key: string;
+  agent_id: string;
   project_root: string;
   repo_root: string | null;
   worktree_path: string;
   branch: string | null;
   base_sha: string | null;
-  mode: string; // "worktree" | "shared"
+  mode: string; // "isolated" | "shared"
   error: string | null;
 }
 
@@ -139,7 +140,7 @@ export async function daemonQuery<T>(
  *  UI closed. The frontend route switch to this lands with the diff move. */
 export interface DaemonActivityGraph {
   agents: {
-    id: string;
+    agent_id: string;
     provider: string | null;
     status: string | null;
     branch?: string | null;
@@ -167,7 +168,7 @@ export async function daemonActivityGraph(): Promise<DaemonActivityGraph> {
 
 /** Enqueue an inbox message for a live daemon agent (Phase 5 message bus). The
  *  daemon delivers it into the receiver's stdin when it next goes idle. `receiver`
- *  is the agent's attribution id; returns the monotonic inbox id. */
+ *  is the agent's id; returns the monotonic inbox id. */
 export async function daemonSendMessage(
   sender: string,
   receiver: string,

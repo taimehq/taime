@@ -66,7 +66,7 @@ interface Placed {
  * step-graph, laid out top-to-bottom by topological depth from `entry`. Nodes are
  * colored by the current run's per-node state; forward edges curve down with a
  * `when` label, back-edges (loops) arc in amber. A Run button starts a run and the
- * drawer polls live status while it runs. Clicking a node that has an `agent_key`
+ * drawer polls live status while it runs. Clicking a node that has an `agent_id`
  * opens that agent's diff.
  */
 export function WorkflowGraph({
@@ -366,7 +366,7 @@ export function WorkflowGraph({
               if (!p) return null;
               const st = nodeStates[n.id];
               const style = nodeStyle(st?.status);
-              const clickable = !!st?.agent_key;
+              const clickable = !!st?.agent_id;
               const iter = st && st.iteration > 1 ? `×${st.iteration}` : "";
               return (
                 <g
@@ -374,7 +374,7 @@ export function WorkflowGraph({
                   transform={`translate(${p.x}, ${p.y})`}
                   onClick={
                     clickable
-                      ? () => useStore.getState().openDiff(st!.agent_key as string)
+                      ? () => useStore.getState().openDiff(st!.agent_id as string)
                       : undefined
                   }
                   style={{ cursor: clickable ? "pointer" : "default" }}
@@ -442,7 +442,7 @@ export function WorkflowGraph({
           </span>
         </div>
         {(run?.node_states &&
-          Object.values(run.node_states).some((s) => s.agent_key)) && (
+          Object.values(run.node_states).some((s) => s.agent_id)) && (
           <p className="mt-1.5 text-[10px] text-zinc-600">
             Click a node to open its agent's diff.
           </p>

@@ -205,6 +205,14 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_worktrees_task ON taime_worktrees(task_id)",
             [],
         )?;
+        // Wave-1 lexicon (v10): the worktree mode named after its own object
+        // becomes `isolated` (`shared` unchanged). One-time rewrite here, plus
+        // read-normalization in [`normalize_mode`] (belt and braces — e.g. a
+        // post-open `--import-cao` can still land legacy rows).
+        conn.execute(
+            "UPDATE taime_worktrees SET mode = 'isolated' WHERE mode = 'worktree'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -240,9 +248,10 @@ impl Store {
         Ok(())
     }
 
-    /// Persist (or update) a provisioned worktree row, keyed by `terminal_key`
-    /// (the CAO terminal id). Mirrors CAO's `taime_worktrees` upsert so the
-    /// Phase-7 import is a row copy. `created_at` stored as a unix-seconds string.
+    /// Persist (or update) a provisioned worktree row, keyed by the Agent ID
+    /// (the `terminal_id` column — DB name kept for import compatibility).
+    /// Mirrors CAO's `taime_worktrees` upsert so the Phase-7 import is a row
+    /// copy. `created_at` stored as a unix-seconds string.
     pub fn upsert_worktree(
         &self,
         info: &WorktreeInfo,
@@ -259,7 +268,7 @@ impl Store {
                base_sha = excluded.base_sha, mode = excluded.mode, \
                created_at = excluded.created_at",
             rusqlite::params![
-                info.terminal_key,
+                info.agent_id,
                 info.project_root,
                 info.repo_root,
                 info.worktree_path,
@@ -566,7 +575,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {WORKTREE_COLS} FROM taime_worktrees \
-             WHERE mode = 'worktree' \
+             WHERE mode IN ('isolated', 'worktree') \
                AND (created_at IS NULL OR CAST(created_at AS INTEGER) <= ?1)"
         ))?;
         let rows = stmt
@@ -617,18 +626,18 @@ impl Store {
         Ok(n)
     }
 
-    /// The worktree `(path, base_sha, mode)` for an attribution key — the daemon
+    /// The worktree `(path, base_sha, mode)` for an Agent ID — the daemon
     /// diff's context (Phase 6). `base_sha` is the fork point for an isolated
     /// worktree (diff against it shows all the agent's changes).
     pub fn worktree(
         &self,
-        terminal_key: &str,
+        agent_id: &str,
     ) -> rusqlite::Result<Option<(String, Option<String>, String)>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT worktree_path, base_sha, mode FROM taime_worktrees WHERE terminal_id = ?1",
-            rusqlite::params![terminal_key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            rusqlite::params![agent_id],
+            |r| Ok((r.get(0)?, r.get(1)?, normalize_mode_str(r.get(2)?))),
         )
         .optional()
     }
@@ -812,29 +821,29 @@ impl Store {
         Ok(rows)
     }
 
-    /// A terminal's worktree attribution attributes: `(branch, mode, member_of)`,
+    /// An agent's worktree attribution attributes: `(branch, mode, member_of)`,
     /// for the activity-graph + attribution surfaces.
     #[allow(clippy::type_complexity)]
     pub fn worktree_attrs(
         &self,
-        terminal_key: &str,
+        agent_id: &str,
     ) -> rusqlite::Result<Option<(Option<String>, Option<String>, Option<String>)>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT branch, mode, member_of FROM taime_worktrees WHERE terminal_id = ?1",
-            rusqlite::params![terminal_key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            rusqlite::params![agent_id],
+            |r| Ok((r.get(0)?, normalize_mode(r.get(1)?), r.get(2)?)),
         )
         .optional()
     }
 
-    /// The workspace (`project_root`) a terminal's worktree was cut from — the
-    /// CAO-session grouping key for the `sessions`/`session_detail` surface.
-    pub fn worktree_project_root(&self, terminal_key: &str) -> rusqlite::Result<Option<String>> {
+    /// The workspace (`project_root`) an agent's worktree was cut from — the
+    /// workspace grouping key for the `agents` surface.
+    pub fn worktree_project_root(&self, agent_id: &str) -> rusqlite::Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT project_root FROM taime_worktrees WHERE terminal_id = ?1",
-            rusqlite::params![terminal_key],
+            rusqlite::params![agent_id],
             |r| r.get(0),
         )
         .optional()
@@ -1244,6 +1253,21 @@ fn map_run(r: &rusqlite::Row) -> rusqlite::Result<WorkflowRunRow> {
 const WORKTREE_COLS: &str = "terminal_id, project_root, repo_root, worktree_path, branch, \
      base_sha, mode, provider, member_of, task_id";
 
+/// Read-normalize a legacy worktree mode value: pre-v10 rows say `worktree`
+/// where the lexicon (and every app-facing surface) says `isolated`. The
+/// open-time migration rewrites rows; this catches anything that slips past it.
+fn normalize_mode(mode: Option<String>) -> Option<String> {
+    mode.map(normalize_mode_str)
+}
+
+fn normalize_mode_str(mode: String) -> String {
+    if mode == "worktree" {
+        "isolated".to_string()
+    } else {
+        mode
+    }
+}
+
 fn map_worktree(r: &rusqlite::Row) -> rusqlite::Result<WorktreeRow> {
     Ok(WorktreeRow {
         terminal_id: r.get(0)?,
@@ -1252,7 +1276,7 @@ fn map_worktree(r: &rusqlite::Row) -> rusqlite::Result<WorktreeRow> {
         worktree_path: r.get(3)?,
         branch: r.get(4)?,
         base_sha: r.get(5)?,
-        mode: r.get(6)?,
+        mode: normalize_mode(r.get(6)?),
         provider: r.get(7)?,
         member_of: r.get(8)?,
         task_id: r.get(9)?,
@@ -1592,6 +1616,8 @@ mod tests {
         // The pre-existing row survives with task_id = NULL (Uncategorized)…
         let row = store.worktree_row("old-agent").unwrap().unwrap();
         assert_eq!(row.task_id, None);
+        // …its legacy mode value is migrated to the v10 lexicon on open…
+        assert_eq!(row.mode.as_deref(), Some("isolated"));
         // …and the upgraded columns are fully usable end-to-end.
         store.create_task("task-up", "/p", "Upgraded", "", 1).unwrap();
         assert!(store.set_worktree_task("old-agent", Some("task-up")).unwrap());
@@ -1625,7 +1651,7 @@ mod tests {
 
         // Membership = nullable task_id on the worktree row (the durable anchor).
         let info = WorktreeInfo {
-            terminal_key: "agent-a".into(),
+            agent_id: "agent-a".into(),
             project_root: "/p".into(),
             repo_root: None,
             worktree_path: "/p".into(),
@@ -1775,6 +1801,10 @@ mod tests {
             assert_eq!(terms, 1);
             assert_eq!(wts, 1);
         }
+        // The import lands AFTER the open-time mode migration, so the legacy
+        // 'worktree' value reaches reads only via normalization (belt/braces).
+        let row = store.worktree_row("t1").unwrap().unwrap();
+        assert_eq!(row.mode.as_deref(), Some("isolated"));
 
         // Re-run is a no-op (the marker gates it).
         let again = store.import_cao(&cao_path).unwrap();

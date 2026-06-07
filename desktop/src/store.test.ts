@@ -12,8 +12,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 vi.mock("./api", () => ({
   api: {
     provisionWorktree: vi.fn(),
-    listSessions: vi.fn(async () => []),
-    getSession: vi.fn(),
+    listAgents: vi.fn(async () => []),
     deleteSession: vi.fn(async () => ({ success: true, deleted: [], errors: [] })),
     getTerminalStatus: vi.fn(async () => null),
     clearDaemonDirty: vi.fn(async () => true),
@@ -76,10 +75,10 @@ function makeSummary(over: Partial<DaemonSessionSummary> = {}): DaemonSessionSum
     rows: 24,
     cols: 80,
     created_at_unix: 1700000000,
-    attribution_key: "term-1",
+    agent_id: "term-1",
     provider: "claude_code",
     status: null,
-    protocol_version: 9,
+    protocol_version: 10,
     task_id: "task-1",
     ...over,
   };
@@ -116,8 +115,8 @@ function makeFrame(over: Partial<Frame> = {}): Frame {
 
 function makeWorktree(over: Partial<WorktreeInfo> = {}): WorktreeInfo {
   return {
-    terminal_id: "term-new",
-    mode: "worktree",
+    agent_id: "term-new",
+    mode: "isolated",
     worktree_path: "/proj/.taime/wt/term-new",
     project_root: "/proj",
     repo_root: "/proj",
@@ -138,7 +137,7 @@ describe("adoptDaemonSession", () => {
     const meta = useStore.getState().rustPtySessions["sess-1"];
     expect(meta).toBeDefined();
     expect(meta.ptySessionId).toBe("sess-1");
-    expect(meta.terminalId).toBe("term-1"); // from attribution_key
+    expect(meta.terminalId).toBe("term-1"); // from agent_id
     expect(meta.status).toBe("running"); // alive: true
     expect(meta.taskId).toBe("task-1"); // from task_id
     expect(meta.provider).toBe("claude_code");
@@ -152,7 +151,7 @@ describe("adoptDaemonSession", () => {
       makeSummary({
         id: "sess-2",
         alive: false,
-        attribution_key: null,
+        agent_id: null,
         task_id: null,
         provider: null,
         program: "/opt/bin/codex",
@@ -160,7 +159,7 @@ describe("adoptDaemonSession", () => {
     );
     const meta = useStore.getState().rustPtySessions["sess-2"];
     expect(meta.status).toBe("exited");
-    expect(meta.terminalId).toBe(""); // attribution_key null → ""
+    expect(meta.terminalId).toBe(""); // agent_id null → ""
     expect(meta.taskId).toBeNull();
     expect(meta.provider).toBe("codex"); // inferred from program
   });
@@ -171,7 +170,7 @@ describe("adoptDaemonSession", () => {
     const before = useStore.getState();
 
     useStore.getState().adoptDaemonSession(
-      makeSummary({ attribution_key: "term-other", task_id: "task-other" }),
+      makeSummary({ agent_id: "term-other", task_id: "task-other" }),
     );
 
     const after = useStore.getState();
@@ -384,7 +383,7 @@ describe("launchAgentDaemon", () => {
 
   it("success: adds a daemon frame + registry entry and returns true", async () => {
     useStore.setState({ workspaceDir: "/proj" });
-    provisionWorktree.mockResolvedValueOnce(makeWorktree({ terminal_id: "term-new" }));
+    provisionWorktree.mockResolvedValueOnce(makeWorktree({ agent_id: "term-new" }));
     spawnAgent.mockResolvedValueOnce("sess-new");
 
     const ok = await useStore.getState().launchAgentDaemon("claude_code", "default", "task-9");
@@ -419,7 +418,7 @@ describe("launchAgentDaemon", () => {
       ],
       activeFrameKey: null,
     });
-    provisionWorktree.mockResolvedValueOnce(makeWorktree({ terminal_id: "term-race" }));
+    provisionWorktree.mockResolvedValueOnce(makeWorktree({ agent_id: "term-race" }));
     spawnAgent.mockResolvedValueOnce("sess-race");
 
     const ok = await useStore
@@ -449,7 +448,7 @@ describe("launchAgentDaemon", () => {
       "/proj/.taime/wt/term-new", // spawned in the provisioned worktree
       24,
       80,
-      "term-new", // attribution key = provisioned terminal id
+      "term-new", // agent id = provisioned worktree row id
       null,
       true, // orchestrate
       "orchestrator",

@@ -15,38 +15,14 @@ import { inTauri } from "./backend";
  */
 
 // ---------------------------------------------------------------------------
-// Types (unchanged shapes — the daemon returns these directly)
+// Types (the daemon returns these directly)
 // ---------------------------------------------------------------------------
 
-export interface Session {
-  id: string;
-  name: string;
-  status: string;
-}
-
-export interface Terminal {
-  id: string;
-  name: string;
-  provider: string;
-  session_name: string;
-  agent_profile: string | null;
-  status: string | null;
-  last_active: string | null;
-}
-
-export interface TerminalMeta {
-  id: string;
-  tmux_session: string;
-  tmux_window: string;
-  provider: string;
-  agent_profile: string | null;
-  created_at: string | null;
-  last_active: string | null;
-}
-
-export interface SessionDetail {
-  session: Session | null;
-  terminals: TerminalMeta[];
+/** One row from the daemon's `agents` query (liveness/reconcile surface).
+ *  `agent_id` is THE identity — the attribution anchor everywhere. */
+export interface AgentSummary {
+  agent_id: string;
+  status?: string | null;
 }
 
 export interface AgentProfileInfo {
@@ -109,7 +85,7 @@ export interface TaskInfo {
 
 /** One member agent in a task detail: worktree row + live status + dirty rollup. */
 export interface TaskAgent {
-  terminal_id: string;
+  agent_id: string;
   provider: string | null;
   branch: string | null;
   mode: string | null;
@@ -142,7 +118,7 @@ export interface WorkflowEdge {
 export interface WorkflowNodeState {
   status: "pending" | "running" | "completed" | "failed" | string;
   iteration: number;
-  agent_key: string | null;
+  agent_id: string | null;
 }
 export interface WorkflowRunSummary {
   id: string;
@@ -207,24 +183,24 @@ export interface FileDiffEntry {
 }
 
 export interface FileDiffsResponse {
-  terminal_id: string;
+  agent_id: string;
   files: FileDiffEntry[];
 }
 
 export interface FileContributor {
-  terminal_id: string;
+  agent_id: string;
   provider: string | null;
   turn_index: number;
   ended_at: string | null;
 }
 export interface HunkAuthor {
-  terminal_id: string;
+  agent_id: string;
   provider: string | null;
   turn_index: number;
 }
 export interface AttributionResponse {
   team: {
-    terminal_id: string;
+    agent_id: string;
     provider: string | null;
     mode: string | null;
     member_of: string | null;
@@ -254,7 +230,7 @@ export interface HunkedFileEntry {
 }
 
 export interface HunkedDiffResponse {
-  terminal_id: string;
+  agent_id: string;
   base: string | null;
   files: HunkedFileEntry[];
 }
@@ -276,10 +252,10 @@ export interface WorkspaceInfo {
   head_short: string | null;
 }
 
-/** Per-agent worktree provenance. `terminal_id` == the daemon `terminal_key`. */
+/** Per-agent worktree provenance, keyed by the agent's id. */
 export interface WorktreeInfo {
-  terminal_id: string;
-  mode: "worktree" | "shared";
+  agent_id: string;
+  mode: "isolated" | "shared";
   worktree_path: string;
   project_root: string | null;
   repo_root: string | null;
@@ -397,17 +373,15 @@ export const api = {
     }
   },
 
-  /** Sessions are the daemon's agents (surfaced via the daemon registry); the
-   *  tmux-shaped session grouping is gone. */
-  listSessions: () => daemonQuery<Session[]>("sessions", {}, []),
-  getSession: (name: string) =>
-    daemonQuery<SessionDetail>("session_detail", { name }, { session: null, terminals: [] }),
+  /** The daemon's agents (its registry is the only roster); the tmux-shaped
+   *  session grouping is gone. */
+  listAgents: () => daemonQuery<AgentSummary[]>("agents", {}, []),
   deleteSession: async (_name: string) => ({ success: true, deleted: [] as string[], errors: [] as unknown[] }),
 
   getWorkingDirectory: (id: string) =>
     daemonQuery<{ working_directory: string | null }>(
       "worktree",
-      { terminal_key: id },
+      { agent_id: id },
       { working_directory: null },
     ).then((w) => {
       const raw = w as unknown as { worktree_path?: string; working_directory?: string | null };
@@ -417,7 +391,7 @@ export const api = {
   getTerminalStatus: (_id: string): Promise<string | null> => Promise.resolve(null),
 
   getTerminalDiff: (id: string) =>
-    daemonQuery<TerminalDiff>("terminal_diff", { terminal_key: id }, {
+    daemonQuery<TerminalDiff>("terminal_diff", { agent_id: id }, {
       working_directory: null,
       is_git: false,
       diff: "",
@@ -426,7 +400,7 @@ export const api = {
     }),
 
   getWorktree: (id: string) =>
-    daemonQuery<WorktreeInfo | null>("worktree", { terminal_key: id }, null),
+    daemonQuery<WorktreeInfo | null>("worktree", { agent_id: id }, null),
 
   /** Provision a daemon-owned worktree for an agent (Phase 3). */
   provisionWorktree: async (body: {
@@ -443,8 +417,8 @@ export const api = {
       body.task_id ?? null,
     );
     return {
-      terminal_id: wt.terminal_key,
-      mode: wt.mode === "worktree" ? "worktree" : "shared",
+      agent_id: wt.agent_id,
+      mode: wt.mode === "isolated" ? "isolated" : "shared",
       worktree_path: wt.worktree_path,
       project_root: wt.project_root,
       repo_root: wt.repo_root,
@@ -501,10 +475,10 @@ export const api = {
   },
   /** Assign (or unassign with null) an agent to a task — membership is the
    *  nullable task_id pointer; at most one task per agent. */
-  assignAgentTask: async (agentKey: string, taskId: string | null): Promise<string | null> => {
+  assignAgentTask: async (agentId: string, taskId: string | null): Promise<string | null> => {
     const r = await daemonQuery<{ ok?: boolean; error?: string }>(
       "task_assign",
-      { agent_key: agentKey, task_id: taskId },
+      { agent_id: agentId, task_id: taskId },
       { error: "daemon unavailable" },
     );
     return r.error ?? null;
@@ -514,17 +488,17 @@ export const api = {
   getTaskDetail: (id: string) => daemonQuery<TaskDetail | null>("task_detail", { id }, null),
 
   getFileDiffs: (id: string) =>
-    daemonQuery<FileDiffsResponse>("file_diffs", { terminal_key: id }, { terminal_id: id, files: [] }),
+    daemonQuery<FileDiffsResponse>("file_diffs", { agent_id: id }, { agent_id: id, files: [] }),
 
   getHunks: (id: string) =>
-    daemonQuery<HunkedDiffResponse>("hunked_diff", { terminal_key: id }, {
-      terminal_id: id,
+    daemonQuery<HunkedDiffResponse>("hunked_diff", { agent_id: id }, {
+      agent_id: id,
       base: null,
       files: [],
     }),
 
   getAttribution: (id: string) =>
-    daemonQuery<AttributionResponse>("attribution", { terminal_key: id }, { team: [], files: {} }),
+    daemonQuery<AttributionResponse>("attribution", { agent_id: id }, { team: [], files: {} }),
 
   applySelection: (
     id: string,
@@ -536,7 +510,7 @@ export const api = {
   ) =>
     daemonQuery<ApplyResult>(
       "apply_selection",
-      { terminal_key: id, target_dir: body.target, mode: body.mode, selections: body.selections },
+      { agent_id: id, target_dir: body.target, mode: body.mode, selections: body.selections },
       { applied: false, target_dir: body.target, files: [], conflicts: [], error: "daemon unavailable" },
     ),
 
@@ -553,7 +527,7 @@ export const api = {
     return {
       session,
       agents: g.agents.map((a) => ({
-        terminal_id: a.id,
+        agent_id: a.agent_id,
         provider: a.provider,
         status: a.status ?? null,
         mode: a.mode ?? null,
@@ -577,8 +551,8 @@ export const api = {
 
   /** Tell the daemon to reset an agent's accumulated dirty set (the user reviewed
    *  its diff), so the next `FsDirty` push starts fresh. */
-  clearDaemonDirty: (terminalId: string) =>
-    daemonQuery<boolean>("clear_dirty", { terminal_key: terminalId }, true),
+  clearDaemonDirty: (agentId: string) =>
+    daemonQuery<boolean>("clear_dirty", { agent_id: agentId }, true),
 
   getActivity: async (_params?: { session?: string; terminalId?: string; limit?: number }): Promise<ActivityEvent[]> => [],
 };
@@ -596,7 +570,7 @@ export interface GraphTurn {
 export interface ActivityGraph {
   session: string;
   agents: {
-    terminal_id: string;
+    agent_id: string;
     provider: string | null;
     /** Inferred live status (IDLE/PROCESSING/WAITING_USER_ANSWER/COMPLETED/ERROR). */
     status: string | null;
@@ -615,11 +589,11 @@ export interface ActivityEvent {
   id: string;
   ts: string | null;
   kind: string;
-  terminal_id: string | null;
+  agent_id: string | null;
   session_name: string | null;
   agent_profile: string | null;
   provider: string | null;
-  target_terminal_id: string | null;
+  target_agent_id: string | null;
   path: string | null;
   change_kind: string | null;
   turn_id: string | null;

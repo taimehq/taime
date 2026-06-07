@@ -1,8 +1,7 @@
 import { create } from "zustand";
 import {
   api,
-  type Session,
-  type SessionDetail,
+  type AgentSummary,
 } from "./api";
 import {
   loadRecentProjects,
@@ -104,7 +103,8 @@ export type RustPtyStatus = "running" | "exited";
 
 export interface RustPtyMeta {
   ptySessionId: string;
-  /** Provisioned worktree terminal id — the attribution key (dirty/diff/graph). */
+  /** The agent's id (provisioned worktree row) — the attribution anchor
+   *  (dirty/diff/graph). Local name kept as terminalId to limit churn. */
   terminalId: string;
   provider: string;
   branch: string | null;
@@ -135,32 +135,14 @@ export interface TimelineEvent {
 /** Cap on retained per-terminal timeline events (most recent kept). */
 const TIMELINE_CAP = 200;
 
-/**
- * Per-session status counts shown at-a-glance on a collapsed sidebar row.
- * Buckets mirror the StatusBadge normalization (PROCESSING→working,
- * WAITING_USER_ANSWER→needsYou, ERROR→error, COMPLETED→done, IDLE→idle); other
- * states (PENDING/UNKNOWN) count toward `total` only.
- */
-export interface SessionStatusRollup {
-  working: number;
-  needsYou: number;
-  error: number;
-  done: number;
-  idle: number;
-  total: number;
-}
-
 let frameCounter = 0;
 const nextKey = () => `frame-${++frameCounter}`;
 
 interface Store {
   // backend-derived
-  sessions: Session[];
-  activeSessionDetail: SessionDetail | null;
+  agents: AgentSummary[];
   connected: boolean;
   terminalStatuses: Record<string, string>;
-  /** Per-session status counts for the collapsed sidebar rows (polled, 10s). */
-  sessionStatusRollup: Record<string, SessionStatusRollup>;
 
   // workspace (single active project)
   workspaceDir: string | null;
@@ -218,11 +200,9 @@ interface Store {
   removeRecentProject: (path: string) => void;
   clearRecentProjects: () => void;
   setIsolationEnabled: (enabled: boolean) => void;
-  fetchSessions: () => Promise<void>;
-  selectSessionDetail: (name: string | null) => Promise<void>;
+  /** Refresh the daemon agent roster — also the connectivity probe. */
+  fetchAgents: () => Promise<void>;
   refreshStatuses: () => Promise<void>;
-  /** Poll per-session terminal statuses and rebuild the collapsed-row rollups. */
-  refreshSessionRollups: () => Promise<void>;
   /** Legacy session-removal hook (no daemon equivalent — agents are standalone);
    *  kept for the pipeline UI's empty session list. */
   killSession: (name: string) => Promise<void>;
@@ -316,11 +296,9 @@ interface Store {
 }
 
 export const useStore = create<Store>((set, get) => ({
-  sessions: [],
-  activeSessionDetail: null,
+  agents: [],
   connected: false,
   terminalStatuses: {},
-  sessionStatusRollup: {},
 
   workspaceDir: loadWorkspaceDir(),
   recentProjects: loadRecentProjects(),
@@ -375,30 +353,15 @@ export const useStore = create<Store>((set, get) => ({
 
   setIsolationEnabled: (isolationEnabled) => set({ isolationEnabled }),
 
-  fetchSessions: async () => {
+  fetchAgents: async () => {
     try {
-      const sessions = await api.listSessions();
+      const agents = await api.listAgents();
       const prev = get();
-      if (!prev.connected || !jsonEqual(prev.sessions, sessions)) {
-        set({ sessions, connected: true });
+      if (!prev.connected || !jsonEqual(prev.agents, agents)) {
+        set({ agents, connected: true });
       }
     } catch {
       if (get().connected) set({ connected: false });
-    }
-  },
-
-  selectSessionDetail: async (name) => {
-    if (!name) {
-      set({ activeSessionDetail: null });
-      return;
-    }
-    try {
-      const detail = await api.getSession(name);
-      if (!jsonEqual(get().activeSessionDetail, detail)) {
-        set({ activeSessionDetail: detail });
-      }
-    } catch {
-      /* leave previous detail */
     }
   },
 
@@ -424,68 +387,6 @@ export const useStore = create<Store>((set, get) => ({
     );
   },
 
-  refreshSessionRollups: async () => {
-    const sessions = get().sessions;
-    if (sessions.length === 0) {
-      if (Object.keys(get().sessionStatusRollup).length > 0) {
-        set({ sessionStatusRollup: {} });
-      }
-      return;
-    }
-    // Bucket each session's agents by their LIVE status — the push-maintained
-    // `terminalStatuses` map (Phase 4), NOT the retired per-terminal status call.
-    // Query each session's detail by its UNIQUE root id (not the basename) so two
-    // same-basename workspaces never merge. Unreachable sessions are omitted.
-    const results = await Promise.all(
-      sessions.map(async (sess) => {
-        try {
-          const detail = await api.getSession(sess.id);
-          const statuses = get().terminalStatuses;
-          const roll: SessionStatusRollup = {
-            working: 0,
-            needsYou: 0,
-            error: 0,
-            done: 0,
-            idle: 0,
-            total: detail.terminals.length,
-          };
-          for (const t of detail.terminals) {
-            switch ((statuses[t.id] ?? "").toUpperCase()) {
-              case "PROCESSING":
-                roll.working++;
-                break;
-              case "WAITING_USER_ANSWER":
-                roll.needsYou++;
-                break;
-              case "ERROR":
-                roll.error++;
-                break;
-              case "COMPLETED":
-                roll.done++;
-                break;
-              case "IDLE":
-                roll.idle++;
-                break;
-            }
-          }
-          return [sess.id, roll] as const;
-        } catch {
-          return null; // skip unreachable session
-        }
-      }),
-    );
-    // Assign in `sessions` order (NOT Promise-resolution order) so the rebuilt
-    // map has deterministic key order — otherwise JSON.stringify in jsonEqual
-    // sees a different string each tick for identical content and set() churns.
-    const next: Record<string, SessionStatusRollup> = {};
-    for (const entry of results) {
-      if (entry) next[entry[0]] = entry[1];
-    }
-    if (!jsonEqual(get().sessionStatusRollup, next)) {
-      set({ sessionStatusRollup: next });
-    }
-  },
-
   killSession: async (name) => {
     // Close any open frames for this session first (UI only). The session-delete
     // below is a no-op stub since the CAO removal (tmux-shaped sessions are
@@ -499,7 +400,7 @@ export const useStore = create<Store>((set, get) => ({
       const msg = e instanceof Error ? e.message : String(e);
       get().showSnackbar({ type: "error", message: `Couldn't remove ${name}: ${msg}` });
     }
-    await get().fetchSessions();
+    await get().fetchAgents();
   },
 
   launchAgent: async (provider, agentProfile, opts) => {
@@ -573,8 +474,8 @@ export const useStore = create<Store>((set, get) => ({
     const orchestrate = profile === "orchestrator";
     try {
       // Provision a daemon-owned worktree first (git worktree in Rust, persisted
-      // to the app-data store) so dirty/diff/graph key off this terminalId, and
-      // pass it to the daemon as the attribution_key so turn events carry it.
+      // to the app-data store) so dirty/diff/graph key off this agent id, and
+      // pass it to the daemon as the agent_id so turn events carry it.
       // `api.provisionWorktree` routes to the daemon (daemonProvisionWorktree).
       let terminalId: string | null = null;
       let cwd = dir;
@@ -586,7 +487,7 @@ export const useStore = create<Store>((set, get) => ({
           isolate: get().isolationEnabled,
           task_id: taskId,
         });
-        terminalId = wt.terminal_id;
+        terminalId = wt.agent_id;
         cwd = wt.worktree_path;
         branch = wt.branch;
       }
@@ -683,7 +584,7 @@ export const useStore = create<Store>((set, get) => ({
       if (s.rustPtySessions[summary.id]) return s;
       const meta: RustPtyMeta = {
         ptySessionId: summary.id,
-        terminalId: summary.attribution_key ?? "",
+        terminalId: summary.agent_id ?? "",
         // Daemon-reported provider (Phase 4); fall back to program inference for
         // a pre-Phase-4 daemon that doesn't report it.
         provider: summary.provider ?? providerFromProgram(summary.program),

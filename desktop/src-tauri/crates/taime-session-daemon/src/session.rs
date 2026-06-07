@@ -145,7 +145,7 @@ impl Session {
             env_remove: Vec::new(),
             rows: spec.rows,
             cols: spec.cols,
-            attribution_key: spec.attribution_key.clone(),
+            attribution_key: spec.agent_id.clone(),
             paste_enter_count: 1,
         };
         Self::spawn_inner(id, &dspec, Cleanup::default(), None, store)
@@ -521,8 +521,8 @@ impl Session {
         matches!(self.infer_status(&st), Some(AgentStatus::Idle | AgentStatus::Completed))
     }
 
-    /// The attribution key (CAO terminal id) this session was spawned with — the
-    /// inbox addresses messages to it.
+    /// The Agent ID this session was spawned with (internally still the
+    /// `attribution_key` field) — the inbox addresses messages to it.
     pub fn attribution_key(&self) -> Option<String> {
         self.inner.attribution_key.clone()
     }
@@ -551,7 +551,7 @@ impl Session {
             rows: st.rows,
             cols: st.cols,
             created_at_unix: self.inner.created_at_unix,
-            attribution_key: self.inner.attribution_key.clone(),
+            agent_id: self.inner.attribution_key.clone(),
             provider: self.inner.provider.clone(),
             status,
             protocol_version: taime_protocol::PROTOCOL_VERSION,
@@ -751,7 +751,7 @@ mod tests {
             env: vec![],
             rows: 24,
             cols: 80,
-            attribution_key: Some("term-fsw".into()),
+            agent_id: Some("term-fsw".into()),
         };
         let session = Session::spawn("pty-fsw".into(), &spec, Some(store.clone())).unwrap();
 

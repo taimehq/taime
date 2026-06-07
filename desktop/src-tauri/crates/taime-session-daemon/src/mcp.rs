@@ -30,7 +30,7 @@ pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "list_agents",
-            "description": "List the live agent sessions: id, provider, role, status, cwd.",
+            "description": "List the live agent sessions: agent_id, provider, role, status, cwd.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
@@ -39,7 +39,7 @@ pub fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "to": { "type": "string", "description": "Receiver agent id (attribution key)." },
+                    "to": { "type": "string", "description": "Receiver agent id." },
                     "body": { "type": "string", "description": "Message body." }
                 },
                 "required": ["to", "body"],
@@ -194,9 +194,9 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
                 .list()
                 .into_iter()
                 .map(|s| {
-                    let key = s.attribution_key.clone().unwrap_or_else(|| s.id.clone());
+                    let key = s.agent_id.clone().unwrap_or_else(|| s.id.clone());
                     json!({
-                        "id": key,
+                        "agent_id": key,
                         "provider": s.provider,
                         "role": manager.role_of(&key),
                         "status": s.status.map(status_str),

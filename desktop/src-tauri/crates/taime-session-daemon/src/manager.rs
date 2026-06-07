@@ -282,21 +282,21 @@ impl Manager {
         let program = prepared.spec.prog.clone();
         let session = Session::spawn_prepared(id.clone(), prepared, adapter, self.store.clone())?;
         self.sessions.lock().unwrap().insert(id.clone(), session);
-        if let (Some(token), Some(key)) = (issued_token, &spec.attribution_key) {
+        if let (Some(token), Some(key)) = (issued_token, &spec.agent_id) {
             self.tokens.lock().unwrap().insert(token, key.clone());
         }
         // Remember this agent's role so `broadcast` can filter by it and
         // `list_agents` can report it.
-        if let Some(key) = &spec.attribution_key {
+        if let Some(key) = &spec.agent_id {
             self.roles.lock().unwrap().insert(key.clone(), spec.profile.name.clone());
         }
         // Durable record (best-effort): the agent existed, with its provider +
-        // attribution key + cwd, for history / Phase-6 attribution.
+        // Agent ID + cwd, for history / Phase-6 attribution.
         if let Some(store) = &self.store {
             let row = SessionRow {
                 pty_session_id: id.clone(),
                 provider: Some(spec.provider.clone()),
-                attribution_key: spec.attribution_key.clone(),
+                attribution_key: spec.agent_id.clone(),
                 cwd: spec.cwd.clone(),
                 program,
                 created_at_unix: now_unix(),
@@ -311,7 +311,7 @@ impl Manager {
     }
 
     /// Provision (or resolve) an isolated git worktree for a new agent (Phase 3).
-    /// The daemon mints the attribution key, runs `git worktree`, and persists the
+    /// The daemon mints the Agent ID, runs `git worktree`, and persists the
     /// `taime_worktrees` row. Shells out to git — call from a blocking context.
     pub fn provision_worktree(
         &self,
@@ -320,16 +320,16 @@ impl Manager {
         isolate: bool,
         task_id: Option<String>,
     ) -> WorktreeInfo {
-        let terminal_key = format!("{:08x}", rand::random::<u32>());
-        let info = crate::worktree::provision(&project_root, &provider, isolate, &terminal_key);
+        let agent_id = format!("{:08x}", rand::random::<u32>());
+        let info = crate::worktree::provision(&project_root, &provider, isolate, &agent_id);
         if let Some(store) = &self.store {
             if let Err(e) = store.upsert_worktree(&info, &provider, now_unix()) {
-                eprintln!("[taime-daemon] persist worktree {terminal_key} failed: {e}");
+                eprintln!("[taime-daemon] persist worktree {agent_id} failed: {e}");
             }
             // Task membership lands on the worktree row at provision — the
             // durable anchor of the Task partition (NULL ⇒ Uncategorized).
             if task_id.is_some() {
-                if let Err(e) = store.set_worktree_task(&info.terminal_key, task_id.as_deref()) {
+                if let Err(e) = store.set_worktree_task(&info.agent_id, task_id.as_deref()) {
                     eprintln!("[taime-daemon] set worktree task failed: {e}");
                 }
             }
@@ -342,7 +342,7 @@ impl Manager {
         self.sessions.lock().unwrap().get(id).cloned()
     }
 
-    /// The live session addressed by `attribution_key` (the inbox routes to it).
+    /// The live session addressed by an Agent ID (the inbox routes to it).
     fn session_by_attribution(&self, key: &str) -> Option<Session> {
         self.sessions
             .lock()
@@ -470,7 +470,7 @@ impl Manager {
                     })
                     .collect();
                 serde_json::json!({
-                    "id": id,
+                    "agent_id": id,
                     "provider": provider,
                     "status": status,
                     "branch": branch,
@@ -496,17 +496,17 @@ impl Manager {
         serde_json::json!({ "agents": agents, "edges": edges, "contention": contention }).to_string()
     }
 
-    /// Resolve a terminal's diff context `(cwd, base)`: an isolated worktree diffs
+    /// Resolve an agent's diff context `(cwd, base)`: an isolated worktree diffs
     /// against its `base_sha` (fork point → shows all the agent's changes); a
-    /// shared/live terminal against HEAD (`None`).
-    fn diff_context(&self, terminal_key: &str) -> (String, Option<String>) {
+    /// shared/live agent against HEAD (`None`).
+    fn diff_context(&self, agent_id: &str) -> (String, Option<String>) {
         if let Some(store) = &self.store {
-            if let Ok(Some((path, base_sha, mode))) = store.worktree(terminal_key) {
-                let base = if mode == "worktree" { base_sha } else { None };
+            if let Ok(Some((path, base_sha, mode))) = store.worktree(agent_id) {
+                let base = if mode == "isolated" { base_sha } else { None };
                 return (path, base);
             }
         }
-        let cwd = self.session_by_attribution(terminal_key).map(|s| s.cwd()).unwrap_or_default();
+        let cwd = self.session_by_attribution(agent_id).map(|s| s.cwd()).unwrap_or_default();
         (cwd, None)
     }
 
@@ -516,7 +516,7 @@ impl Manager {
     pub fn query(&self, kind: &str, args_json: &str) -> String {
         let a: serde_json::Value =
             serde_json::from_str(args_json).unwrap_or_else(|_| serde_json::json!({}));
-        let tk = a.get("terminal_key").and_then(|v| v.as_str()).unwrap_or("");
+        let tk = a.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             "terminal_diff" => {
                 let (cwd, base) = self.diff_context(tk);
@@ -551,10 +551,7 @@ impl Manager {
                 "true".to_string()
             }
             "attribution" => self.attribution_json(tk),
-            "sessions" => self.sessions_json(),
-            "session_detail" => {
-                self.session_detail_json(a.get("name").and_then(|v| v.as_str()).unwrap_or(""))
-            }
+            "agents" => self.agents_json(),
             "providers" => Self::providers_json(),
             "profiles" => crate::profiles::ProfileStore::load().infos_json(),
             "schedules" => self.schedules_json(),
@@ -648,7 +645,7 @@ impl Manager {
                 }
             }
             "task_assign" => {
-                let agent = a.get("agent_key").and_then(|v| v.as_str()).unwrap_or("");
+                let agent = a.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
                 let task = a.get("task_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
                 match self.assign_task(agent, task) {
                     Ok(()) => r#"{"ok":true}"#.to_string(),
@@ -688,7 +685,7 @@ impl Manager {
         let members: Vec<String> = self
             .workspace_members(session)
             .into_iter()
-            .filter_map(|(s, _)| s.attribution_key)
+            .filter_map(|(s, _)| s.agent_id)
             .collect();
         let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for tid in &members {
@@ -734,7 +731,7 @@ impl Manager {
                 // `branch`, `project_root`, …; a reduced shape silently dropped the
                 // branch chip and repo root in the diff view).
                 return serde_json::json!({
-                    "terminal_id": w.terminal_id,
+                    "agent_id": w.terminal_id,
                     "project_root": w.project_root,
                     "repo_root": w.repo_root,
                     "worktree_path": w.worktree_path,
@@ -820,30 +817,30 @@ impl Manager {
     }
 
     /// An agent's current task membership (`None` ⇒ Uncategorized).
-    pub fn task_of_agent(&self, agent_key: &str) -> Option<String> {
-        self.store.as_ref().and_then(|s| s.task_of_worktree(agent_key))
+    pub fn task_of_agent(&self, agent_id: &str) -> Option<String> {
+        self.store.as_ref().and_then(|s| s.task_of_worktree(agent_id))
     }
 
     /// Assign (or unassign with `None`) an agent to a task. The membership rule:
     /// at most one task per agent; reassignment just rewrites the pointer. Tasks
     /// are workspace-scoped, so the agent's worktree must come from the task's
     /// workspace — a cross-workspace pointer would corrupt the partition.
-    pub fn assign_task(&self, agent_key: &str, task_id: Option<&str>) -> Result<(), String> {
+    pub fn assign_task(&self, agent_id: &str, task_id: Option<&str>) -> Result<(), String> {
         let store = self.store.as_ref().ok_or("persistence disabled")?;
         if let Some(tid) = task_id {
             let task = store
                 .get_task(tid)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("unknown task '{tid}'"))?;
-            let agent_root = store.worktree_project_root(agent_key).ok().flatten();
+            let agent_root = store.worktree_project_root(agent_id).ok().flatten();
             if agent_root.as_deref() != Some(task.workspace_root.as_str()) {
                 return Err("task belongs to a different workspace".into());
             }
         }
-        if store.set_worktree_task(agent_key, task_id).map_err(|e| e.to_string())? {
+        if store.set_worktree_task(agent_id, task_id).map_err(|e| e.to_string())? {
             Ok(())
         } else {
-            Err(format!("unknown agent '{agent_key}'"))
+            Err(format!("unknown agent '{agent_id}'"))
         }
     }
 
@@ -880,7 +877,7 @@ impl Manager {
                     })
                     .unwrap_or((None, false, Vec::new()));
                 serde_json::json!({
-                    "terminal_id": w.terminal_id,
+                    "agent_id": w.terminal_id,
                     "provider": w.provider,
                     "branch": w.branch,
                     "mode": w.mode,
@@ -914,38 +911,38 @@ impl Manager {
     fn attribution_json(&self, tk: &str) -> String {
         let Some(store) = &self.store else { return r#"{"team":[],"files":{}}"#.to_string() };
         let sums: Vec<SessionSummary> = self.list();
-        // Team = live agents sharing the reviewed terminal's workspace; fall back
-        // to the reviewed terminal alone (e.g. it already exited).
+        // Team = live agents sharing the reviewed agent's workspace; fall back
+        // to the reviewed agent alone (e.g. it already exited).
         let target_root = sums
             .iter()
-            .find(|s| s.attribution_key.as_deref() == Some(tk))
+            .find(|s| s.agent_id.as_deref() == Some(tk))
             .map(|s| self.session_root_of(s));
         let team_members: Vec<SessionSummary> = match &target_root {
             Some(root) => sums.into_iter().filter(|s| self.session_root_of(s) == *root).collect(),
-            None => sums.into_iter().filter(|s| s.attribution_key.as_deref() == Some(tk)).collect(),
+            None => sums.into_iter().filter(|s| s.agent_id.as_deref() == Some(tk)).collect(),
         };
         let provider_of = |key: &str| -> Option<String> {
             team_members
                 .iter()
-                .find(|s| s.attribution_key.as_deref() == Some(key))
+                .find(|s| s.agent_id.as_deref() == Some(key))
                 .and_then(|s| s.provider.clone())
         };
 
         let mut team = Vec::new();
         let mut keys: Vec<String> = Vec::new();
         for s in &team_members {
-            let key = s.attribution_key.clone().unwrap_or_else(|| s.id.clone());
+            let key = s.agent_id.clone().unwrap_or_else(|| s.id.clone());
             let (_, mode, member_of) =
                 store.worktree_attrs(&key).ok().flatten().unwrap_or((None, None, None));
             team.push(serde_json::json!({
-                "terminal_id": key, "provider": s.provider, "mode": mode, "member_of": member_of,
+                "agent_id": key, "provider": s.provider, "mode": mode, "member_of": member_of,
             }));
             keys.push(key);
         }
         if keys.is_empty() {
             keys.push(tk.to_string());
             team.push(serde_json::json!({
-                "terminal_id": tk, "provider": serde_json::Value::Null,
+                "agent_id": tk, "provider": serde_json::Value::Null,
                 "mode": serde_json::Value::Null, "member_of": serde_json::Value::Null,
             }));
         }
@@ -973,7 +970,7 @@ impl Manager {
         }
         let contributor = |key: &str| -> serde_json::Value {
             serde_json::json!({
-                "terminal_id": key,
+                "agent_id": key,
                 "provider": provider_of(key),
                 "turn_index": 0,
                 "ended_at": serde_json::Value::Null,
@@ -994,11 +991,11 @@ impl Manager {
         serde_json::json!({ "team": team, "files": files_json }).to_string()
     }
 
-    /// The workspace a live agent belongs to (CAO "session" grouping key): its
-    /// worktree's `project_root` when isolated, else its cwd. Live data is the
-    /// source of truth, so the session list reflects what's actually running.
+    /// The workspace a live agent belongs to: its worktree's `project_root` when
+    /// provisioned, else its cwd. Live data is the source of truth, so the agent
+    /// list reflects what's actually running.
     fn session_root_of(&self, sum: &SessionSummary) -> String {
-        if let (Some(store), Some(key)) = (&self.store, sum.attribution_key.as_ref()) {
+        if let (Some(store), Some(key)) = (&self.store, sum.agent_id.as_ref()) {
             if let Ok(Some(root)) = store.worktree_project_root(key) {
                 return root;
             }
@@ -1006,65 +1003,27 @@ impl Manager {
         sum.cwd.clone()
     }
 
-    /// Live agents grouped into CAO-shaped sessions by workspace: one `Session`
-    /// per `project_root`, `status="running"` if any of its agents is alive.
-    fn sessions_json(&self) -> String {
-        let sums: Vec<SessionSummary> =
-            self.sessions.lock().unwrap().values().map(|s| s.summary()).collect();
-        let mut groups: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
-        for s in &sums {
-            let root = self.session_root_of(s);
-            let alive = groups.entry(root).or_insert(false);
-            *alive = *alive || s.alive;
-        }
-        let out: Vec<serde_json::Value> = groups
+    /// Live agents as flat rows (the `agents` query). Identity is the Agent ID
+    /// (pty session id fallback for a pre-provision low-level spawn); the app
+    /// groups by `workspace_root`. Replaces the retired tmux-shaped `sessions`/
+    /// `session_detail` surface.
+    fn agents_json(&self) -> String {
+        let out: Vec<serde_json::Value> = self
+            .list()
             .into_iter()
-            .map(|(root, alive)| {
+            .map(|s| {
+                let workspace_root = self.session_root_of(&s);
                 serde_json::json!({
-                    "id": root,
-                    "name": basename(&root),
-                    "status": if alive { "running" } else { "exited" },
+                    "agent_id": s.agent_id.clone().unwrap_or_else(|| s.id.clone()),
+                    "workspace_root": workspace_root,
+                    "provider": s.provider,
+                    "status": s.status,
+                    "alive": s.alive,
+                    "task_id": s.task_id,
                 })
             })
             .collect();
         serde_json::json!(out).to_string()
-    }
-
-    /// One workspace's detail: its `Session` plus its agents as CAO `Terminal`
-    /// rows. The app lists sessions with `id = project_root` and
-    /// `name = basename(root)` and may query by EITHER; [`workspace_members`]
-    /// resolves the membership (preferring an exact-root match).
-    fn session_detail_json(&self, name: &str) -> String {
-        let members = self.workspace_members(name);
-        if members.is_empty() {
-            return r#"{"session":null,"terminals":[]}"#.to_string();
-        }
-        let root = members[0].1.clone();
-        let alive = members.iter().any(|(s, _)| s.alive);
-        let terminals: Vec<serde_json::Value> = members
-            .iter()
-            .map(|(s, root)| {
-                serde_json::json!({
-                    "id": s.attribution_key.clone().unwrap_or_else(|| s.id.clone()),
-                    "tmux_session": basename(root),
-                    // No tmux: the pty session id stands in for the window handle.
-                    "tmux_window": s.id,
-                    "provider": s.provider.clone().unwrap_or_default(),
-                    "agent_profile": serde_json::Value::Null,
-                    "created_at": s.created_at_unix.to_string(),
-                    "last_active": serde_json::Value::Null,
-                })
-            })
-            .collect();
-        serde_json::json!({
-            "session": {
-                "id": root,
-                "name": basename(&root),
-                "status": if alive { "running" } else { "exited" },
-            },
-            "terminals": terminals,
-        })
-        .to_string()
     }
 
     /// Broadcast a message to every live agent except the sender — optionally
@@ -1323,7 +1282,7 @@ impl Manager {
                 // itself, matching CAO flow behavior (spawn path 4 of 4).
                 let info =
                     self.provision_worktree(root.clone(), provider.to_string(), false, task_id);
-                (info.terminal_key, Some(root))
+                (info.agent_id, Some(root))
             }
             None => (format!("sched-{}", &gen_id()[..8]), None),
         };
@@ -1333,7 +1292,7 @@ impl Manager {
             cwd,
             rows: 24,
             cols: 80,
-            attribution_key: Some(key.clone()),
+            agent_id: Some(key.clone()),
             seed_prompt: None,
             env: vec![],
             inject_orchestration: false,
@@ -1609,7 +1568,7 @@ impl Manager {
 
     /// Spawn one workflow-node worker: a worktree off `project_root` (if any), the
     /// agent under `role`/`provider` WITH orchestration tools (so it can `share` its
-    /// result), seeded with `prompt`. Returns `(session_id, attribution_key)`. Not
+    /// result), seeded with `prompt`. Returns `(session_id, agent_id)`. Not
     /// subject to the `assign` fan/depth limits — the workflow's own iteration
     /// guards bound it.
     pub fn spawn_workflow_node(
@@ -1629,7 +1588,7 @@ impl Manager {
                     true,
                     task_id.map(str::to_string),
                 );
-                (Some(info.worktree_path), info.terminal_key)
+                (Some(info.worktree_path), info.agent_id)
             }
             None => (None, format!("wf-{}", &gen_id()[..8])),
         };
@@ -1639,7 +1598,7 @@ impl Manager {
             cwd,
             rows: 24,
             cols: 80,
-            attribution_key: Some(attr_key.clone()),
+            agent_id: Some(attr_key.clone()),
             seed_prompt: None,
             env: vec![],
             inject_orchestration: true,
@@ -1766,7 +1725,7 @@ impl Manager {
                 (
                     n.node_id,
                     serde_json::json!({
-                        "status": n.status, "iteration": n.iteration, "agent_key": n.agent_key,
+                        "status": n.status, "iteration": n.iteration, "agent_id": n.agent_key,
                     }),
                 )
             })
@@ -1880,7 +1839,7 @@ impl Manager {
                             .is_some_and(|t| t.workspace_root == root)
                     });
                 let info = self.provision_worktree(root, provider.clone(), true, parent_task);
-                (Some(info.worktree_path), info.terminal_key)
+                (Some(info.worktree_path), info.agent_id)
             }
             None => (working_directory, gen_id()[..8].to_string()),
         };
@@ -1897,7 +1856,7 @@ impl Manager {
             cwd,
             rows: 24,
             cols: 80,
-            attribution_key: Some(child_key.clone()),
+            agent_id: Some(child_key.clone()),
             seed_prompt: None,
             env: vec![],
             // Workers don't get orchestration tools by default (a supervisor role
@@ -1937,7 +1896,7 @@ impl Manager {
         // the live session — fill at list time so reassignment shows next tick.
         if let Some(store) = &self.store {
             for s in &mut sums {
-                if let Some(key) = &s.attribution_key {
+                if let Some(key) = &s.agent_id {
                     s.task_id = store.task_of_worktree(key);
                 }
             }
@@ -2180,7 +2139,7 @@ mod tests {
         let mgr = Manager::for_test(Some(store));
         let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json()).unwrap();
         assert_eq!(v["agents"].as_array().unwrap().len(), 1);
-        assert_eq!(v["agents"][0]["id"], "a");
+        assert_eq!(v["agents"][0]["agent_id"], "a");
         assert_eq!(v["agents"][0]["provider"], "claude_code");
         assert_eq!(v["edges"].as_array().unwrap().len(), 1);
         assert_eq!(v["edges"][0]["kind"], "assign");
@@ -2270,7 +2229,7 @@ mod tests {
 
         let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json()).unwrap();
         let agent = &v["agents"][0];
-        assert_eq!(agent["id"], "a");
+        assert_eq!(agent["agent_id"], "a");
         assert_eq!(agent["turns"].as_array().unwrap().len(), 1);
         assert_eq!(agent["turns"][0]["files_touched"][0], "src/x.rs");
         assert_eq!(agent["turns"][0]["turn_index"], 0);
@@ -2294,7 +2253,7 @@ mod tests {
     }
 
     #[test]
-    fn session_detail_resolves_by_root_or_basename() {
+    fn agents_query_lists_live_agents_with_workspace_root() {
         let mgr = mem_manager();
         let dir = std::env::temp_dir().join(format!("taime-sess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2306,34 +2265,28 @@ mod tests {
             env: vec![],
             rows: 24,
             cols: 80,
-            attribution_key: Some("a".into()),
+            agent_id: Some("a".into()),
         };
         mgr.spawn(spec).unwrap();
 
         let root = dir.to_string_lossy().into_owned();
-        let base = dir.file_name().unwrap().to_string_lossy().into_owned();
 
-        // `sessions` lists id=root, name=basename.
-        let sessions: serde_json::Value = serde_json::from_str(&mgr.query("sessions", "{}")).unwrap();
-        assert_eq!(sessions[0]["id"], root);
-        assert_eq!(sessions[0]["name"], base);
+        // One flat row per live agent: identity is the Agent ID, the workspace
+        // grouping key travels as `workspace_root` (no tmux-shaped fields).
+        let agents: serde_json::Value = serde_json::from_str(&mgr.query("agents", "{}")).unwrap();
+        assert_eq!(agents.as_array().unwrap().len(), 1);
+        assert_eq!(agents[0]["agent_id"], "a");
+        assert_eq!(agents[0]["workspace_root"], root);
+        assert_eq!(agents[0]["alive"], true);
+        assert!(agents[0].get("tmux_session").is_none());
+        assert!(agents[0].get("tmux_window").is_none());
 
-        // `session_detail` is resolvable by EITHER the full root or the basename
-        // (the bug was an exact-root filter that the basename lookup never hit).
-        for key in [root.as_str(), base.as_str()] {
-            let detail: serde_json::Value =
-                serde_json::from_str(&mgr.query("session_detail", &format!("{{\"name\":{key:?}}}")))
-                    .unwrap();
-            assert_eq!(detail["terminals"].as_array().unwrap().len(), 1, "key {key}");
-            assert_eq!(detail["terminals"][0]["id"], "a");
-            assert_eq!(detail["session"]["id"], root);
-        }
         mgr.kill_all();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn session_detail_prefers_exact_root_over_basename() {
+    fn workspace_members_prefers_exact_root_over_basename() {
         let mgr = mem_manager();
         let base = std::env::temp_dir().join(format!("taime-dup-{}", std::process::id()));
         let a = base.join("alpha").join("proj");
@@ -2349,21 +2302,21 @@ mod tests {
                 env: vec![],
                 rows: 24,
                 cols: 80,
-                attribution_key: Some(key.into()),
+                agent_id: Some(key.into()),
             })
             .unwrap();
         };
         spawn(&a, "ka");
         spawn(&b, "kb");
 
-        // An exact full-root query must return ONLY that workspace's agent — two
-        // workspaces sharing the basename "proj" must not merge.
-        let da: serde_json::Value = serde_json::from_str(
-            &mgr.query("session_detail", &format!("{{\"name\":{:?}}}", a.to_string_lossy())),
-        )
-        .unwrap();
-        let ids: Vec<&str> =
-            da["terminals"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+        // An exact full-root lookup must return ONLY that workspace's agent — two
+        // workspaces sharing the basename "proj" must not merge (this membership
+        // resolution backs the contention surface).
+        let ids: Vec<String> = mgr
+            .workspace_members(&a.to_string_lossy())
+            .into_iter()
+            .filter_map(|(s, _)| s.agent_id)
+            .collect();
         assert_eq!(ids, vec!["ka"], "exact root must not merge same-basename workspaces");
 
         mgr.kill_all();
@@ -2386,23 +2339,23 @@ mod tests {
     fn worktree_query_returns_full_shape_with_branch() {
         let mgr = mem_manager();
         let info = WorktreeInfo {
-            terminal_key: "a".into(),
+            agent_id: "a".into(),
             project_root: "/proj".into(),
             repo_root: Some("/proj".into()),
             worktree_path: "/wt/a".into(),
             branch: Some("taime/a".into()),
             base_sha: Some("abc".into()),
-            mode: "worktree".into(),
+            mode: "isolated".into(),
             error: None,
         };
         mgr.store().unwrap().upsert_worktree(&info, "claude_code", 1).unwrap();
 
         let v: serde_json::Value =
-            serde_json::from_str(&mgr.query("worktree", r#"{"terminal_key":"a"}"#)).unwrap();
-        // The app's getWorktree reads terminal_id/branch/mode/project_root.
-        assert_eq!(v["terminal_id"], "a");
+            serde_json::from_str(&mgr.query("worktree", r#"{"agent_id":"a"}"#)).unwrap();
+        // The app's getWorktree reads agent_id/branch/mode/project_root.
+        assert_eq!(v["agent_id"], "a");
         assert_eq!(v["branch"], "taime/a");
-        assert_eq!(v["mode"], "worktree");
+        assert_eq!(v["mode"], "isolated");
         assert_eq!(v["project_root"], "/proj");
     }
 
@@ -2414,10 +2367,10 @@ mod tests {
         store.record_fs_event("e2", "a", "src/y.rs", "modify", 6).unwrap();
 
         let v: serde_json::Value = serde_json::from_str(&mgr.attribution_json("a")).unwrap();
-        // No live session in for_test → team falls back to the reviewed terminal.
-        assert_eq!(v["team"][0]["terminal_id"], "a");
-        assert_eq!(v["files"]["src/x.rs"]["last"]["terminal_id"], "a");
-        assert_eq!(v["files"]["src/y.rs"]["contributors"][0]["terminal_id"], "a");
+        // No live session in for_test → team falls back to the reviewed agent.
+        assert_eq!(v["team"][0]["agent_id"], "a");
+        assert_eq!(v["files"]["src/x.rs"]["last"]["agent_id"], "a");
+        assert_eq!(v["files"]["src/y.rs"]["contributors"][0]["agent_id"], "a");
     }
 
     #[test]
@@ -2435,21 +2388,22 @@ mod tests {
     }
 
     #[test]
-    fn sessions_surface_is_real_shaped_when_empty() {
-        // No live agents → an empty session list and a null detail (NOT the old
-        // hardcoded stub path; this exercises the real query dispatch).
+    fn agents_surface_is_real_shaped_when_empty() {
+        // No live agents → an empty list (NOT the old hardcoded stub path; this
+        // exercises the real query dispatch). The retired surfaces stay retired.
         let mgr = Manager::for_test(None);
-        let sessions: serde_json::Value = serde_json::from_str(&mgr.sessions_json()).unwrap();
-        assert!(sessions.as_array().unwrap().is_empty());
-
-        let detail: serde_json::Value =
-            serde_json::from_str(&mgr.session_detail_json("/whatever")).unwrap();
-        assert!(detail["session"].is_null());
-        assert!(detail["terminals"].as_array().unwrap().is_empty());
+        let agents: serde_json::Value = serde_json::from_str(&mgr.agents_json()).unwrap();
+        assert!(agents.as_array().unwrap().is_empty());
 
         // The generic Query dispatch routes to the same real implementation.
         let via_query: serde_json::Value =
-            serde_json::from_str(&mgr.query("sessions", "{}")).unwrap();
+            serde_json::from_str(&mgr.query("agents", "{}")).unwrap();
         assert!(via_query.as_array().unwrap().is_empty());
+
+        // The retired tmux-shaped queries are gone, not aliased.
+        for retired in ["sessions", "session_detail"] {
+            let v: serde_json::Value = serde_json::from_str(&mgr.query(retired, "{}")).unwrap();
+            assert!(v.get("error").is_some(), "{retired} must be an unknown query");
+        }
     }
 }
