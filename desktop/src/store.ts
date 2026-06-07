@@ -235,11 +235,22 @@ interface Store {
     sessionName?: string | null;
   }) => void;
   /** Launch a provider on the detached session daemon (the Rust PTY path; survives
-   *  app crashes). `orchestrate` injects the daemon's MCP tools so the agent can
-   *  assign/handoff to others. Returns true on success. */
-  launchAgentDaemon: (provider: string, orchestrate?: boolean) => Promise<boolean>;
+   *  app crashes). `profile` is the daemon profile name (`~/.taime/agents/*.toml`
+   *  + built-in `default`/`orchestrator`); the daemon resolves it to fill the
+   *  system prompt / model / tools and injects the MCP orchestration tools for a
+   *  supervisor role. `sessionName` (optional) is the display label of the workspace
+   *  session the agent joins; `projectRoot` (optional) is that session's root to
+   *  provision the worktree from — so the daemon actually groups the agent there,
+   *  not just labels it (defaults to the active `workspaceDir`). Returns true on
+   *  success. */
+  launchAgentDaemon: (
+    provider: string,
+    profile?: string,
+    sessionName?: string | null,
+    projectRoot?: string | null,
+  ) => Promise<boolean>;
   /** Reopen a detached (still-running) Rust-PTY agent in a new frame. */
-  reopenRustPty: (ptySessionId: string) => void;
+  reopenRustPty: (ptySessionId: string, opts?: { focus?: boolean }) => void;
   /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
   markRustPtyExited: (ptySessionId: string) => void;
   /** Adopt a daemon session discovered at boot (crash survival): populate the
@@ -281,6 +292,12 @@ interface Store {
 
   // misc
   setTerminalStatus: (id: string, status: string | null) => void;
+  /** Mirror a daemon status PUSH (Phase 4) for `sessionId` into the badge map,
+   *  resolving its attribution-keyed terminalId via `rustPtySessions`. */
+  setDaemonSessionStatus: (sessionId: string, status: string | null) => void;
+  /** Mirror a daemon fs-dirty PUSH (Phase 6) for `sessionId`: the full set of
+   *  paths its per-session watcher has seen change since the last review. */
+  markDaemonFsDirty: (sessionId: string, paths: string[]) => void;
   /** Record the model parsed from a frame's startup banner. */
   setFrameModel: (key: string, model: string) => void;
   showSnackbar: (s: Snackbar) => void;
@@ -406,20 +423,15 @@ export const useStore = create<Store>((set, get) => ({
       }
       return;
     }
-    // No session endpoint returns per-terminal status, so fan out: list each
-    // session's terminals, then fetch each terminal's status, and bucket. Failed
-    // sessions are simply omitted from the rebuilt map (stale row clears).
-    // TODO: useTerminalReconcile also getSession()s these every 10s — a shared
-    // pass could halve the calls, but the two loops schedule independently today.
+    // Bucket each session's agents by their LIVE status — the push-maintained
+    // `terminalStatuses` map (Phase 4), NOT the retired per-terminal status call.
+    // Query each session's detail by its UNIQUE root id (not the basename) so two
+    // same-basename workspaces never merge. Unreachable sessions are omitted.
     const results = await Promise.all(
       sessions.map(async (sess) => {
         try {
-          const detail = await api.getSession(sess.name);
-          const statuses = await Promise.all(
-            detail.terminals.map((t) =>
-              api.getTerminalStatus(t.id).catch(() => null),
-            ),
-          );
+          const detail = await api.getSession(sess.id);
+          const statuses = get().terminalStatuses;
           const roll: SessionStatusRollup = {
             working: 0,
             needsYou: 0,
@@ -428,8 +440,8 @@ export const useStore = create<Store>((set, get) => ({
             idle: 0,
             total: detail.terminals.length,
           };
-          for (const st of statuses) {
-            switch ((st ?? "").toUpperCase()) {
+          for (const t of detail.terminals) {
+            switch ((statuses[t.id] ?? "").toUpperCase()) {
               case "PROCESSING":
                 roll.working++;
                 break;
@@ -447,7 +459,7 @@ export const useStore = create<Store>((set, get) => ({
                 break;
             }
           }
-          return [sess.name, roll] as const;
+          return [sess.id, roll] as const;
         } catch {
           return null; // skip unreachable session
         }
@@ -480,18 +492,31 @@ export const useStore = create<Store>((set, get) => ({
     await get().fetchSessions();
   },
 
-  launchAgent: async (provider, agentProfile, _opts) => {
+  launchAgent: async (provider, agentProfile, opts) => {
     // Daemon-only after the CAO/tmux removal: every supported CLI launches on the
     // detached session daemon (the Rust PTY path), in its own worktree. The
-    // "orchestrator" role injects the daemon's MCP tools so the agent can
-    // assign/handoff to other agents; "default" is a plain agent. (A full daemon
-    // profile store — richer roles + tool restrictions — is a follow-up.)
+    // chosen profile name flows to the daemon, which resolves it against its
+    // profile store (~/.taime/agents/*.toml + built-in default/orchestrator) to
+    // fill the system prompt / model / tools and inject orchestration for a
+    // supervisor role.
     if (!DAEMON_PROVIDERS.has(provider)) {
       get().showSnackbar({ type: "error", message: `Unknown provider ${provider}` });
       return;
     }
-    // launchAgentDaemon reports its own (real) error on failure.
-    await get().launchAgentDaemon(provider, agentProfile === "orchestrator");
+    // launchAgentDaemon reports its own (real) error on failure. `workingDirectory`
+    // (the selected session's root) routes provisioning so "Add to session" is real
+    // grouping, not just a label.
+    // Open the (non-disruptive) team drawer on the FIRST agent so the team view is
+    // discovered, then leave it to the user — repeat launches just update the
+    // "Team N" badge in the title bar rather than popping the panel each time.
+    const firstAgent = Object.keys(get().rustPtySessions).length === 0;
+    const ok = await get().launchAgentDaemon(
+      provider,
+      agentProfile || "default",
+      opts?.sessionName ?? null,
+      opts?.workingDirectory ?? null,
+    );
+    if (ok && firstAgent) get().setGraphOpen(true);
   },
 
   openTerminalFrame: ({ terminalId, provider, agentProfile, sessionName }) => {
@@ -528,8 +553,15 @@ export const useStore = create<Store>((set, get) => ({
     }));
   },
 
-  launchAgentDaemon: async (provider, orchestrate = false) => {
-    const dir = get().workspaceDir;
+  launchAgentDaemon: async (provider, profile = "default", sessionName = null, projectRoot = null) => {
+    // Provision from the selected session's root when "Add to session" was chosen,
+    // else the active workspace — so the daemon groups the agent under the right
+    // project (session_root_of keys off the worktree's project_root).
+    const dir = projectRoot ?? get().workspaceDir;
+    // The built-in "orchestrator" role is a supervisor; the daemon also infers
+    // this from a file profile's `orchestrator = true`, but pass the hint so a
+    // pre-resolution path still injects the tools.
+    const orchestrate = profile === "orchestrator";
     try {
       // Provision a daemon-owned worktree first (git worktree in Rust, persisted
       // to the app-data store) so dirty/diff/graph key off this terminalId, and
@@ -548,24 +580,45 @@ export const useStore = create<Store>((set, get) => ({
         cwd = wt.worktree_path;
         branch = wt.branch;
       }
-      const sessionId = await daemonSpawnAgent(provider, cwd, 24, 80, terminalId, null, orchestrate);
+      const sessionId = await daemonSpawnAgent(
+        provider,
+        cwd,
+        24,
+        80,
+        terminalId,
+        null,
+        orchestrate,
+        profile,
+      );
       const key = nextKey();
-      set((s) => ({
-        frames: [
-          ...s.frames,
-          {
-            key,
-            terminalId,
-            provider,
-            agentProfile: null,
-            sessionName: null,
-            pending: false,
-            transport: "daemon",
-            ptySessionId: sessionId,
-          },
-        ],
-        activeFrameKey: key,
-        rustPtySessions: terminalId
+      set((s) => {
+        // If the reconcile tick already surfaced this freshly-spawned session as a
+        // frame (a concurrent daemonList can list it before this set() runs), reuse
+        // that frame instead of adding a duplicate — just focus it + label its role.
+        const existing = s.frames.find((f) => f.ptySessionId === sessionId);
+        const frames = existing
+          ? s.frames.map((f) =>
+              f.key === existing.key
+                ? { ...f, agentProfile: profile, sessionName: sessionName ?? null }
+                : f,
+            )
+          : [
+              ...s.frames,
+              {
+                key,
+                terminalId,
+                provider,
+                agentProfile: profile,
+                sessionName: sessionName ?? null,
+                pending: false,
+                transport: "daemon" as const,
+                ptySessionId: sessionId,
+              },
+            ];
+        return {
+          frames,
+          activeFrameKey: existing ? existing.key : key,
+          rustPtySessions: terminalId
           ? {
               ...s.rustPtySessions,
               [sessionId]: {
@@ -579,8 +632,9 @@ export const useStore = create<Store>((set, get) => ({
                 transport: "daemon",
               },
             }
-          : s.rustPtySessions,
-      }));
+            : s.rustPtySessions,
+        };
+      });
       get().showSnackbar({
         type: "success",
         message: `${providerTitle(provider)} launched`,
@@ -637,12 +691,13 @@ export const useStore = create<Store>((set, get) => ({
       return { frameTurns: { ...s.frameTurns, [frameKey]: next } };
     }),
 
-  reopenRustPty: (ptySessionId) => {
+  reopenRustPty: (ptySessionId, opts) => {
+    const focus = opts?.focus ?? true;
     const meta = get().rustPtySessions[ptySessionId];
     if (!meta || meta.status === "exited") return;
     const existing = get().frames.find((f) => f.ptySessionId === ptySessionId);
     if (existing) {
-      set({ activeFrameKey: existing.key });
+      if (focus) set({ activeFrameKey: existing.key });
       return;
     }
     const key = nextKey();
@@ -662,7 +717,8 @@ export const useStore = create<Store>((set, get) => ({
           ptySessionId,
         },
       ],
-      activeFrameKey: key,
+      // Auto-surfaced workers don't steal focus from the agent you're typing in.
+      activeFrameKey: focus ? key : s.activeFrameKey,
     }));
   },
 
@@ -737,13 +793,19 @@ export const useStore = create<Store>((set, get) => ({
       return { dirty: { ...s.dirty, [terminalId]: dirty } };
     }),
 
-  clearDirty: (terminalId) =>
+  clearDirty: (terminalId) => {
+    // Also reset the daemon's accumulated set so its next FsDirty push doesn't
+    // re-surface already-reviewed paths (best-effort; the daemon owns the watch).
+    api.clearDaemonDirty(terminalId).catch(() => {
+      /* daemon may be down; the local clear below still applies */
+    });
     set((s) => {
       if (!s.dirty[terminalId]) return s;
       const next = { ...s.dirty };
       delete next[terminalId];
       return { dirty: next };
-    }),
+    });
+  },
 
   appendTimeline: (terminalId, events) =>
     set((s) => {
@@ -833,6 +895,36 @@ export const useStore = create<Store>((set, get) => ({
       return {
         terminalStatuses: { ...s.terminalStatuses, [id]: normalized },
       };
+    }),
+
+  setDaemonSessionStatus: (sessionId, status) =>
+    set((s) => {
+      const tid = s.rustPtySessions[sessionId]?.terminalId;
+      if (!tid) return s;
+      const normalized = status ? status.toUpperCase() : "UNKNOWN";
+      if (s.terminalStatuses[tid] === normalized) return s;
+      // Keep the daemon-session map's own status field coherent too (used by the
+      // Agents panel), mapping the inferred status onto the lifecycle label.
+      const m = s.rustPtySessions[sessionId];
+      const lifecycle = normalized === "EXITED" ? "exited" : m.status === "exited" ? "exited" : "running";
+      return {
+        terminalStatuses: { ...s.terminalStatuses, [tid]: normalized },
+        rustPtySessions:
+          m.status === lifecycle
+            ? s.rustPtySessions
+            : { ...s.rustPtySessions, [sessionId]: { ...m, status: lifecycle } },
+      };
+    }),
+
+  markDaemonFsDirty: (sessionId, paths) =>
+    set((s) => {
+      const tid = s.rustPtySessions[sessionId]?.terminalId;
+      if (!tid || paths.length === 0) return s;
+      const prev = s.dirty[tid];
+      if (prev && prev.count === paths.length && prev.paths.join(" ") === paths.join(" ")) {
+        return s;
+      }
+      return { dirty: { ...s.dirty, [tid]: { count: paths.length, paths } } };
     }),
 
   setFrameModel: (key, model) =>

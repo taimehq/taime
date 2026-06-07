@@ -3,7 +3,6 @@ import { TerminalViewRustPty } from "../components/TerminalViewRustPty";
 import { StatusBadge, statusDotClass } from "../components/StatusBadge";
 import { prettySessionText } from "../lib/sessionName";
 import { providerTitle } from "../lib/providerLabel";
-import { useFsWatch } from "../hooks/useFsWatch";
 import { Loader2, X, TerminalSquare, Power, LayoutGrid } from "lucide-react";
 
 /** CSS grid template that keeps frames roughly square as count grows. */
@@ -178,8 +177,9 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
 
   const isRustPty = isDaemonTransport(frame.transport) && !!frame.ptySessionId;
 
-  // Watch this terminal's working dir while the frame is mounted (CAO path).
-  useFsWatch(frame.terminalId);
+  // (Filesystem watching now lives in the session daemon — it streams dirty
+  // paths over the attach channel as `FsDirty`, so React no longer mounts a
+  // watcher per frame.)
 
   const active = activeFrameKey === frame.key;
   const title = providerTitle(frame.provider);

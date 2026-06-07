@@ -22,11 +22,11 @@ import { useRustPtyReconcile } from "./hooks/useRustPtyReconcile";
 import { useTerminalReconcile } from "./hooks/useTerminalReconcile";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
 import {
-  Activity,
   LayoutGrid,
   Maximize2,
   PanelLeftClose,
   PanelLeftOpen,
+  Users,
 } from "lucide-react";
 
 // Defer the Monaco-heavy overlays out of the initial bundle — they load only
@@ -121,6 +121,9 @@ function TitleBar({
   const hasFrames = useStore((s) => s.frames.length > 0);
   const sidebarCollapsed = useStore((s) => s.sidebarCollapsed);
   const toggleSidebar = useStore((s) => s.toggleSidebar);
+  const runningAgents = useStore(
+    (s) => Object.values(s.rustPtySessions).filter((m) => m.status === "running").length,
+  );
 
   return (
     <header className="titlebar-drag flex h-12 shrink-0 items-center justify-between border-b border-ink-600 bg-ink-800 pl-[88px] pr-4">
@@ -161,10 +164,16 @@ function TitleBar({
         )}
         <button
           onClick={onOpenGraph}
-          className="no-drag flex items-center gap-2.5 rounded-full border border-ink-600 px-3.5 py-1.5 text-xs text-zinc-300 hover:bg-ink-600"
+          title="Agent team & activity graph (⌘⇧A)"
+          className="no-drag flex items-center gap-2 rounded-full border border-ink-600 px-3.5 py-1.5 text-xs text-zinc-300 hover:bg-ink-600"
         >
-          <Activity size={13} />
-          Activity
+          <Users size={13} />
+          Team
+          {runningAgents > 0 && (
+            <span className="rounded-full bg-teal-400/20 px-1.5 text-[10px] font-semibold text-teal-300">
+              {runningAgents}
+            </span>
+          )}
         </button>
         <BackendStatusPill state={backend} />
       </div>

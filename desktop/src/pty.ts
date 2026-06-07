@@ -25,6 +25,8 @@ export interface TurnEvent {
   startedCause: string;
   endedCause: string;
   commandExit: number | null;
+  /** Files the daemon's fs-watcher saw change during this turn (Phase 6). */
+  fsDirtyPaths: string[];
 }
 
 /** A session enumerated from the daemon's own registry (for discovery/adoption
@@ -61,6 +63,7 @@ export async function daemonSpawnAgent(
   attributionKey: string | null,
   model: string | null = null,
   injectOrchestration = false,
+  profile = "default",
 ): Promise<string> {
   return invoke<string>("daemon_spawn_agent", {
     provider,
@@ -71,6 +74,9 @@ export async function daemonSpawnAgent(
     permissionMode: null,
     attributionKey: attributionKey ?? null,
     injectOrchestration,
+    // The daemon resolves this name against its profile store
+    // (~/.taime/agents/*.toml + built-ins) to fill system_prompt/model/tools.
+    profile,
   });
 }
 
@@ -126,8 +132,25 @@ export async function daemonQuery<T>(
  *  (assign/handoff/message), read from the durable store — complete even with the
  *  UI closed. The frontend route switch to this lands with the diff move. */
 export interface DaemonActivityGraph {
-  agents: { id: string; provider: string | null; status: string | null }[];
+  agents: {
+    id: string;
+    provider: string | null;
+    status: string | null;
+    branch?: string | null;
+    mode?: string | null;
+    member_of?: string | null;
+    turns?: {
+      id: string;
+      turn_index: number;
+      started_at: string | null;
+      ended_at: string | null;
+      files_touched: string[];
+      start_snapshot: string | null;
+      end_snapshot: string | null;
+    }[];
+  }[];
   edges: { kind: string; source: string; target: string }[];
+  contention?: { path: string; terminals: string[] }[];
 }
 
 export async function daemonActivityGraph(): Promise<DaemonActivityGraph> {
@@ -227,8 +250,9 @@ export async function daemonAvailable(): Promise<boolean> {
 /**
  * Attach to a daemon session. The grid repaint (at the supplied viewport) +
  * live output arrive as `ArrayBuffer` via `onBytes`; control objects arrive as
- * JSON: `exit` → `onExit`, `turn` → `onTurn`. Returns the `Channel` — the caller
- * must keep it alive (GC of it silently stops output).
+ * JSON: `exit` → `onExit`, `turn` → `onTurn`, `status` → `onStatus` (Phase 4
+ * push), `fs_dirty` → `onFsDirty` (Phase 6 push). Returns the `Channel` — the
+ * caller must keep it alive (GC of it silently stops output).
  */
 export async function daemonAttach(
   sessionId: string,
@@ -237,6 +261,8 @@ export async function daemonAttach(
   onBytes: (bytes: Uint8Array) => void,
   onExit: (code: number | null) => void,
   onTurn?: (turn: TurnEvent) => void,
+  onStatus?: (status: string) => void,
+  onFsDirty?: (paths: string[]) => void,
 ): Promise<Channel<PtyChannelMessage> | null> {
   if (!inTauri()) return null;
   const onData = new Channel<PtyChannelMessage>();
@@ -247,9 +273,18 @@ export async function daemonAttach(
       const view = msg as ArrayBufferView;
       onBytes(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
     } else if (msg && typeof msg === "object") {
-      const m = msg as { type?: string; code?: number | null };
+      const m = msg as {
+        type?: string;
+        code?: number | null;
+        status?: string;
+        paths?: string[];
+      };
       if (m.type === "exit") onExit(m.code ?? null);
       else if (m.type === "turn" && onTurn) onTurn(msg as unknown as TurnEvent);
+      // Phase 4 push: inferred status changed → update the badge without polling.
+      else if (m.type === "status" && onStatus && m.status) onStatus(m.status);
+      // Phase 6 push: daemon's per-session watcher saw paths change → mark dirty.
+      else if (m.type === "fs_dirty" && onFsDirty && m.paths) onFsDirty(m.paths);
       else if (m.type === "error") console.warn("[taime] daemon error", msg);
     }
   };
