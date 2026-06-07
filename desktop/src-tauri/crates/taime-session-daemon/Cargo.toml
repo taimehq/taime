@@ -37,6 +37,17 @@ anyhow = "1"
 rand = "0.8"
 subtle = "2"
 dirs = "5"
+# Schedules (cron-triggered unattended Agent/Workflow runs): saffron parses a
+# 5-field POSIX cron string (Sun=0, so `1-5` = Mon–Fri, matching CAO) and computes
+# the next fire time. chrono provides the wall clock.
+saffron = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Per-session source-tree watcher (Phase 6 daemon-owned fs attribution): the
+# daemon watches each agent's worktree, records change events to the store, and
+# pushes dirty paths to the app. Same versions as the (retired) app-side watcher.
+notify = "6"
+notify-debouncer-full = "0.3"
+ignore = "0.4"
 
 # Authoritative headless emulator + (alternative) repaint renderer. Git-pinned,
 # SAME rev for both, NOT crates.io (wezterm-term is unpublished; crates.io termwiz

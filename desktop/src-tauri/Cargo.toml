@@ -37,10 +37,7 @@ tokio = { version = "1", features = ["time", "net", "io-util", "sync", "rt", "ma
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
 futures = "0.3"
-# File watcher: native FS events + debouncing + gitignore-aware filtering.
-notify = "6"
-notify-debouncer-full = "0.3"
-ignore = "0.4"
+# (File watching moved into the session daemon — it owns the one watcher now.)
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

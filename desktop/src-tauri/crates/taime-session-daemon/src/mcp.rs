@@ -23,14 +23,14 @@ use crate::manager::Manager;
 const MCP_PROTOCOL: &str = "2024-11-05";
 
 /// The orchestration tool schemas (JSON Schema per the MCP spec) returned by
-/// `tools/list`. Phase-5 MVP exposes `list_agents` + `send_message`; the rest
-/// (`broadcast`/`request`/`reply`/`handoff`/`assign`/`share`) land with the
-/// transport.
+/// `tools/list`: the full Phase-5 surface — `list_agents`, `send_message`,
+/// `broadcast` (role-filterable), `request`/`reply` (correlated), `handoff`,
+/// `assign` (role + tools + fan/depth limits), and the `share`/`get` blackboard.
 pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "list_agents",
-            "description": "List the live agent sessions: id, provider, status, cwd.",
+            "description": "List the live agent sessions: id, provider, role, status, cwd.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
@@ -48,11 +48,40 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "broadcast",
-            "description": "Send a message to every other live agent's inbox.",
+            "description": "Send a message to every other live agent's inbox, optionally only those with a given role (profile name).",
             "inputSchema": {
                 "type": "object",
-                "properties": { "body": { "type": "string", "description": "Message body." } },
+                "properties": {
+                    "body": { "type": "string", "description": "Message body." },
+                    "role": { "type": "string", "description": "Optional role filter: only agents launched under this profile name receive it." }
+                },
                 "required": ["body"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "request",
+            "description": "Send a message that expects a reply. Returns an interaction_id; the receiver answers with `reply`. Use to ask another agent a question and correlate the answer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string", "description": "Receiver agent id." },
+                    "body": { "type": "string", "description": "The question / request body." }
+                },
+                "required": ["to", "body"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "reply",
+            "description": "Answer a `request` you received, by its interaction_id. Delivered back to the original requester.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "interaction_id": { "type": "string", "description": "The interaction id from the request you received." },
+                    "body": { "type": "string", "description": "Your answer." }
+                },
+                "required": ["interaction_id", "body"],
                 "additionalProperties": false
             }
         },
@@ -71,14 +100,59 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "assign",
-            "description": "Spawn a worker sub-agent in its own worktree, seed it with a task, and get back its id. The worker reports results to you via send_message.",
+            "description": "Spawn a worker sub-agent in its own worktree under an optional role (profile name) with an optional tool allow-list, seed it with a task, and get back its id. The worker reports its result to you via send_message; the daemon also notifies you when it exits. Subject to fan-out/depth limits.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "message": { "type": "string", "description": "The task for the worker." },
+                    "role": { "type": "string", "description": "Optional profile name to launch the worker under (default: default)." },
+                    "tools": { "type": "array", "items": { "type": "string" }, "description": "Optional allowed-tools override for the worker." },
                     "working_directory": { "type": "string", "description": "Optional project root to fork the worker's worktree from." }
                 },
                 "required": ["message"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "share",
+            "description": "Post a value to the shared blackboard under a key (last writer wins). Other agents read it with `get`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Blackboard key." },
+                    "value": { "type": "string", "description": "Value to store." }
+                },
+                "required": ["key", "value"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "get",
+            "description": "Read a value from the shared blackboard by key. Returns the value, its author, and when it was last updated (or null if absent).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "key": { "type": "string", "description": "Blackboard key." } },
+                "required": ["key"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "create_workflow",
+            "description": "Define a reusable Workflow — a graph of agent steps with conditional branches and loops. Pass a JSON definition: {name, entry, max_iterations?, nodes:[{id, role, prompt, output_key?}], edges:[{from, to, when}]} where `role` is a profile name and `when` is \"always\" | \"keyword:WORD\" | \"/regex/\" (first matching edge wins; no match = terminal). Each node's worker posts its result with the `share` tool to the node's output_key; edges route on that. Returns the workflow name; run it with run_workflow.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "definition": { "type": "string", "description": "The workflow JSON." } },
+                "required": ["definition"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "run_workflow",
+            "description": "Start a run of a named Workflow in the background. Each step spawns a worker in its own worktree; the engine routes between steps on their results, with branches + bounded loops. Returns the run id immediately; you'll be messaged when it finishes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "name": { "type": "string", "description": "Workflow name." } },
+                "required": ["name"],
                 "additionalProperties": false
             }
         }
@@ -120,9 +194,11 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
                 .list()
                 .into_iter()
                 .map(|s| {
+                    let key = s.attribution_key.clone().unwrap_or_else(|| s.id.clone());
                     json!({
-                        "id": s.attribution_key.unwrap_or(s.id),
+                        "id": key,
                         "provider": s.provider,
+                        "role": manager.role_of(&key),
                         "status": s.status.map(status_str),
                         "cwd": s.cwd,
                     })
@@ -141,7 +217,11 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
             }
             // `from` is the authenticated caller — never a client field.
             match manager.enqueue_message(caller.to_string(), to.to_string(), body.to_string()) {
-                Ok(mid) => tool_ok(id, json!({ "ok": true, "message_id": mid })),
+                Ok(mid) => {
+                    // Record the message as a graph edge (the activity substrate).
+                    manager.record_edge("message", caller, to);
+                    tool_ok(id, json!({ "ok": true, "message_id": mid }))
+                }
                 Err(e) => tool_err(id, &format!("send_message failed: {e}")),
             }
         }
@@ -150,8 +230,34 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
             if body.is_empty() {
                 return tool_err(id, "broadcast: 'body' is required");
             }
-            let n = manager.broadcast(caller, body);
+            let role = args.get("role").and_then(|v| v.as_str()).filter(|r| !r.is_empty());
+            let n = manager.broadcast(caller, body, role);
             tool_ok(id, json!({ "ok": true, "recipients": n }))
+        }
+        "request" => {
+            let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            if to.is_empty() || to == caller {
+                return tool_err(id, "request: a distinct 'to' is required");
+            }
+            if body.is_empty() {
+                return tool_err(id, "request: 'body' is required");
+            }
+            match manager.request(caller, to, body) {
+                Ok(interaction_id) => tool_ok(id, json!({ "ok": true, "interaction_id": interaction_id })),
+                Err(e) => tool_err(id, &format!("request failed: {e}")),
+            }
+        }
+        "reply" => {
+            let interaction_id = args.get("interaction_id").and_then(|v| v.as_str()).unwrap_or("");
+            let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            if interaction_id.is_empty() {
+                return tool_err(id, "reply: 'interaction_id' is required");
+            }
+            match manager.reply(caller, interaction_id, body) {
+                Ok(mid) => tool_ok(id, json!({ "ok": true, "message_id": mid })),
+                Err(e) => tool_err(id, &format!("reply failed: {e}")),
+            }
         }
         "handoff" => {
             let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
@@ -173,9 +279,52 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
                 .get("working_directory")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            match manager.assign_worker(caller, message, wd) {
+            let role = args.get("role").and_then(|v| v.as_str()).filter(|r| !r.is_empty());
+            let tools: Option<Vec<String>> = args.get("tools").and_then(|v| v.as_array()).map(|a| {
+                a.iter().filter_map(|t| t.as_str().map(String::from)).collect()
+            });
+            match manager.assign_worker(caller, message, wd, role, tools) {
                 Ok(worker) => tool_ok(id, json!({ "ok": true, "worker_id": worker })),
                 Err(e) => tool_err(id, &format!("assign failed: {e}")),
+            }
+        }
+        "share" => {
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            if key.is_empty() {
+                return tool_err(id, "share: 'key' is required");
+            }
+            match manager.blackboard_set(key, value, caller) {
+                Ok(()) => tool_ok(id, json!({ "ok": true, "key": key })),
+                Err(e) => tool_err(id, &format!("share failed: {e}")),
+            }
+        }
+        "get" => {
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            if key.is_empty() {
+                return tool_err(id, "get: 'key' is required");
+            }
+            match manager.blackboard_get(key) {
+                Ok(Some((value, author, updated_at))) => tool_ok(
+                    id,
+                    json!({ "found": true, "key": key, "value": value, "author": author, "updated_at": updated_at }),
+                ),
+                Ok(None) => tool_ok(id, json!({ "found": false, "key": key, "value": Value::Null })),
+                Err(e) => tool_err(id, &format!("get failed: {e}")),
+            }
+        }
+        "create_workflow" => {
+            let def = args.get("definition").and_then(|v| v.as_str()).unwrap_or("");
+            match manager.create_workflow(def, "generated") {
+                Ok(name) => tool_ok(id, json!({ "ok": true, "name": name })),
+                Err(e) => tool_err(id, &format!("create_workflow failed: {e}")),
+            }
+        }
+        "run_workflow" => {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            match manager.run_workflow(name, None, Some(caller.to_string())) {
+                Ok(run_id) => tool_ok(id, json!({ "ok": true, "run_id": run_id })),
+                Err(e) => tool_err(id, &format!("run_workflow failed: {e}")),
             }
         }
         other => error(id, -32602, &format!("unknown tool '{other}'")),
@@ -334,9 +483,81 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for t in ["list_agents", "send_message", "broadcast", "handoff", "assign"] {
+        for t in [
+            "list_agents",
+            "send_message",
+            "broadcast",
+            "request",
+            "reply",
+            "handoff",
+            "assign",
+            "share",
+            "get",
+        ] {
             assert!(names.contains(&t), "missing tool {t}");
         }
+    }
+
+    fn call(mgr: &Manager, caller: &str, id: i64, name: &str, args: Value) -> Value {
+        handle(
+            mgr,
+            caller,
+            &json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                     "params": { "name": name, "arguments": args } }),
+        )
+    }
+
+    /// Pull the `text` content block of a tool result and parse it as JSON.
+    fn tool_json(resp: &Value) -> Value {
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn request_then_reply_correlates_over_mcp() {
+        let mgr = manager();
+        let req = call(&mgr, "term-a", 20, "request", json!({ "to": "term-b", "body": "status?" }));
+        assert_eq!(req["result"]["isError"], false);
+        let iid = tool_json(&req)["interaction_id"].as_str().unwrap().to_string();
+        assert!(!iid.is_empty());
+
+        // Wrong responder is rejected.
+        let bad = call(&mgr, "term-c", 21, "reply", json!({ "interaction_id": iid, "body": "x" }));
+        assert_eq!(bad["result"]["isError"], true);
+
+        // Addressed responder succeeds; the reply reaches the requester's inbox.
+        let ok = call(&mgr, "term-b", 22, "reply", json!({ "interaction_id": iid, "body": "all green" }));
+        assert_eq!(ok["result"]["isError"], false);
+        let to_a = mgr.store().unwrap().pending_for("term-a", 10).unwrap();
+        assert!(to_a.iter().any(|m| m.message.contains("all green")));
+    }
+
+    #[test]
+    fn share_then_get_round_trips_over_mcp() {
+        let mgr = manager();
+        let s = call(&mgr, "term-a", 30, "share", json!({ "key": "plan", "value": "ship it" }));
+        assert_eq!(s["result"]["isError"], false);
+
+        let g = call(&mgr, "term-b", 31, "get", json!({ "key": "plan" }));
+        assert_eq!(g["result"]["isError"], false);
+        let got = tool_json(&g);
+        assert_eq!(got["found"], true);
+        assert_eq!(got["value"], "ship it");
+        assert_eq!(got["author"], "term-a");
+
+        // A missing key is found:false, not an error.
+        let miss = call(&mgr, "term-b", 32, "get", json!({ "key": "nope" }));
+        assert_eq!(tool_json(&miss)["found"], false);
+    }
+
+    #[test]
+    fn broadcast_accepts_a_role_filter() {
+        let mgr = manager();
+        // With no live agents either form is 0 recipients (the role param plumbs
+        // through without error).
+        let resp = call(&mgr, "term-a", 40, "broadcast", json!({ "body": "hi", "role": "reviewer" }));
+        assert_eq!(resp["result"]["isError"], false);
+        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("\"recipients\":0"));
     }
 
     #[test]

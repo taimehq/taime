@@ -21,6 +21,7 @@
 //! mark the session attached — so the reader's first live data frame
 //! (`start_offset >= seq_n`) is ordered strictly after the repaint.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -30,12 +31,18 @@ use bytes::Bytes;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use taime_protocol::{
     encode_data, encode_repaint, encode_server, AgentStatus, ServerMsg, SessionSummary, SpawnSpec,
+    TurnInfo,
 };
 use tokio::sync::mpsc;
 
 use crate::attribution::Attribution;
 use crate::providers::{Cleanup, DaemonSessionSpec, GridView, Prepared, Provider};
+use crate::store::Store;
 use crate::{emulator, repaint};
+
+/// Cap on the dirty-path set pushed to the app per `FsDirty` (mirrors the app
+/// badge's old truncation).
+const FS_DIRTY_CAP: usize = 50;
 
 /// Backpressure watermarks (bytes in flight = sent − acked). Generous for the
 /// daemon's two-hop path (socket + Tauri channel + xterm); 64 KiB would stall a
@@ -70,6 +77,15 @@ struct SessionState {
     last_output: Instant,
     /// Output seen since the last turn boundary (gates the quiet-window close).
     turn_dirty: bool,
+    /// Last status pushed to the attached client (Phase 4 push) — push only on
+    /// change.
+    last_status: Option<AgentStatus>,
+    /// Paths the daemon's fs-watcher saw change since the current turn opened;
+    /// drained into each closing turn's `fs_dirty_paths` (Phase 6).
+    fs_turn_dirty: BTreeSet<String>,
+    /// Accumulated dirty paths since the last review/clear — the full set pushed
+    /// to the app on `FsDirty` (the badge/inventory).
+    fs_all_dirty: BTreeSet<String>,
 }
 
 struct SessionInner {
@@ -90,6 +106,11 @@ struct SessionInner {
     /// Spawn-time MCP injection to undo when the process exits (best-effort).
     cleanup: Cleanup,
     created_at_unix: u64,
+    /// Durable store handle (Phase 6) — the session records its own fs-change
+    /// activity here so attribution accrues even with the app closed.
+    store: Option<Arc<Store>>,
+    /// The per-session source-tree watcher (RAII: dropping it stops the OS watch).
+    watcher: Mutex<Option<crate::fswatch::SessionWatcher>>,
     state: Mutex<SessionState>,
     resume: Condvar,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -107,7 +128,11 @@ pub struct Session {
 impl Session {
     /// Spawn a low-level [`SpawnSpec`] (the Claude-only Step-2 path; no provider
     /// recipe, no MCP cleanup). Kept for back-compat with `ClientMsg::Spawn`.
-    pub fn spawn(id: String, spec: &SpawnSpec) -> Result<Session, String> {
+    pub fn spawn(
+        id: String,
+        spec: &SpawnSpec,
+        store: Option<Arc<Store>>,
+    ) -> Result<Session, String> {
         let dspec = DaemonSessionSpec {
             prog: spec.prog.clone(),
             args: spec.args.clone(),
@@ -119,7 +144,7 @@ impl Session {
             attribution_key: spec.attribution_key.clone(),
             paste_enter_count: 1,
         };
-        Self::spawn_inner(id, &dspec, Cleanup::default(), None)
+        Self::spawn_inner(id, &dspec, Cleanup::default(), None, store)
     }
 
     /// Spawn a registry-`Prepared` agent: the daemon-built command + MCP injection
@@ -129,8 +154,9 @@ impl Session {
         id: String,
         prepared: Prepared,
         adapter: Option<Box<dyn Provider>>,
+        store: Option<Arc<Store>>,
     ) -> Result<Session, String> {
-        Self::spawn_inner(id, &prepared.spec, prepared.cleanup, adapter)
+        Self::spawn_inner(id, &prepared.spec, prepared.cleanup, adapter, store)
     }
 
     /// Shared PTY setup for both spawn paths.
@@ -139,6 +165,7 @@ impl Session {
         spec: &DaemonSessionSpec,
         cleanup: Cleanup,
         adapter: Option<Box<dyn Provider>>,
+        store: Option<Arc<Store>>,
     ) -> Result<Session, String> {
         let provider = adapter.as_ref().map(|a| a.id().to_string());
         let pty_system = native_pty_system();
@@ -202,6 +229,8 @@ impl Session {
             paste_enter_count: spec.paste_enter_count,
             cleanup,
             created_at_unix,
+            store,
+            watcher: Mutex::new(None),
             state: Mutex::new(SessionState {
                 term: emulator::build_terminal(spec.rows, spec.cols),
                 attr: Attribution::new(id.clone()),
@@ -212,6 +241,9 @@ impl Session {
                 cols: spec.cols,
                 last_output: Instant::now(),
                 turn_dirty: false,
+                last_status: None,
+                fs_turn_dirty: BTreeSet::new(),
+                fs_all_dirty: BTreeSet::new(),
             }),
             resume: Condvar::new(),
             writer: Mutex::new(writer),
@@ -220,6 +252,7 @@ impl Session {
             dead: AtomicBool::new(false),
         });
 
+        start_fs_watch(&inner);
         spawn_reader(inner.clone(), reader);
         Ok(Session { inner })
     }
@@ -252,6 +285,18 @@ impl Session {
         out.send(attach_ok).map_err(|e| format!("attach send: {e}"))?;
         out.send(encode_repaint(seq_n, &repaint_bytes))
             .map_err(|e| format!("repaint send: {e}"))?;
+
+        // Replay the current accumulated dirty set so a (re)attaching client's
+        // badge is correct immediately, rather than lagging until the next fs
+        // change (Phase 6: FsDirty is otherwise only pushed on change, to the one
+        // attached client).
+        if !st.fs_all_dirty.is_empty() {
+            let mut paths: Vec<String> = st.fs_all_dirty.iter().cloned().collect();
+            paths.truncate(FS_DIRTY_CAP);
+            if let Ok(frame) = encode_server(&ServerMsg::FsDirty { paths }) {
+                let _ = out.send(frame);
+            }
+        }
 
         st.attached = Some(AttachedClient {
             out,
@@ -326,8 +371,10 @@ impl Session {
     pub fn checkpoint(&self) {
         let mut st = self.inner.state.lock().unwrap();
         let off = st.out_offset;
-        if let Some(turn) = st.attr.checkpoint(off) {
+        if let Some(mut turn) = st.attr.checkpoint(off) {
             st.turn_dirty = false;
+            drain_turn_paths(&mut st, &mut turn);
+            persist_turn(&self.inner, &turn);
             if let (Some(c), Ok(frame)) = (
                 st.attached.as_ref(),
                 encode_server(&ServerMsg::TurnBoundary { turn }),
@@ -345,8 +392,10 @@ impl Session {
             return;
         }
         let off = st.out_offset;
-        if let Some(turn) = st.attr.quiet(off) {
+        if let Some(mut turn) = st.attr.quiet(off) {
             st.turn_dirty = false;
+            drain_turn_paths(&mut st, &mut turn);
+            persist_turn(&self.inner, &turn);
             if let (Some(c), Ok(frame)) = (
                 st.attached.as_ref(),
                 encode_server(&ServerMsg::TurnBoundary { turn }),
@@ -384,6 +433,70 @@ impl Session {
             let lines = emulator::snapshot_visible_text(&st.term);
             a.status(&GridView::new(&lines))
         })
+    }
+
+    /// Push a `StatusChanged` to the attached client when the inferred status
+    /// changes (Phase 4 push). Called on the manager tick — cheap (one regex pass
+    /// over the grid) and only emits on a transition.
+    pub fn push_status_if_changed(&self) {
+        let mut st = self.inner.state.lock().unwrap();
+        let status = self.infer_status(&st);
+        if status == st.last_status {
+            return;
+        }
+        st.last_status = status;
+        if let (Some(s), Some(c)) = (status, st.attached.as_ref()) {
+            if let Ok(frame) = encode_server(&ServerMsg::StatusChanged { status: s }) {
+                let _ = c.out.send(frame);
+            }
+        }
+    }
+
+    /// Ingest a batch of filesystem changes from this session's watcher (Phase 6):
+    /// accumulate the dirty sets, record each change to the durable store, and —
+    /// if the dirty set grew — push the full set to the attached client so the app
+    /// badge updates without polling. Runs on the debouncer's thread.
+    pub fn note_fs_changes(&self, changes: Vec<crate::fswatch::FsChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        let (grew, snapshot, out) = {
+            let mut st = self.inner.state.lock().unwrap();
+            let mut grew = false;
+            for c in &changes {
+                st.fs_turn_dirty.insert(c.path.clone());
+                if st.fs_all_dirty.insert(c.path.clone()) {
+                    grew = true;
+                }
+            }
+            let mut paths: Vec<String> = st.fs_all_dirty.iter().cloned().collect();
+            paths.truncate(FS_DIRTY_CAP);
+            let out = if grew { st.attached.as_ref().map(|c| c.out.clone()) } else { None };
+            (grew, paths, out)
+        };
+        // Durable per-file attribution (best-effort), outside the state lock.
+        if let (Some(store), Some(key)) = (&self.inner.store, &self.inner.attribution_key) {
+            let ts = now_unix_secs();
+            for c in &changes {
+                let _ = store.record_fs_event(&gen_event_id(), key, &c.path, c.kind, ts);
+            }
+        }
+        // Push the full dirty set to the app (Phase 6 fs-dirty push).
+        if grew {
+            if let Some(out) = out {
+                if let Ok(frame) = encode_server(&ServerMsg::FsDirty { paths: snapshot }) {
+                    let _ = out.send(frame);
+                }
+            }
+        }
+    }
+
+    /// Clear the accumulated dirty set (the user reviewed the diff). Resets both
+    /// the badge set and the in-flight turn set so future pushes start fresh.
+    pub fn clear_fs_dirty(&self) {
+        let mut st = self.inner.state.lock().unwrap();
+        st.fs_all_dirty.clear();
+        st.fs_turn_dirty.clear();
     }
 
     /// Whether the agent is ready to receive an injected message: IDLE or
@@ -432,6 +545,60 @@ impl Session {
     }
 }
 
+/// Persist a closed attribution turn to the durable store (best-effort) so the
+/// flagship turn substrate — including its files-touched — survives restarts and
+/// feeds the graph/attribution surface even with the app closed.
+fn persist_turn(inner: &SessionInner, turn: &TurnInfo) {
+    if let (Some(store), Some(key)) = (&inner.store, &inner.attribution_key) {
+        let now = now_unix_secs();
+        let _ = store.record_turn(&gen_event_id(), key, turn.epoch, now, now, &turn.fs_dirty_paths);
+    }
+}
+
+/// Move the fs paths seen during the now-closing turn into its `fs_dirty_paths`
+/// (sorted) and reset the per-turn set. The accumulated badge set is untouched.
+fn drain_turn_paths(st: &mut SessionState, turn: &mut TurnInfo) {
+    if st.fs_turn_dirty.is_empty() {
+        return;
+    }
+    // BTreeSet already yields sorted; collect then clear.
+    turn.fs_dirty_paths = st.fs_turn_dirty.iter().cloned().collect();
+    st.fs_turn_dirty.clear();
+}
+
+/// Start the per-session source-tree watcher on the agent's cwd (best-effort: a
+/// non-dir cwd or watcher-init failure just means no fs attribution). The
+/// callback holds a `Weak` to avoid a ref-cycle that would keep the session — and
+/// thus the OS watch — alive forever; on session drop the watcher drops with it.
+fn start_fs_watch(inner: &Arc<SessionInner>) {
+    if inner.cwd.is_empty() {
+        return;
+    }
+    let dir = std::path::PathBuf::from(&inner.cwd);
+    if !dir.is_dir() {
+        return;
+    }
+    let weak = Arc::downgrade(inner);
+    let watcher = crate::fswatch::spawn_watcher(&dir, move |batch| {
+        if let Some(strong) = weak.upgrade() {
+            Session { inner: strong }.note_fs_changes(batch);
+        }
+    });
+    match watcher {
+        Ok(w) => *inner.watcher.lock().unwrap() = Some(w),
+        Err(e) => eprintln!("[taime-daemon] fs-watch disabled for {}: {e}", inner.id),
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// A random hex id for an fs activity-event row.
+fn gen_event_id() -> String {
+    format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>())
+}
+
 /// The blocking PTY reader thread.
 fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
     std::thread::spawn(move || {
@@ -459,10 +626,18 @@ fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
             st.term.advance_bytes(chunk);
             let start = st.out_offset;
             let end = start + n as u64;
-            let turns = st.attr.feed(chunk, end);
+            let mut turns = st.attr.feed(chunk, end);
             st.out_offset = end;
             st.last_output = Instant::now();
             st.turn_dirty = true;
+            // Attribute fs changes accumulated during this turn to its boundary.
+            if let Some(turn) = turns.last_mut() {
+                drain_turn_paths(st, turn);
+            }
+            // Persist every closed turn (durable, regardless of attach).
+            for turn in &turns {
+                persist_turn(&inner, turn);
+            }
             if let Some(c) = st.attached.as_mut() {
                 let mut ok = c.out.send(encode_data(start, chunk)).is_ok();
                 for turn in turns {
@@ -503,4 +678,64 @@ fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+impl Session {
+    /// The accumulated badge dirty set (test inspection).
+    pub fn fs_all_dirty_snapshot(&self) -> Vec<String> {
+        self.inner.state.lock().unwrap().fs_all_dirty.iter().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// A live end-to-end check that the daemon-owned watcher records a real file
+    /// change to the store AND into the badge dirty set.
+    #[test]
+    fn fs_watch_records_changes_to_store_and_dirty_set() {
+        let dir = std::env::temp_dir().join(format!("taime-fsw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let store = Arc::new(Store::open_at(Path::new(":memory:")).unwrap());
+        let spec = SpawnSpec {
+            // A long-lived process so the watcher stays up during the test.
+            prog: "sleep".into(),
+            args: vec!["10".into()],
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            env: vec![],
+            rows: 24,
+            cols: 80,
+            attribution_key: Some("term-fsw".into()),
+        };
+        let session = Session::spawn("pty-fsw".into(), &spec, Some(store.clone())).unwrap();
+
+        // Create a source file; the debounced watcher should pick it up.
+        std::fs::write(dir.join("hello.txt"), "hi").unwrap();
+
+        let mut recorded = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if store
+                .fs_path_touches("term-fsw")
+                .unwrap()
+                .iter()
+                .any(|(p, _)| p == "hello.txt")
+            {
+                recorded = true;
+                break;
+            }
+        }
+        session.kill();
+        let dirty = session.fs_all_dirty_snapshot();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(recorded, "watcher should record the new file to the store");
+        assert!(dirty.iter().any(|p| p == "hello.txt"), "dirty set: {dirty:?}");
+    }
 }

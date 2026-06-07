@@ -10,10 +10,15 @@ mod attribution;
 mod conn;
 mod diff;
 mod emulator;
+mod fswatch;
 mod listener;
 mod manager;
 mod mcp;
+mod profiles;
 mod providers;
+mod schedules;
+mod workflow;
+mod workflow_engine;
 mod repaint;
 mod runtime;
 mod session;
@@ -141,6 +146,7 @@ fn run_import_cao(cao_path: &std::path::Path) -> anyhow::Result<()> {
 fn cleanup(paths: &Paths) {
     let _ = std::fs::remove_file(&paths.socket);
     let _ = std::fs::remove_file(&paths.token);
+    let _ = std::fs::remove_file(&paths.lock);
 }
 
 #[tokio::main]
@@ -177,6 +183,12 @@ async fn main() -> anyhow::Result<()> {
     let token = listener::write_token(&paths.token)?;
     let listener = listener::bind_secure(&paths.socket).await?;
     let manager = Arc::new(Manager::new());
+    // Let the manager hand its own Arc to background driver threads (the workflow
+    // engine), then ingest schedule + workflow files.
+    manager.init_self();
+    manager.load_schedules_on_start();
+    manager.seed_example_workflows();
+    manager.load_workflow_files();
     eprintln!("[taime-daemon] listening on {:?}", paths.socket);
 
     // Signal handler: unlink socket + token, kill children, exit.
@@ -214,12 +226,21 @@ async fn main() -> anyhow::Result<()> {
         };
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(250));
+            let mut n: u64 = 0;
             loop {
                 ticker.tick().await;
                 if mgr.gc_tick(QUIET_WINDOW, IDLE_GRACE) {
                     eprintln!("[taime-daemon] idle with no sessions; shutting down");
                     cleanup(&paths_gc);
                     std::process::exit(0);
+                }
+                // Schedules: check due cron schedules every ~30s, OFF the hot tick
+                // (sqlite + an optional shell gate) so a slow gate never stalls the
+                // 250 ms delivery/quiet-window loop.
+                n = n.wrapping_add(1);
+                if n % 120 == 0 {
+                    let m = mgr.clone();
+                    tokio::task::spawn_blocking(move || m.check_schedules());
                 }
             }
         });

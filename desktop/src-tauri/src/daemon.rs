@@ -34,6 +34,12 @@ fn framed(stream: UnixStream) -> Conn {
         .new_framed(stream)
 }
 
+/// Whether a handshake error is the daemon rejecting our `Hello` (magic/version/
+/// token mismatch) — the signal that a stale, pre-upgrade daemon is running.
+fn is_protocol_reject(err: &str) -> bool {
+    err.contains("handshake rejected")
+}
+
 /// Per-attached-session handle: the outbound control channel + the offset
 /// accounting needed to translate the frontend's processed-byte count into the
 /// absolute `AckBytes` offset the daemon expects.
@@ -51,6 +57,9 @@ pub struct DaemonClient {
     daemon_bin: Option<PathBuf>,
     req_counter: AtomicU64,
     attaches: Mutex<HashMap<String, AttachHandle>>,
+    /// Serializes stale-daemon replacement so two ops hitting the protocol-mismatch
+    /// path at once don't each spawn a replacement.
+    restart_lock: Mutex<()>,
 }
 
 impl DaemonClient {
@@ -61,6 +70,7 @@ impl DaemonClient {
             daemon_bin,
             req_counter: AtomicU64::new(1),
             attaches: Mutex::new(HashMap::new()),
+            restart_lock: Mutex::new(()),
         }
     }
 
@@ -120,24 +130,98 @@ impl DaemonClient {
         }
     }
 
-    /// Spawn-if-needed, then connect + handshake. Used by ops that REQUIRE a
-    /// daemon (spawn, attach).
-    async fn connect_handshake(&self) -> Result<Conn, String> {
-        self.ensure_running().await?;
+    /// Connect to the (already-running) daemon and handshake. No spawn.
+    async fn connect_once(&self) -> Result<Conn, String> {
         let stream = UnixStream::connect(&self.socket)
             .await
             .map_err(|e| format!("connect: {e}"))?;
         self.handshake(framed(stream)).await
     }
 
+    /// Spawn-if-needed, then connect + handshake. Used by ops that REQUIRE a
+    /// daemon (spawn, attach). If the daemon we reach speaks a different protocol
+    /// (e.g. a pre-upgrade daemon still running — `HelloRejected`), replace it with
+    /// the current binary and retry ONCE, so an app upgrade self-heals instead of
+    /// requiring a manual `pkill`.
+    async fn connect_handshake(&self) -> Result<Conn, String> {
+        self.ensure_running().await?;
+        match self.connect_once().await {
+            Err(e) if is_protocol_reject(&e) => {
+                eprintln!("[taime] daemon protocol mismatch ({e}); replacing stale daemon");
+                self.restart_daemon().await?;
+                self.connect_once().await
+            }
+            other => other,
+        }
+    }
+
     /// Connect-only handshake: returns `Ok(None)` if no daemon is reachable.
     /// Does NOT spawn one — used by enumeration/kill so we never boot a daemon
-    /// just to list (or to kill a session that's already gone with it).
+    /// just to list. A stale (wrong-protocol) daemon IS replaced, though, so the
+    /// next poll heals it instead of erroring every tick.
     async fn try_connect_handshake(&self) -> Result<Option<Conn>, String> {
-        match UnixStream::connect(&self.socket).await {
-            Ok(stream) => self.handshake(framed(stream)).await.map(Some),
-            Err(_) => Ok(None),
+        if UnixStream::connect(&self.socket).await.is_err() {
+            return Ok(None); // no daemon — caller uses its fallback
         }
+        match self.connect_once().await {
+            Ok(c) => Ok(Some(c)),
+            Err(e) if is_protocol_reject(&e) => {
+                eprintln!("[taime] daemon protocol mismatch ({e}); replacing stale daemon");
+                // If we can't replace it (no binary), fall back rather than error.
+                match self.restart_daemon().await {
+                    Ok(()) => self.connect_once().await.map(Some),
+                    Err(_) => Ok(None),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The pid the live daemon recorded in its lock file (read only after a
+    /// confirmed-live handshake, so it's the current lock holder — no PID reuse).
+    fn read_lock_pid(&self) -> Option<i32> {
+        std::fs::read_to_string(paths::lock_path(&self.socket)).ok()?.trim().parse::<i32>().ok()
+    }
+
+    /// Replace a stale/incompatible daemon: SIGTERM it (its handler kills its old
+    /// agents + unlinks its runtime files), remove any leftover socket/token/lock,
+    /// then spawn the current binary fresh and wait for it to come up.
+    async fn restart_daemon(&self) -> Result<(), String> {
+        let _guard = self.restart_lock.lock().await;
+        // A concurrent op may have already replaced it while we waited — if the
+        // daemon now handshakes cleanly, we're done.
+        if self.connect_once().await.is_ok() {
+            return Ok(());
+        }
+        if let Some(pid) = self.read_lock_pid() {
+            // SAFETY: a plain kill(2); pid is the live daemon we just handshook.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        // Let it release the socket (its SIGTERM handler unlinks + exits).
+        for _ in 0..50 {
+            if UnixStream::connect(&self.socket).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Belt-and-suspenders: free the path so a fresh bind succeeds even if the
+        // stale daemon is wedged (it then orphans and idle-shuts-down).
+        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(paths::token_path(&self.socket));
+        let _ = std::fs::remove_file(paths::lock_path(&self.socket));
+
+        let bin = self
+            .daemon_bin
+            .as_ref()
+            .ok_or_else(|| "session daemon binary not found".to_string())?;
+        spawn_detached(bin, &self.socket).map_err(|e| format!("respawn daemon: {e}"))?;
+        for _ in 0..150 {
+            if UnixStream::connect(&self.socket).await.is_ok() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Err("replacement daemon did not come up".into())
     }
 
     /// Provision (or resolve) an isolated git worktree for an agent (Phase 3):
@@ -400,7 +484,14 @@ fn forward_control(
             "startedCause": format!("{:?}", turn.started_cause),
             "endedCause": format!("{:?}", turn.ended_cause),
             "commandExit": turn.command_exit,
+            // The daemon fills this from its per-session fs-watcher (Phase 6); the
+            // app's live per-frame turn history shows which files the turn touched.
+            "fsDirtyPaths": turn.fs_dirty_paths,
         }),
+        ServerMsg::StatusChanged { status } => {
+            serde_json::json!({ "type": "status", "status": status })
+        }
+        ServerMsg::FsDirty { paths } => serde_json::json!({ "type": "fs_dirty", "paths": paths }),
         ServerMsg::Error { message } => serde_json::json!({ "type": "error", "message": message }),
         _ => return true,
     };
