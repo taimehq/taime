@@ -37,6 +37,9 @@ const DiffView = lazy(() =>
 const ActivityGraph = lazy(() =>
   import("./components/ActivityGraph").then((m) => ({ default: m.ActivityGraph })),
 );
+const TaskReviewDrawer = lazy(() =>
+  import("./components/TaskReviewDrawer").then((m) => ({ default: m.TaskReviewDrawer })),
+);
 
 export default function App() {
   const [cfg, setCfg] = useState<ResolvedConfig | null>(null);
@@ -99,6 +102,7 @@ export default function App() {
       <Suspense fallback={null}>
         <DiffView />
         <ActivityGraph />
+        <TaskReviewDrawer />
       </Suspense>
       <Snackbar />
     </div>

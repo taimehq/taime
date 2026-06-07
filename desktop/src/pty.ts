@@ -47,6 +47,9 @@ export interface DaemonSessionSummary {
    *  COMPLETED/ERROR) — daemon-reported (Phase 4), null when not yet known. */
   status: string | null;
   protocol_version: number;
+  /** Task membership (v9) — read from the worktree row at list time so
+   *  reassignment shows next tick. null ⇒ Uncategorized. */
+  task_id: string | null;
 }
 
 /**
@@ -94,16 +97,19 @@ export interface DaemonWorktreeInfo {
 }
 
 /** Provision (or resolve) an isolated git worktree for a daemon agent — the
- *  daemon-owned replacement for CAO's /worktrees/provision. */
+ *  daemon-owned replacement for CAO's /worktrees/provision. `taskId` (v9)
+ *  stamps Task membership onto the worktree row (null ⇒ Uncategorized). */
 export async function daemonProvisionWorktree(
   projectRoot: string,
   provider: string,
   isolate: boolean,
+  taskId: string | null = null,
 ): Promise<DaemonWorktreeInfo> {
   return invoke<DaemonWorktreeInfo>("daemon_provision_worktree", {
     projectRoot,
     provider,
     isolate,
+    taskId,
   });
 }
 
@@ -139,6 +145,8 @@ export interface DaemonActivityGraph {
     branch?: string | null;
     mode?: string | null;
     member_of?: string | null;
+    /** Task membership (v9) — null ⇒ Uncategorized. */
+    task_id?: string | null;
     turns?: {
       id: string;
       turn_index: number;

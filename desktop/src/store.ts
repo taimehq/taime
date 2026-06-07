@@ -83,6 +83,9 @@ export interface Frame {
   provider: string;
   agentProfile: string | null;
   sessionName: string | null;
+  /** Task membership at launch (null ⇒ Uncategorized). The durable source of
+   *  truth is the worktree row; this is the display copy for tabs/headers. */
+  taskId?: string | null;
   pending: boolean;
   error?: string;
   /** Transport for this frame's terminal (default cao_ws). */
@@ -110,6 +113,9 @@ export interface RustPtyMeta {
   startedAt: number;
   /** Lifecycle: "running" (reattachable) or "exited" (process gone; dismiss only). */
   status: RustPtyStatus;
+  /** Task membership (null ⇒ Uncategorized). Daemon-reported from the worktree
+   *  row; the reconcile tick keeps it fresh after reassignment. */
+  taskId?: string | null;
   /** The owning transport — always the daemon now (kept for forward-compat). */
   transport?: "daemon";
 }
@@ -226,7 +232,7 @@ interface Store {
   launchAgent: (
     provider: string,
     agentProfile: string,
-    opts?: { sessionName?: string; workingDirectory?: string },
+    opts?: { taskId?: string | null; workingDirectory?: string },
   ) => Promise<void>;
   openTerminalFrame: (t: {
     terminalId: string;
@@ -238,17 +244,23 @@ interface Store {
    *  app crashes). `profile` is the daemon profile name (`~/.taime/agents/*.toml`
    *  + built-in `default`/`orchestrator`); the daemon resolves it to fill the
    *  system prompt / model / tools and injects the MCP orchestration tools for a
-   *  supervisor role. `sessionName` (optional) is the display label of the workspace
-   *  session the agent joins; `projectRoot` (optional) is that session's root to
-   *  provision the worktree from — so the daemon actually groups the agent there,
-   *  not just labels it (defaults to the active `workspaceDir`). Returns true on
-   *  success. */
+   *  supervisor role. `taskId` (optional) is the Task the agent joins — stamped
+   *  onto its worktree row at provision (null ⇒ Uncategorized); `projectRoot`
+   *  (optional) overrides the worktree fork root (defaults to the active
+   *  `workspaceDir`). Returns true on success. */
   launchAgentDaemon: (
     provider: string,
     profile?: string,
-    sessionName?: string | null,
+    taskId?: string | null,
     projectRoot?: string | null,
   ) => Promise<boolean>;
+  /** Refresh each tracked agent's Task membership from a daemon list (the
+   *  reconcile tick) — keeps the sidebar grouping fresh after reassignment. */
+  syncDaemonTaskIds: (sessions: DaemonSessionSummary[]) => void;
+  /** Task whose review drawer is open (null = closed). */
+  taskReviewId: string | null;
+  openTaskReview: (taskId: string) => void;
+  closeTaskReview: () => void;
   /** Reopen a detached (still-running) Rust-PTY agent in a new frame. */
   reopenRustPty: (ptySessionId: string, opts?: { focus?: boolean }) => void;
   /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
@@ -503,9 +515,9 @@ export const useStore = create<Store>((set, get) => ({
       get().showSnackbar({ type: "error", message: `Unknown provider ${provider}` });
       return;
     }
-    // launchAgentDaemon reports its own (real) error on failure. `workingDirectory`
-    // (the selected session's root) routes provisioning so "Add to session" is real
-    // grouping, not just a label.
+    // launchAgentDaemon reports its own (real) error on failure. `taskId` is the
+    // Task the agent joins — real membership (stamped on the worktree row at
+    // provision), not just a label; null ⇒ Uncategorized.
     // Open the (non-disruptive) team drawer on the FIRST agent so the team view is
     // discovered, then leave it to the user — repeat launches just update the
     // "Team N" badge in the title bar rather than popping the panel each time.
@@ -513,7 +525,7 @@ export const useStore = create<Store>((set, get) => ({
     const ok = await get().launchAgentDaemon(
       provider,
       agentProfile || "default",
-      opts?.sessionName ?? null,
+      opts?.taskId ?? null,
       opts?.workingDirectory ?? null,
     );
     if (ok && firstAgent) get().setGraphOpen(true);
@@ -553,10 +565,9 @@ export const useStore = create<Store>((set, get) => ({
     }));
   },
 
-  launchAgentDaemon: async (provider, profile = "default", sessionName = null, projectRoot = null) => {
-    // Provision from the selected session's root when "Add to session" was chosen,
-    // else the active workspace — so the daemon groups the agent under the right
-    // project (session_root_of keys off the worktree's project_root).
+  launchAgentDaemon: async (provider, profile = "default", taskId = null, projectRoot = null) => {
+    // Provision from the active workspace (or an explicit override root) — the
+    // worktree row is the durable anchor for attribution AND Task membership.
     const dir = projectRoot ?? get().workspaceDir;
     // The built-in "orchestrator" role is a supervisor; the daemon also infers
     // this from a file profile's `orchestrator = true`, but pass the hint so a
@@ -575,6 +586,7 @@ export const useStore = create<Store>((set, get) => ({
           project_root: dir,
           provider,
           isolate: get().isolationEnabled,
+          task_id: taskId,
         });
         terminalId = wt.terminal_id;
         cwd = wt.worktree_path;
@@ -599,7 +611,7 @@ export const useStore = create<Store>((set, get) => ({
         const frames = existing
           ? s.frames.map((f) =>
               f.key === existing.key
-                ? { ...f, agentProfile: profile, sessionName: sessionName ?? null }
+                ? { ...f, agentProfile: profile, taskId: taskId ?? null }
                 : f,
             )
           : [
@@ -609,7 +621,8 @@ export const useStore = create<Store>((set, get) => ({
                 terminalId,
                 provider,
                 agentProfile: profile,
-                sessionName: sessionName ?? null,
+                sessionName: null,
+                taskId: taskId ?? null,
                 pending: false,
                 transport: "daemon" as const,
                 ptySessionId: sessionId,
@@ -629,6 +642,7 @@ export const useStore = create<Store>((set, get) => ({
                 cwd,
                 startedAt: Date.now(),
                 status: "running",
+                taskId: taskId ?? null,
                 transport: "daemon",
               },
             }
@@ -679,10 +693,48 @@ export const useStore = create<Store>((set, get) => ({
         cwd: summary.cwd || null,
         startedAt: summary.created_at_unix ? summary.created_at_unix * 1000 : Date.now(),
         status: summary.alive ? "running" : "exited",
+        taskId: summary.task_id ?? null,
         transport: "daemon",
       };
       return { rustPtySessions: { ...s.rustPtySessions, [summary.id]: meta } };
     }),
+
+  syncDaemonTaskIds: (sessions) =>
+    set((s) => {
+      // Membership can change daemon-side (task_assign, task delete demotion);
+      // mirror the worktree-row truth into the tracked metas AND any open
+      // frames (DiffView's sibling matching reads frames) when it drifts.
+      let changed = false;
+      const next = { ...s.rustPtySessions };
+      const byId = new Map(sessions.map((sum) => [sum.id, sum.task_id ?? null]));
+      for (const sum of sessions) {
+        const m = next[sum.id];
+        const tid = sum.task_id ?? null;
+        if (m && (m.taskId ?? null) !== tid) {
+          next[sum.id] = { ...m, taskId: tid };
+          changed = true;
+        }
+      }
+      let framesChanged = false;
+      const frames = s.frames.map((f) => {
+        if (!f.ptySessionId || !byId.has(f.ptySessionId)) return f;
+        const tid = byId.get(f.ptySessionId) ?? null;
+        if ((f.taskId ?? null) === tid) return f;
+        framesChanged = true;
+        return { ...f, taskId: tid };
+      });
+      if (!changed && !framesChanged) return s;
+      return {
+        ...(changed ? { rustPtySessions: next } : {}),
+        ...(framesChanged ? { frames } : {}),
+      };
+    }),
+
+  taskReviewId: null,
+  // The two right drawers (Task Review / Team graph) share the same geometry —
+  // opening one closes the other so they never stack invisibly.
+  openTaskReview: (taskId) => set({ taskReviewId: taskId, graphOpen: false }),
+  closeTaskReview: () => set({ taskReviewId: null }),
 
   recordTurn: (frameKey, turn) =>
     set((s) => {
@@ -710,6 +762,9 @@ export const useStore = create<Store>((set, get) => ({
           provider: meta.provider,
           agentProfile: null,
           sessionName: null,
+          // Carry membership from the (reconcile-synced) meta so reattached /
+          // adopted agents cross-link in DiffView like manually launched ones.
+          taskId: meta.taskId ?? null,
           pending: false,
           // Reattach via the backend that owns the session (daemon vs in-app),
           // or the in-app default for pre-existing records without a transport.
@@ -858,7 +913,8 @@ export const useStore = create<Store>((set, get) => ({
 
   openDiff: (terminalId) => set({ diffTerminalId: terminalId }),
   closeDiff: () => set({ diffTerminalId: null }),
-  setGraphOpen: (graphOpen) => set({ graphOpen }),
+  // Mutually exclusive with the Task Review drawer (same right-edge geometry).
+  setGraphOpen: (graphOpen) => set(graphOpen ? { graphOpen, taskReviewId: null } : { graphOpen }),
   setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
   setLaunchOpen: (launchOpen) => set({ launchOpen }),
   setLayoutMode: (layoutMode) => set({ layoutMode }),

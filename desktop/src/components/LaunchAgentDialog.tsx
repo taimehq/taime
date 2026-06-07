@@ -1,8 +1,12 @@
 import { useEffect, useState } from "react";
 import { X, Users, Bot } from "lucide-react";
-import { api, type ProviderInfo, type AgentProfileInfo } from "../api";
+import {
+  api,
+  type ProviderInfo,
+  type AgentProfileInfo,
+  type TaskInfo,
+} from "../api";
 import { useStore } from "../store";
-import { prettySessionText } from "../lib/sessionName";
 
 /** Canonical target providers, in display order, with friendly labels. */
 const TARGETS: Record<string, { name: string; vendor: string }> = {
@@ -27,15 +31,17 @@ function isSupervisor(p: AgentProfileInfo): boolean {
 
 export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
   const launchAgent = useStore((s) => s.launchAgent);
-  const sessions = useStore((s) => s.sessions);
-  // prettySession: drop the "cao-" prefix for display.
   const workspaceDir = useStore((s) => s.workspaceDir);
 
   const [providers, setProviders] = useState<ProviderInfo[] | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<AgentProfileInfo[]>([]);
   const [profile, setProfile] = useState<string>("default");
-  const [sessionName, setSessionName] = useState<string>(""); // "" = new session
+  // Task attachment: "" = Uncategorized (the zero-click default), a task id to
+  // join an existing task, or "__new__" to create one inline at launch time.
+  const [tasks, setTasks] = useState<TaskInfo[]>([]);
+  const [taskSel, setTaskSel] = useState<string>("");
+  const [newTaskTitle, setNewTaskTitle] = useState<string>("");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -69,6 +75,15 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
       .catch(() => setProfiles([]));
   }, []);
 
+  // Tasks are workspace-scoped — only offer the picker when a workspace is set.
+  useEffect(() => {
+    if (!workspaceDir) return;
+    api
+      .listTasks(workspaceDir)
+      .then((list) => setTasks(list.filter((t) => t.status === "open")))
+      .catch(() => setTasks([]));
+  }, [workspaceDir]);
+
   // The daemon's profile store already includes the built-in default/orchestrator
   // roles, but guarantee they exist (and aren't duplicated) so the select is
   // never empty mid-load.
@@ -96,15 +111,36 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
 
   const submit = async () => {
     if (!selected) return;
+    // "+ New task…" with no title: don't silently launch Uncategorized — keep
+    // the dialog open so the user can finish (or clear) the task choice.
+    if (taskSel === "__new__" && !newTaskTitle.trim()) {
+      useStore.getState().showSnackbar({
+        type: "error",
+        message: "Give the new task a title (or pick Uncategorized).",
+      });
+      return;
+    }
     setBusy(true);
+    // Resolve the task BEFORE the optimistic close, so a failed creation can
+    // abort loudly instead of demoting the launch to Uncategorized behind a
+    // success toast. null = Uncategorized — Task is never a toll booth.
+    let taskId: string | null = null;
+    if (taskSel === "__new__" && workspaceDir) {
+      const t = await api.createTask(workspaceDir, newTaskTitle.trim());
+      if (!t) {
+        setBusy(false);
+        useStore.getState().showSnackbar({
+          type: "error",
+          message: "Couldn't create the task — agent not launched.",
+        });
+        return;
+      }
+      taskId = t.id;
+    } else if (taskSel && taskSel !== "__new__") {
+      taskId = taskSel;
+    }
     onClose(); // optimistic: close immediately, frame appears as pending
-    // The dropdown value is the session's unique root (id); resolve its display
-    // name and pass the root so provisioning actually joins that session.
-    const sess = sessions.find((s) => s.id === sessionName);
-    await launchAgent(selected, profile, {
-      sessionName: sess?.name || undefined,
-      workingDirectory: sess?.id || undefined,
-    });
+    await launchAgent(selected, profile, { taskId });
   };
 
   return (
@@ -233,24 +269,41 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
           )}
         </div>
 
-        {/* Session */}
-        {sessions.length > 0 && (
+        {/* Task (workspace-scoped; Uncategorized is the zero-click default) */}
+        {workspaceDir && (
           <>
             <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">
-              Session
+              Task
             </label>
             <select
-              value={sessionName}
-              onChange={(e) => setSessionName(e.target.value)}
+              value={taskSel}
+              onChange={(e) => setTaskSel(e.target.value)}
               className="mb-4 w-full rounded-lg border border-ink-500 bg-ink-700 px-3 py-2 text-sm text-zinc-200"
             >
-              <option value="">New session</option>
-              {sessions.map((s) => (
-                <option key={s.id} value={s.id}>
-                  Add to {prettySessionText(s.name)}
+              <option value="">Uncategorized</option>
+              {tasks.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.title}
+                  {t.agent_count > 0 ? ` · ${t.agent_count}` : ""}
                 </option>
               ))}
+              <option value="__new__">+ New task…</option>
             </select>
+            {taskSel === "__new__" && (
+              <>
+                <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">
+                  Task title
+                </label>
+                <input
+                  type="text"
+                  value={newTaskTitle}
+                  onChange={(e) => setNewTaskTitle(e.target.value)}
+                  placeholder="Fix login bug"
+                  autoFocus
+                  className="mb-4 w-full rounded-lg border border-ink-500 bg-ink-700 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600"
+                />
+              </>
+            )}
           </>
         )}
 

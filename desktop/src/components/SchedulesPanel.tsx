@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Plus, Play, Trash2, Clock, Check, Loader2 } from "lucide-react";
 import { api, type ScheduleInfo } from "../api";
+import { useStore } from "../store";
 import { AddScheduleDialog } from "./AddScheduleDialog";
+import { basename } from "../lib/recentProjects";
 
 /** Provider display names (the daemon's 4 CLIs). */
 const PROVIDER_LABELS: Record<string, string> = {
@@ -44,16 +46,25 @@ export function SchedulesPanel() {
   const [showAdd, setShowAdd] = useState(false);
   const [runningName, setRunningName] = useState<string | null>(null);
   const [ranName, setRanName] = useState<string | null>(null);
+  // Task titles for the fixed-task chips: the user-facing identity of a Task
+  // is its title, never the raw id.
+  const [taskTitles, setTaskTitles] = useState<Record<string, string>>({});
+  const workspaceDir = useStore((s) => s.workspaceDir);
   const mounted = useRef(true);
 
   const refresh = useCallback(async () => {
     try {
       const list = await api.listSchedules();
       if (mounted.current) setSchedules(list);
+      if (workspaceDir) {
+        const tasks = await api.listTasks(workspaceDir, true);
+        if (mounted.current)
+          setTaskTitles(Object.fromEntries(tasks.map((t) => [t.id, t.title])));
+      }
     } catch {
       /* surfaced by the next poll */
     }
-  }, []);
+  }, [workspaceDir]);
 
   useEffect(() => {
     mounted.current = true;
@@ -131,6 +142,29 @@ export function SchedulesPanel() {
                       <span className="rounded-md bg-ink-700 px-1.5 py-0.5 font-mono text-[10px] text-zinc-500">
                         {s.schedule}
                       </span>
+                      {/* Workspace + task targeting (explicit; set at creation) */}
+                      {s.workspace_root && (
+                        <span
+                          title={s.workspace_root}
+                          className="rounded bg-ink-700 px-1 text-[9px] text-zinc-500"
+                        >
+                          {basename(s.workspace_root)}
+                        </span>
+                      )}
+                      {s.task_mode && (
+                        <span
+                          title={
+                            s.task_mode === "fixed"
+                              ? `Task: ${(s.task_id && taskTitles[s.task_id]) ?? s.task_id ?? ""}`
+                              : "Creates a new task per run"
+                          }
+                          className="rounded bg-teal-600/15 px-1 text-[9px] text-teal-400"
+                        >
+                          {s.task_mode === "per_run"
+                            ? "task/run"
+                            : ((s.task_id && taskTitles[s.task_id]) ?? "task")}
+                        </span>
+                      )}
                       <span className="truncate text-[10px] text-zinc-600">
                         {providerLabel(s.provider)} · {s.agent_profile}
                       </span>

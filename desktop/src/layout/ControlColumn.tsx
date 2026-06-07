@@ -1,10 +1,13 @@
+import { useEffect, useState } from "react";
 import {
   Plus,
   GitBranch,
   Power,
   PanelLeftOpen,
+  ClipboardList,
 } from "lucide-react";
-import { useStore } from "../store";
+import { useStore, type RustPtyMeta } from "../store";
+import { api, type TaskInfo } from "../api";
 import { StatusBadge, statusDotClass } from "../components/StatusBadge";
 import { FileInventory } from "../components/FileInventory";
 import { SchedulesPanel } from "../components/SchedulesPanel";
@@ -134,96 +137,207 @@ function ResizeHandle({ onResize }: { onResize: (px: number) => void }) {
 }
 
 /**
- * The running/idle agents — every daemon session (close ≠ kill, so a closed frame
- * keeps its agent here). Click an open agent to focus it, a detached one to
- * reattach; an exited one can be dismissed. Replaces the old tmux session list.
+ * Agents grouped by **Task** (workspace-scoped units of intent). Tasks render as
+ * clickable group headers (→ Task Review drawer); agents without a task sit
+ * under "Uncategorized". With no tasks at all this stays the flat agent list —
+ * Task is never a toll booth. Every daemon session appears (close ≠ kill).
  */
 function AgentsSection() {
   const rustPtySessions = useStore((s) => s.rustPtySessions);
-  const frames = useStore((s) => s.frames);
-  const statuses = useStore((s) => s.terminalStatuses);
-  const setActiveFrameGuarded = useStore((s) => s.setActiveFrameGuarded);
-  const reopenRustPty = useStore((s) => s.reopenRustPty);
-  const forgetRustPty = useStore((s) => s.forgetRustPty);
+  const workspaceDir = useStore((s) => s.workspaceDir);
+  const openTaskReview = useStore((s) => s.openTaskReview);
+  const [tasks, setTasks] = useState<TaskInfo[]>([]);
+
+  // Tasks live in the daemon store; poll lightly so daemon-side changes
+  // (orchestrator inherits, schedule per-run creates) surface without a reload.
+  // Archived tasks are fetched too: "archive preserves membership", so their
+  // members must keep their group (dimmed) — NOT masquerade as Uncategorized.
+  useEffect(() => {
+    if (!workspaceDir) {
+      setTasks([]);
+      return;
+    }
+    let alive = true;
+    const load = () =>
+      api.listTasks(workspaceDir, true).then((t) => {
+        if (alive) setTasks(t);
+      });
+    load();
+    const timer = setInterval(load, 5000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [workspaceDir]);
 
   // Running first (most recent first), then exited.
   const agents = Object.values(rustPtySessions).sort((a, b) => {
     if (a.status !== b.status) return a.status === "running" ? -1 : 1;
     return b.startedAt - a.startedAt;
   });
+  const taskIds = new Set(tasks.map((t) => t.id));
+  const membersOf = (taskId: string) => agents.filter((m) => m.taskId === taskId);
+  // Uncategorized is STRICTLY task_id = null (the lexicon definition). An agent
+  // whose task isn't in this workspace's list belongs to another workspace —
+  // label it as such rather than asserting a membership it doesn't have.
+  const uncategorized = agents.filter((m) => !m.taskId);
+  const foreign = agents.filter((m) => m.taskId && !taskIds.has(m.taskId));
+  const active = tasks.filter((t) => t.status !== "archived");
+  // Archived groups only earn a row while they still have live members; their
+  // history stays reachable through the drawer (status select un-archives).
+  const archived = tasks.filter(
+    (t) => t.status === "archived" && membersOf(t.id).length > 0,
+  );
+  const grouped = active.length > 0 || archived.length > 0;
 
   return (
     <Section title={`Agents · ${agents.length}`}>
-      {agents.length === 0 ? (
+      {agents.length === 0 && !grouped ? (
         <p className="text-[11px] text-zinc-600">
           No agents yet. Launch one to begin.
         </p>
+      ) : !grouped ? (
+        <AgentList agents={agents} />
       ) : (
-        <div className="flex flex-col gap-1">
-          {agents.map((m) => {
-            const frame = frames.find((f) => f.ptySessionId === m.ptySessionId);
-            const exited = m.status === "exited";
-            const status = m.terminalId ? statuses[m.terminalId] : undefined;
-            const stateTag = frame ? "open" : exited ? "exited" : "detached";
+        <div className="flex flex-col gap-2.5">
+          {[...active, ...archived].map((task) => {
+            const members = membersOf(task.id);
+            const dim = task.status === "archived";
             return (
-              <div
-                key={m.ptySessionId}
-                className={`flex items-center gap-2 rounded-lg border px-2.5 py-1.5 ${
-                  exited ? "border-ink-600 bg-ink-800/40" : "border-teal-600/30 bg-teal-600/5"
-                }`}
-              >
+              <div key={task.id} className="flex flex-col gap-1">
                 <button
-                  onClick={() =>
-                    frame ? setActiveFrameGuarded(frame.key) : reopenRustPty(m.ptySessionId)
-                  }
-                  disabled={exited && !frame}
-                  title={frame ? "Focus" : exited ? "Process exited" : "Reopen (reattach)"}
-                  className="flex min-w-0 flex-1 flex-col text-left disabled:cursor-default"
+                  onClick={() => openTaskReview(task.id)}
+                  title="Open task review"
+                  className={`flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left hover:bg-ink-700/60 ${
+                    dim ? "opacity-60" : ""
+                  }`}
                 >
-                  <span className="flex items-center gap-1.5 truncate text-xs text-zinc-200">
-                    {providerTitle(m.provider)}
-                    <span
-                      className={`rounded px-1 text-[10px] font-semibold uppercase tracking-wide ${
-                        exited
-                          ? "bg-ink-600 text-zinc-400"
-                          : frame
-                            ? "bg-ink-600 text-zinc-400"
-                            : "bg-teal-600/20 text-teal-400"
-                      }`}
-                    >
-                      {stateTag}
-                    </span>
+                  <ClipboardList size={11} className="shrink-0 text-zinc-500" />
+                  <span className="min-w-0 flex-1 truncate text-xs font-medium text-zinc-300">
+                    {task.title}
                   </span>
-                  {m.branch && (
-                    <span className="flex items-center gap-1 truncate font-mono text-[10px] text-zinc-500">
-                      <GitBranch size={10} /> {m.branch}
-                    </span>
-                  )}
+                  <TaskStatusChip status={task.status} />
+                  <span className="shrink-0 text-[10px] tabular-nums text-zinc-600">
+                    {members.length}
+                  </span>
                 </button>
-                {!exited && <StatusBadge status={status} />}
-                {exited ? (
-                  <button
-                    onClick={() => forgetRustPty(m.ptySessionId)}
-                    className="shrink-0 rounded border border-ink-500 px-2 py-0.5 text-[11px] text-zinc-400 hover:bg-ink-600"
-                  >
-                    Dismiss
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => forgetRustPty(m.ptySessionId)}
-                    aria-label="Kill agent"
-                    title="Kill agent (terminate process)"
-                    className="shrink-0 rounded p-0.5 text-red-400/80 hover:text-red-300"
-                  >
-                    <Power size={13} />
-                  </button>
-                )}
+                {members.length > 0 && <AgentList agents={members} />}
               </div>
             );
           })}
+          {uncategorized.length > 0 && (
+            <div className="flex flex-col gap-1">
+              <span className="px-1 text-[10px] font-medium uppercase tracking-wide text-zinc-600">
+                Uncategorized
+              </span>
+              <AgentList agents={uncategorized} />
+            </div>
+          )}
+          {foreign.length > 0 && (
+            <div className="flex flex-col gap-1">
+              <span className="px-1 text-[10px] font-medium uppercase tracking-wide text-zinc-600">
+                Other workspaces
+              </span>
+              <AgentList agents={foreign} />
+            </div>
+          )}
         </div>
       )}
     </Section>
+  );
+}
+
+/** Lifecycle chip for a task: open · in_review · done · archived. */
+function TaskStatusChip({ status }: { status: string }) {
+  const cls =
+    status === "in_review"
+      ? "bg-amber/20 text-amber"
+      : status === "done"
+        ? "bg-emerald-500/15 text-emerald-400"
+        : status === "archived"
+          ? "bg-ink-600 text-zinc-500"
+          : "bg-ink-600 text-zinc-400"; // open
+  return (
+    <span
+      className={`shrink-0 rounded px-1 text-[9px] font-semibold uppercase tracking-wide ${cls}`}
+    >
+      {status.replace(/_/g, " ")}
+    </span>
+  );
+}
+
+/** The flat agent rows (focus/reattach, status badge, kill/dismiss). */
+function AgentList({ agents }: { agents: RustPtyMeta[] }) {
+  const frames = useStore((s) => s.frames);
+  const statuses = useStore((s) => s.terminalStatuses);
+  const setActiveFrameGuarded = useStore((s) => s.setActiveFrameGuarded);
+  const reopenRustPty = useStore((s) => s.reopenRustPty);
+  const forgetRustPty = useStore((s) => s.forgetRustPty);
+
+  return (
+    <div className="flex flex-col gap-1">
+      {agents.map((m) => {
+        const frame = frames.find((f) => f.ptySessionId === m.ptySessionId);
+        const exited = m.status === "exited";
+        const status = m.terminalId ? statuses[m.terminalId] : undefined;
+        const stateTag = frame ? "open" : exited ? "exited" : "detached";
+        return (
+          <div
+            key={m.ptySessionId}
+            className={`flex items-center gap-2 rounded-lg border px-2.5 py-1.5 ${
+              exited ? "border-ink-600 bg-ink-800/40" : "border-teal-600/30 bg-teal-600/5"
+            }`}
+          >
+            <button
+              onClick={() =>
+                frame ? setActiveFrameGuarded(frame.key) : reopenRustPty(m.ptySessionId)
+              }
+              disabled={exited && !frame}
+              title={frame ? "Focus" : exited ? "Process exited" : "Reopen (reattach)"}
+              className="flex min-w-0 flex-1 flex-col text-left disabled:cursor-default"
+            >
+              <span className="flex items-center gap-1.5 truncate text-xs text-zinc-200">
+                {providerTitle(m.provider)}
+                <span
+                  className={`rounded px-1 text-[10px] font-semibold uppercase tracking-wide ${
+                    exited
+                      ? "bg-ink-600 text-zinc-400"
+                      : frame
+                        ? "bg-ink-600 text-zinc-400"
+                        : "bg-teal-600/20 text-teal-400"
+                  }`}
+                >
+                  {stateTag}
+                </span>
+              </span>
+              {m.branch && (
+                <span className="flex items-center gap-1 truncate font-mono text-[10px] text-zinc-500">
+                  <GitBranch size={10} /> {m.branch}
+                </span>
+              )}
+            </button>
+            {!exited && <StatusBadge status={status} />}
+            {exited ? (
+              <button
+                onClick={() => forgetRustPty(m.ptySessionId)}
+                className="shrink-0 rounded border border-ink-500 px-2 py-0.5 text-[11px] text-zinc-400 hover:bg-ink-600"
+              >
+                Dismiss
+              </button>
+            ) : (
+              <button
+                onClick={() => forgetRustPty(m.ptySessionId)}
+                aria-label="Kill agent"
+                title="Kill agent (terminate process)"
+                className="shrink-0 rounded p-0.5 text-red-400/80 hover:text-red-300"
+              >
+                <Power size={13} />
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

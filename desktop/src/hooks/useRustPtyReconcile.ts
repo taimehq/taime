@@ -45,6 +45,9 @@ export function useRustPtyReconcile() {
       const daemonSessions = await daemonList();
       if (!alive) return;
       applyDaemonStatuses(daemonSessions);
+      // Mirror daemon-side Task membership (task_assign / delete demotion) into
+      // the tracked metas so the sidebar grouping stays fresh.
+      useStore.getState().syncDaemonTaskIds(daemonSessions);
 
       // Surface NEW live daemon sessions the moment they appear — e.g. the workers
       // an orchestrator just assigned. Adopt into the Agents panel AND open a

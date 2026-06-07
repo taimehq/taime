@@ -67,8 +67,9 @@ pub async fn daemon_provision_worktree(
     project_root: String,
     provider: String,
     isolate: bool,
+    task_id: Option<String>,
 ) -> Result<WorktreeInfo, String> {
-    daemon.provision_worktree(project_root, provider, isolate).await
+    daemon.provision_worktree(project_root, provider, isolate, task_id).await
 }
 
 /// A high-level spawn for ANY provider through the daemon's registry (Phase 1).
