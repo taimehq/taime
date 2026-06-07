@@ -304,12 +304,20 @@ impl Manager {
         project_root: String,
         provider: String,
         isolate: bool,
+        task_id: Option<String>,
     ) -> WorktreeInfo {
         let terminal_key = format!("{:08x}", rand::random::<u32>());
         let info = crate::worktree::provision(&project_root, &provider, isolate, &terminal_key);
         if let Some(store) = &self.store {
             if let Err(e) = store.upsert_worktree(&info, &provider, now_unix()) {
                 eprintln!("[taime-daemon] persist worktree {terminal_key} failed: {e}");
+            }
+            // Task membership lands on the worktree row at provision — the
+            // durable anchor of the Task partition (NULL ⇒ Uncategorized).
+            if task_id.is_some() {
+                if let Err(e) = store.set_worktree_task(&info.terminal_key, task_id.as_deref()) {
+                    eprintln!("[taime-daemon] set worktree task failed: {e}");
+                }
             }
         }
         self.touch();
@@ -454,6 +462,7 @@ impl Manager {
                     "branch": branch,
                     "mode": mode,
                     "member_of": member_of,
+                    "task_id": store.task_of_worktree(&id),
                     "turns": turns,
                 })
             })
@@ -543,6 +552,9 @@ impl Manager {
                     a.get("provider").and_then(|v| v.as_str()).unwrap_or("claude_code"),
                     a.get("prompt").and_then(|v| v.as_str()).unwrap_or(""),
                     a.get("script").and_then(|v| v.as_str()).map(String::from),
+                    a.get("workspace_root").and_then(|v| v.as_str()).map(String::from),
+                    a.get("task_mode").and_then(|v| v.as_str()).map(String::from),
+                    a.get("task_id").and_then(|v| v.as_str()).map(String::from),
                 );
                 match res {
                     Ok(()) => r#"{"ok":true}"#.to_string(),
@@ -570,7 +582,8 @@ impl Manager {
             "workflow_run" => {
                 let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let root = a.get("project_root").and_then(|v| v.as_str()).map(String::from);
-                match self.run_workflow(name, root, None) {
+                let task = a.get("task_id").and_then(|v| v.as_str()).map(String::from);
+                match self.run_workflow(name, root, None, task) {
                     Ok(run_id) => serde_json::json!({ "run_id": run_id }).to_string(),
                     Err(e) => serde_json::json!({ "error": e }).to_string(),
                 }
@@ -582,6 +595,53 @@ impl Manager {
                 let _ = self.delete_workflow(a.get("name").and_then(|v| v.as_str()).unwrap_or(""));
                 r#"{"ok":true}"#.to_string()
             }
+            // ---- Tasks (v9): workspace-scoped intent grouping. Membership is
+            // ---- the nullable task_id on durable rows; rollups are derived. ----
+            "tasks" => self.tasks_json(
+                a.get("workspace_root").and_then(|v| v.as_str()).unwrap_or(""),
+                a.get("include_archived").and_then(|v| v.as_bool()).unwrap_or(false),
+            ),
+            "task_create" => {
+                let root = a.get("workspace_root").and_then(|v| v.as_str()).unwrap_or("");
+                let title = a.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let description = a.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                match self.create_task(root, title, description) {
+                    Ok(json) => json,
+                    Err(e) => serde_json::json!({ "error": e }).to_string(),
+                }
+            }
+            "task_update" => {
+                let id = a.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let res = self.update_task(
+                    id,
+                    a.get("title").and_then(|v| v.as_str()),
+                    a.get("description").and_then(|v| v.as_str()),
+                    a.get("status").and_then(|v| v.as_str()),
+                );
+                match res {
+                    Ok(()) => r#"{"ok":true}"#.to_string(),
+                    Err(e) => serde_json::json!({ "error": e }).to_string(),
+                }
+            }
+            "task_delete" => {
+                // Delete demotes members to Uncategorized (store-side transaction);
+                // never kills runtimes or touches attribution.
+                let id = a.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                match self.store.as_ref().map(|s| s.delete_task(id)) {
+                    Some(Ok(())) => r#"{"ok":true}"#.to_string(),
+                    Some(Err(e)) => serde_json::json!({ "error": e.to_string() }).to_string(),
+                    None => r#"{"error":"persistence disabled"}"#.to_string(),
+                }
+            }
+            "task_assign" => {
+                let agent = a.get("agent_key").and_then(|v| v.as_str()).unwrap_or("");
+                let task = a.get("task_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                match self.assign_task(agent, task) {
+                    Ok(()) => r#"{"ok":true}"#.to_string(),
+                    Err(e) => serde_json::json!({ "error": e }).to_string(),
+                }
+            }
+            "task_detail" => self.task_detail_json(a.get("id").and_then(|v| v.as_str()).unwrap_or("")),
             "graph" => self.activity_graph_json(),
             other => serde_json::json!({ "error": format!("unknown query {other}") }).to_string(),
         }
@@ -669,11 +729,167 @@ impl Manager {
                     "mode": w.mode,
                     "provider": w.provider,
                     "member_of": w.member_of,
+                    "task_id": w.task_id,
                 })
                 .to_string();
             }
         }
         "null".to_string()
+    }
+
+    // ---- Tasks (v9): grouping/lifecycle/rollups — never raw attribution ----
+
+    /// The Task lifecycle. `in_review` may be *suggested* by derived state, but
+    /// the user confirms transitions (the manager only validates the enum).
+    const TASK_STATUSES: [&'static str; 4] = ["open", "in_review", "done", "archived"];
+
+    fn task_json(t: &crate::store::TaskRow, agent_count: i64) -> serde_json::Value {
+        serde_json::json!({
+            "id": t.id,
+            "workspace_root": t.workspace_root,
+            "title": t.title,
+            "description": t.description,
+            "status": t.status,
+            "created_at": t.created_at,
+            "updated_at": t.updated_at,
+            "archived_at": t.archived_at,
+            "agent_count": agent_count,
+        })
+    }
+
+    /// Create a task (status `open`); returns its JSON.
+    pub fn create_task(
+        &self,
+        workspace_root: &str,
+        title: &str,
+        description: &str,
+    ) -> Result<String, String> {
+        let store = self.store.as_ref().ok_or("persistence disabled")?;
+        let (root, title) = (workspace_root.trim(), title.trim());
+        if root.is_empty() {
+            return Err("workspace_root is required".into());
+        }
+        if title.is_empty() {
+            return Err("a task title is required".into());
+        }
+        let id = format!("task-{}", &gen_id()[..8]);
+        store.create_task(&id, root, title, description, now_unix()).map_err(|e| e.to_string())?;
+        let task = store
+            .get_task(&id)
+            .map_err(|e| e.to_string())?
+            .ok_or("task not found after create")?;
+        Ok(Self::task_json(&task, 0).to_string())
+    }
+
+    /// Update title/description/status. Status is validated against the
+    /// lifecycle enum; `archived` stamps `archived_at` (store-side).
+    pub fn update_task(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<(), String> {
+        let store = self.store.as_ref().ok_or("persistence disabled")?;
+        if let Some(s) = status {
+            if !Self::TASK_STATUSES.contains(&s) {
+                return Err(format!(
+                    "invalid status '{s}' (expected open | in_review | done | archived)"
+                ));
+            }
+        }
+        if store.update_task(id, title, description, status, now_unix()).map_err(|e| e.to_string())? {
+            Ok(())
+        } else {
+            Err(format!("unknown task '{id}'"))
+        }
+    }
+
+    /// An agent's current task membership (`None` ⇒ Uncategorized).
+    pub fn task_of_agent(&self, agent_key: &str) -> Option<String> {
+        self.store.as_ref().and_then(|s| s.task_of_worktree(agent_key))
+    }
+
+    /// Assign (or unassign with `None`) an agent to a task. The membership rule:
+    /// at most one task per agent; reassignment just rewrites the pointer. Tasks
+    /// are workspace-scoped, so the agent's worktree must come from the task's
+    /// workspace — a cross-workspace pointer would corrupt the partition.
+    pub fn assign_task(&self, agent_key: &str, task_id: Option<&str>) -> Result<(), String> {
+        let store = self.store.as_ref().ok_or("persistence disabled")?;
+        if let Some(tid) = task_id {
+            let task = store
+                .get_task(tid)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("unknown task '{tid}'"))?;
+            let agent_root = store.worktree_project_root(agent_key).ok().flatten();
+            if agent_root.as_deref() != Some(task.workspace_root.as_str()) {
+                return Err("task belongs to a different workspace".into());
+            }
+        }
+        if store.set_worktree_task(agent_key, task_id).map_err(|e| e.to_string())? {
+            Ok(())
+        } else {
+            Err(format!("unknown agent '{agent_key}'"))
+        }
+    }
+
+    /// Tasks of a workspace with member-agent counts (the sidebar list).
+    fn tasks_json(&self, workspace_root: &str, include_archived: bool) -> String {
+        let Some(store) = &self.store else { return "[]".to_string() };
+        let counts: std::collections::HashMap<String, i64> =
+            store.task_agent_counts(workspace_root).unwrap_or_default().into_iter().collect();
+        let list: Vec<serde_json::Value> = store
+            .list_tasks(workspace_root, include_archived)
+            .unwrap_or_default()
+            .iter()
+            .map(|t| Self::task_json(t, counts.get(&t.id).copied().unwrap_or(0)))
+            .collect();
+        serde_json::json!(list).to_string()
+    }
+
+    /// One task with its member agents (worktree row + live status + fs-dirty
+    /// rollup) and attached workflow runs — the Task Review surface. Rollups are
+    /// derived by join here, never stored.
+    fn task_detail_json(&self, id: &str) -> String {
+        let Some(store) = &self.store else { return "null".to_string() };
+        let Some(task) = store.get_task(id).ok().flatten() else { return "null".to_string() };
+        let agents: Vec<serde_json::Value> = store
+            .agents_for_task(id)
+            .unwrap_or_default()
+            .iter()
+            .map(|w| {
+                let live = self.session_by_attribution(&w.terminal_id);
+                let (status, alive, dirty) = live
+                    .map(|s| {
+                        let sum = s.summary();
+                        (sum.status, sum.alive, s.fs_dirty_paths())
+                    })
+                    .unwrap_or((None, false, Vec::new()));
+                serde_json::json!({
+                    "terminal_id": w.terminal_id,
+                    "provider": w.provider,
+                    "branch": w.branch,
+                    "mode": w.mode,
+                    "worktree_path": w.worktree_path,
+                    "status": status,
+                    "alive": alive,
+                    "dirty_count": dirty.len(),
+                    "dirty_paths": dirty,
+                })
+            })
+            .collect();
+        let runs: Vec<serde_json::Value> = store
+            .runs_for_task(id)
+            .unwrap_or_default()
+            .iter()
+            .map(|r| self.run_summary_json(r))
+            .collect();
+        serde_json::json!({
+            "task": Self::task_json(&task, agents.len() as i64),
+            "agents": agents,
+            "runs": runs,
+        })
+        .to_string()
     }
 
     /// Per-file authorship for the diff under review (`tk`): the workspace's team
@@ -984,11 +1200,15 @@ impl Manager {
             last_run: None,
             next_run,
             enabled: true,
+            workspace_root: def.workspace_root.clone(),
+            task_mode: def.task_mode.clone(),
+            task_id: def.task_id.clone(),
         }
     }
 
     /// Create or replace a schedule from the UI: validate the cron, write its `.md`
     /// to `~/.taime/schedules/`, and store the row.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_schedule(
         &self,
         name: &str,
@@ -997,6 +1217,9 @@ impl Manager {
         provider: &str,
         prompt: &str,
         script: Option<String>,
+        workspace_root: Option<String>,
+        task_mode: Option<String>,
+        task_id: Option<String>,
     ) -> Result<(), String> {
         let store = self.store.as_ref().ok_or("persistence disabled")?;
         let name = name.trim();
@@ -1008,6 +1231,33 @@ impl Manager {
         if prompt.trim().is_empty() {
             return Err("a prompt is required".into());
         }
+        // Task targeting is workspace-scoped: any task behavior needs a workspace,
+        // and "fixed" needs an existing task in THAT workspace. Schedules must
+        // never implicitly create unlimited tasks — per_run is explicit opt-in.
+        let workspace_root = workspace_root.filter(|s| !s.trim().is_empty());
+        let task_mode = task_mode.filter(|s| !s.trim().is_empty());
+        let task_id = task_id.filter(|s| !s.trim().is_empty());
+        match task_mode.as_deref() {
+            None => {}
+            Some("per_run") => {
+                if workspace_root.is_none() {
+                    return Err("task per run requires a workspace".into());
+                }
+            }
+            Some("fixed") => {
+                let root =
+                    workspace_root.as_deref().ok_or("a task target requires a workspace")?;
+                let tid = task_id.as_deref().ok_or("task_mode 'fixed' requires task_id")?;
+                let task = store
+                    .get_task(tid)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("unknown task '{tid}'"))?;
+                if task.workspace_root != root {
+                    return Err("task belongs to a different workspace".into());
+                }
+            }
+            Some(other) => return Err(format!("invalid task_mode '{other}'")),
+        }
         let def = ScheduleDef {
             name: name.to_string(),
             schedule: schedule.to_string(),
@@ -1015,6 +1265,9 @@ impl Manager {
             provider: provider.to_string(),
             script: script.filter(|s| !s.trim().is_empty()),
             prompt: prompt.to_string(),
+            workspace_root,
+            task_mode,
+            task_id,
         };
         let dir = Self::schedules_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("create schedules dir: {e}"))?;
@@ -1031,15 +1284,28 @@ impl Manager {
     }
 
     /// Spawn a headless agent under `profile`/`provider` and deliver `prompt` when
-    /// it next goes idle (the shared Schedule/Workflow fire path).
+    /// it next goes idle (the shared Schedule/Workflow fire path). With a
+    /// `workspace_root` the agent is provisioned a shared worktree row there —
+    /// so attribution AND Task membership land on the durable anchor; without
+    /// one it runs in the daemon's cwd under a synthetic `sched-` key.
     pub fn fire_headless(
         &self,
         profile: &str,
         provider: &str,
-        cwd: Option<String>,
+        workspace_root: Option<String>,
         prompt: &str,
+        task_id: Option<String>,
     ) -> Result<String, String> {
-        let key = format!("sched-{}", &gen_id()[..8]);
+        let (key, cwd) = match workspace_root.filter(|r| !r.trim().is_empty()) {
+            Some(root) => {
+                // Shared (not isolated): unattended fires work in the workspace
+                // itself, matching CAO flow behavior (spawn path 4 of 4).
+                let info =
+                    self.provision_worktree(root.clone(), provider.to_string(), false, task_id);
+                (info.terminal_key, Some(root))
+            }
+            None => (format!("sched-{}", &gen_id()[..8]), None),
+        };
         let spec = AgentSpawnSpec {
             provider: provider.to_string(),
             profile: AgentProfile { name: profile.to_string(), ..Default::default() },
@@ -1057,6 +1323,55 @@ impl Manager {
         Ok(id)
     }
 
+    /// Resolve a schedule's task target at fire time. `fixed` requires the task
+    /// to still exist, in THIS schedule's workspace, and not be archived —
+    /// anything else degrades the fire to Uncategorized, loudly (the `.md`
+    /// ingest path has no create-time validation, and a target can be archived/
+    /// deleted/edited after creation). `per_run` creates a fresh task titled
+    /// from the schedule + fire date (explicit opt-in, never default). Returns
+    /// `(task_id, created_this_fire)` so a failed fire can roll back a per-run
+    /// task instead of leaking one per cron tick.
+    fn schedule_task_target(&self, row: &ScheduleRow) -> (Option<String>, bool) {
+        let Some(root) = row.workspace_root.as_deref().filter(|r| !r.trim().is_empty()) else {
+            return (None, false);
+        };
+        let Some(store) = self.store.as_ref() else { return (None, false) };
+        match row.task_mode.as_deref() {
+            Some("fixed") => {
+                let task = row.task_id.clone().filter(|tid| {
+                    store
+                        .get_task(tid)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|t| t.workspace_root == root && t.status != "archived")
+                });
+                if task.is_none() {
+                    eprintln!(
+                        "[taime-daemon] schedule '{}': fixed task target missing/archived/\
+                         foreign-workspace — firing Uncategorized",
+                        row.name
+                    );
+                }
+                (task, false)
+            }
+            Some("per_run") => {
+                let id = format!("task-{}", &gen_id()[..8]);
+                let when = chrono::DateTime::from_timestamp(now_unix() as i64, 0)
+                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                let title = format!("{} — {}", row.name, when);
+                match store.create_task(&id, root, &title, "", now_unix()) {
+                    Ok(()) => (Some(id), true),
+                    Err(e) => {
+                        eprintln!("[taime-daemon] per-run task create failed: {e}");
+                        (None, false)
+                    }
+                }
+            }
+            _ => (None, false),
+        }
+    }
+
     /// Fire one schedule: run its optional shell gate (non-zero exit = skip), then
     /// spawn the agent with the var-substituted prompt. Always advances last/next.
     fn fire_schedule(&self, row: &ScheduleRow) {
@@ -1072,7 +1387,23 @@ impl Manager {
         }
         let prompt = row.prompt.clone().unwrap_or_default();
         let prompt = schedules::substitute_vars(&prompt, &schedule_vars(&row.name));
-        let _ = self.fire_headless(&row.agent_profile, &row.provider, None, &prompt);
+        let (task, task_created) = self.schedule_task_target(row);
+        if let Err(e) = self.fire_headless(
+            &row.agent_profile,
+            &row.provider,
+            row.workspace_root.clone(),
+            &prompt,
+            task.clone(),
+        ) {
+            eprintln!("[taime-daemon] schedule '{}' fire failed: {e}", row.name);
+            // Roll back a task minted for THIS fire — a persistently failing
+            // schedule must not accumulate one orphan task per cron tick.
+            if task_created {
+                if let (Some(store), Some(tid)) = (&self.store, task.as_deref()) {
+                    let _ = store.delete_task(tid);
+                }
+            }
+        }
         if let Some(store) = &self.store {
             let _ = store.set_schedule_run(&row.name, now, next);
         }
@@ -1095,7 +1426,22 @@ impl Manager {
             .ok_or_else(|| format!("unknown schedule '{name}'"))?;
         let prompt =
             schedules::substitute_vars(&row.prompt.clone().unwrap_or_default(), &schedule_vars(name));
-        self.fire_headless(&row.agent_profile, &row.provider, None, &prompt)?;
+        let (task, task_created) = self.schedule_task_target(&row);
+        if let Err(e) = self.fire_headless(
+            &row.agent_profile,
+            &row.provider,
+            row.workspace_root.clone(),
+            &prompt,
+            task.clone(),
+        ) {
+            // Roll back a per-run task minted for this (failed) manual fire.
+            if task_created {
+                if let Some(tid) = task.as_deref() {
+                    let _ = store.delete_task(tid);
+                }
+            }
+            return Err(e);
+        }
         let _ = store.set_schedule_run(name, now_unix(), schedules::next_run_unix(&row.schedule));
         Ok(())
     }
@@ -1135,6 +1481,9 @@ impl Manager {
                     "enabled": r.enabled,
                     "last_run": r.last_run,
                     "next_run": r.next_run,
+                    "workspace_root": r.workspace_root,
+                    "task_mode": r.task_mode,
+                    "task_id": r.task_id,
                 })
             })
             .collect();
@@ -1248,10 +1597,17 @@ impl Manager {
         provider: &str,
         role: &str,
         prompt: &str,
+        task_id: Option<&str>,
     ) -> Result<(String, String), String> {
         let (cwd, attr_key) = match project_root.filter(|r| !r.is_empty()) {
             Some(root) => {
-                let info = self.provision_worktree(root.to_string(), provider.to_string(), true);
+                // Node agents inherit the run's task (spawn path 3 of 4).
+                let info = self.provision_worktree(
+                    root.to_string(),
+                    provider.to_string(),
+                    true,
+                    task_id.map(str::to_string),
+                );
                 (Some(info.worktree_path), info.terminal_key)
             }
             None => (None, format!("wf-{}", &gen_id()[..8])),
@@ -1280,6 +1636,7 @@ impl Manager {
         name: &str,
         project_root: Option<String>,
         caller: Option<String>,
+        task_id: Option<String>,
     ) -> Result<String, String> {
         let store = self.store.as_ref().ok_or("persistence disabled")?;
         let (def_json, _src, _fp) = store
@@ -1296,11 +1653,21 @@ impl Manager {
         let project_root = project_root.filter(|r| !r.is_empty()).or_else(|| {
             caller_session.as_ref().map(|s| self.session_root_of(&s.summary()))
         });
+        // A task can only group work inside its own workspace; validate so a
+        // stale/foreign task id degrades to Uncategorized instead of mislabeling.
+        let task_id = task_id.filter(|tid| {
+            store.get_task(tid).ok().flatten().is_some_and(|t| match project_root.as_deref() {
+                Some(root) => t.workspace_root == root,
+                None => true,
+            })
+        });
         let run_id = format!("wfrun-{}", &gen_id()[..12]);
-        store.create_run(&run_id, name, now_unix()).map_err(|e| e.to_string())?;
-        let (def2, run2, caller2) = (def, run_id.clone(), caller);
+        store
+            .create_run(&run_id, name, now_unix(), task_id.as_deref())
+            .map_err(|e| e.to_string())?;
+        let (def2, run2, caller2, task2) = (def, run_id.clone(), caller, task_id);
         std::thread::spawn(move || {
-            crate::workflow_engine::run(arc, def2, run2, project_root, provider, caller2);
+            crate::workflow_engine::run(arc, def2, run2, project_root, provider, caller2, task2);
         });
         Ok(run_id)
     }
@@ -1356,6 +1723,7 @@ impl Manager {
             "started_at": r.started_at,
             "ended_at": r.ended_at,
             "error": r.error,
+            "task_id": r.task_id,
             "node_states": states,
         })
     }
@@ -1425,14 +1793,38 @@ impl Manager {
             .as_ref()
             .and_then(|s| s.provider())
             .unwrap_or_else(|| "claude_code".to_string());
+        // Prefer the parent's durable workspace root (its worktree row) over its
+        // session cwd: an ISOLATED parent's cwd is its worktree path, which would
+        // root the child — and the workspace grouping — under the wrong "project".
         let project_root = working_directory
             .clone()
+            .or_else(|| {
+                self.store
+                    .as_ref()
+                    .and_then(|s| s.worktree_project_root(parent_key).ok().flatten())
+            })
             .or_else(|| parent.as_ref().map(|s| s.cwd()))
             .filter(|c| !c.is_empty());
 
         let (cwd, child_key) = match project_root {
             Some(root) => {
-                let info = self.provision_worktree(root, provider.clone(), true);
+                // Orchestrator-assigned workers inherit the parent's task
+                // (spawn path 2 of 4) — the team stays inside one Task. Tasks
+                // are workspace-scoped, so inherit ONLY when the task's
+                // workspace matches the provision root: an explicit
+                // cross-workspace working_directory must not smuggle the
+                // pointer along (the same invariant assign_task enforces).
+                let parent_task = self
+                    .store
+                    .as_ref()
+                    .and_then(|s| s.task_of_worktree(parent_key))
+                    .filter(|tid| {
+                        self.store
+                            .as_ref()
+                            .and_then(|s| s.get_task(tid).ok().flatten())
+                            .is_some_and(|t| t.workspace_root == root)
+                    });
+                let info = self.provision_worktree(root, provider.clone(), true, parent_task);
                 (Some(info.worktree_path), info.terminal_key)
             }
             None => (working_directory, gen_id()[..8].to_string()),
@@ -1484,7 +1876,18 @@ impl Manager {
     }
 
     pub fn list(&self) -> Vec<SessionSummary> {
-        self.sessions.lock().unwrap().values().map(|s| s.summary()).collect()
+        let mut sums: Vec<SessionSummary> =
+            self.sessions.lock().unwrap().values().map(|s| s.summary()).collect();
+        // Task membership lives on the worktree row (the durable anchor), not in
+        // the live session — fill at list time so reassignment shows next tick.
+        if let Some(store) = &self.store {
+            for s in &mut sums {
+                if let Some(key) = &s.attribution_key {
+                    s.task_id = store.task_of_worktree(key);
+                }
+            }
+        }
+        sums
     }
 
     pub fn kill(&self, id: &str) {

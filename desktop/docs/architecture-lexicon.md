@@ -14,16 +14,19 @@ terminology where the legacy word no longer names a real object.
 
 ## The mental model (one paragraph)
 
-You open a **Workspace** and launch **Agents** — each a **Profile** running on
+You open a **Workspace** and create or select a **Task** (or stay
+Uncategorized). You launch **Agents** into it — each a **Profile** running on
 a **Provider**. At launch an agent is minted its **Agent ID** and its own
 **Worktree**; everything it does — **Turns**, files touched, **Diffs** — is
 recorded against that ID and persists even after its process exits. The
 **Runtime** is replaceable: agents survive app restarts as detached runtimes
 you can reattach. An **Orchestrator** is an Agent whose Profile grants
-delegation; its delegations form a **Team**. **Workflows** are reusable graphs
-(branches, loops) that **Run** inside a workspace; **Schedules** fire agents on
-cron. The **Daemon** keeps all of it alive independently of the app, and
-nothing merges without **Review**.
+delegation; its delegations form a **Team**. The **Task** groups the work,
+tracks lifecycle and review state, and shows rollups — it is the unit of safe
+context switching. **Workflows** are reusable graphs (branches, loops) that
+**Run** inside a workspace; **Schedules** fire agents on cron. The **Daemon**
+keeps all of it alive independently of the app, and nothing merges without
+**Review**.
 
 ---
 
@@ -41,7 +44,14 @@ DAEMON — the persistent substrate (agents and schedules outlive the app;
 │     └── Schedules   cron → fire an Agent, unattended
 │
 └── WORKSPACE (the user-selected project root)
-      ├── Agent — the primary unit;  launch = Profile × Provider
+      ├── Tasks — stored user intent (a partition over agents, NOT a container)
+      │     ├── Task ID · Title / Description
+      │     ├── Status   open · in_review · done · archived
+      │     ├── member Agents + Workflow Runs   (via nullable task_id)
+      │     ├── Task Review State   (aggregate + task-level decisions)
+      │     └── Attribution Rollups (derived by join, never stored raw)
+      │
+      ├── Agent — the primary unit;  launch = Profile × Provider; task_id?
       │     ├── AGENT ID  ← the stable identity, minted at provision; the pivot
       │     │     ├── Worktree   (isolated git checkout | shared fallback)
       │     │     ├── Turns      (bounded spans of work + files touched)
@@ -51,14 +61,15 @@ DAEMON — the persistent substrate (agents and schedules outlive the app;
       │                    live (viewed or detached) | exited; replaceable
       │
       ├── Workflow RUN — a Library workflow executed here; each Node spawns
-      │                  an Agent in this workspace; per-node run states
+      │                  an Agent in this workspace; per-node run states; task_id?
       │
-      └── DERIVED VIEWS (computed, never containers)
+      └── DERIVED VIEWS (computed, never containers; workspace-wide AND
+            task-filtered)
             Team graph · Attribution rollups · Contention ·
-            Review (Merge · Revert · Mark reviewed)
+            Review (Merge · Revert · Mark reviewed) · Task Review
 ```
 
-Three structural rules fall out of this:
+Four structural rules fall out of this:
 
 1. **The Library/Workspace split.** Profiles, Workflow *definitions*, and
    Schedules are global, reusable, daemon-owned objects
@@ -74,6 +85,16 @@ Three structural rules fall out of this:
    history) hangs off each Agent ID. Cross-agent surfaces (Team graph,
    contention, rollups, review) are workspace-level **derived views** —
    computed at query time, never stored as containers.
+4. **Membership, not ownership (Tasks).** Task membership is a nullable
+   `task_id` on the agent's durable record (the worktree row). An Agent
+   belongs to at most one Task; Tasks partition workspace agents into
+   task-scoped groups plus **Uncategorized**. All four spawn paths propagate
+   `task_id`: manual launch (selected), `assign` (child inherits parent's),
+   workflow node spawn (inherits the Run's), schedule fire (per the schedule's
+   explicit task behavior). Archiving a Task preserves membership as a
+   read-only view; deleting a Task demotes members to Uncategorized. Neither
+   ever kills runtimes, deletes worktrees, or erases attribution. Task does
+   not own raw attribution — Agent ID remains the sole anchor.
 
 ---
 
@@ -84,7 +105,11 @@ Three structural rules fall out of this:
 | Term | Definition |
 |---|---|
 | **Workspace** | The user-selected project root that scopes work. The top-level user object. |
-| **Agent** | The primary unit: one AI worker — a Profile running on a Provider, working against its own Worktree, identified by its Agent ID. |
+| **Task** | A named, workspace-scoped unit of user intent (bug, feature, issue, cleanup, review, investigation). Groups Agents and Workflow Runs via membership; owns lifecycle (`open · in_review · done · archived`), review state, and derived rollups. Never owns raw attribution. The unit of safe context switching. |
+| **Task ID** | Stable identity of a Task. |
+| **Task Review** | The aggregate review surface for a Task: combined diff, per-agent diffs, dirty agents, reviewed/unreviewed state, rollups, and task-level decisions. Grounded per Agent/Worktree; merge executes per-worktree underneath. |
+| **Uncategorized** | Agents (or runs) with `task_id = null`. Always a legal state — the zero-click launch default; Task is never a toll booth. |
+| **Agent** | The primary unit: one AI worker — a Profile running on a Provider, working against its own Worktree, identified by its Agent ID. Optionally a member of one Task. |
 | **Agent ID** | The stable, durable identity of an agent. Minted at provision; keys the worktree, turns, fs events, diffs, messages, MCP identity, and graph nodes. Persists after the process exits. *(Implementation alias: `attribution_key` / `terminal_key` / frontend `terminalId` — see migration table.)* |
 | **Provider** | The CLI engine backing an agent: `claude_code`, `codex`, `gemini_cli`, `grok_cli`. Resolved by the daemon's provider registry. |
 | **Profile** | A named behavior definition applied at launch: system prompt, model, tools, orchestration capability. Built-ins plus `~/.taime/agents/*.toml`. *(The single canonical noun — "role" is allowed only as informal UI copy, never as a distinct concept.)* |
@@ -124,7 +149,8 @@ Three structural rules fall out of this:
 |---|---|---|
 | Session (workspace grouping) | **delete** — it was 1:1 with the Workspace root; say "the workspace's agents" | The grouping was a derived compatibility view, never a stored object |
 | Session (daemon runtime) | **Runtime** (docs); code may keep the `Session` struct internally | Internal-only |
-| "Add to session" | "Add to workspace" | Follows the deletion |
+| "Add to session" | "Add to Task" (launch task picker) | Follows the deletion; Task is the grouping that Session pretended to be |
+| `session_name` / `member_of` grouping | `task_id` membership | Proto-Task technical debt; migrate then retire |
 | Terminal (as identity) | **Agent ID** | "Terminal" survives only as the colloquial on-screen terminal view |
 | `terminalId` / Terminal ID / Attribution Key (docs) | **Agent ID** | `attribution_key` remains the implementation-layer name during migration |
 | Role (UI) | **Profile** | One UI string change; code/store/API already say profile |

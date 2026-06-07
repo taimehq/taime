@@ -30,6 +30,14 @@ pub struct ScheduleDef {
     pub provider: String,
     pub script: Option<String>,
     pub prompt: String,
+    /// Workspace the fire runs in (front-matter `workspace:`). Without one the
+    /// agent runs in the daemon's cwd and task targeting is unavailable.
+    pub workspace_root: Option<String>,
+    /// Explicit task behavior (front-matter `task_mode:`): absent = uncategorized,
+    /// `fixed` = attach runs to `task_id`, `per_run` = create a task per fire.
+    pub task_mode: Option<String>,
+    /// The target task for `task_mode: fixed` (front-matter `task_id:`).
+    pub task_id: Option<String>,
 }
 
 /// Parse a schedule markdown file (YAML-ish front-matter + body). Hand-rolled (no
@@ -97,13 +105,37 @@ pub fn parse_schedule(text: &str) -> Result<ScheduleDef, String> {
     let agent_profile = get("agent_profile").unwrap_or_else(|| "default".to_string());
     let provider = get("provider").unwrap_or_else(|| "claude_code".to_string());
     let script = get("script").or(script_block).filter(|s| !s.is_empty());
+    let workspace_root = get("workspace");
+    let task_mode = get("task_mode");
+    let task_id = get("task_id");
     if prompt.is_empty() {
         return Err("schedule has no prompt body (after the closing `---`)".to_string());
     }
     if next_run_unix(&schedule).is_none() {
         return Err(format!("invalid cron schedule: {schedule:?}"));
     }
-    Ok(ScheduleDef { name, schedule, agent_profile, provider, script, prompt })
+    if let Some(mode) = task_mode.as_deref() {
+        if mode != "fixed" && mode != "per_run" {
+            return Err(format!("invalid task_mode {mode:?} (expected fixed | per_run)"));
+        }
+        if workspace_root.is_none() {
+            return Err("task_mode requires a `workspace:` target".to_string());
+        }
+        if mode == "fixed" && task_id.is_none() {
+            return Err("task_mode `fixed` requires `task_id:`".to_string());
+        }
+    }
+    Ok(ScheduleDef {
+        name,
+        schedule,
+        agent_profile,
+        provider,
+        script,
+        prompt,
+        workspace_root,
+        task_mode,
+        task_id,
+    })
 }
 
 fn unquote(s: &str) -> &str {
@@ -145,6 +177,15 @@ pub fn to_markdown(def: &ScheduleDef) -> String {
     s.push_str(&format!("provider: {}\n", def.provider));
     if let Some(script) = &def.script {
         s.push_str(&format!("script: {script}\n"));
+    }
+    if let Some(root) = &def.workspace_root {
+        s.push_str(&format!("workspace: {root}\n"));
+    }
+    if let Some(mode) = &def.task_mode {
+        s.push_str(&format!("task_mode: {mode}\n"));
+    }
+    if let Some(tid) = &def.task_id {
+        s.push_str(&format!("task_id: {tid}\n"));
     }
     s.push_str("---\n");
     s.push_str(def.prompt.trim());
@@ -210,8 +251,40 @@ mod tests {
             provider: "claude_code".into(),
             script: None,
             prompt: "summarize commits".into(),
+            workspace_root: None,
+            task_mode: None,
+            task_id: None,
         };
         let reparsed = parse_schedule(&to_markdown(&def)).unwrap();
         assert_eq!(reparsed, def);
+    }
+
+    #[test]
+    fn task_targeting_roundtrips_and_validates() {
+        // Full task-targeted schedule survives a markdown roundtrip.
+        let def = ScheduleDef {
+            name: "triage".into(),
+            schedule: "0 8 * * *".into(),
+            agent_profile: "bug-fixer".into(),
+            provider: "claude_code".into(),
+            script: None,
+            prompt: "triage new issues".into(),
+            workspace_root: Some("/projects/app".into()),
+            task_mode: Some("fixed".into()),
+            task_id: Some("task-deadbeef".into()),
+        };
+        assert_eq!(parse_schedule(&to_markdown(&def)).unwrap(), def);
+
+        // task_mode without a workspace is rejected.
+        let bad = "---\nname: x\nschedule: \"0 8 * * *\"\ntask_mode: per_run\n---\nbody";
+        assert!(parse_schedule(bad).unwrap_err().contains("workspace"));
+        // fixed without task_id is rejected.
+        let bad =
+            "---\nname: x\nschedule: \"0 8 * * *\"\nworkspace: /p\ntask_mode: fixed\n---\nbody";
+        assert!(parse_schedule(bad).unwrap_err().contains("task_id"));
+        // unknown mode is rejected.
+        let bad =
+            "---\nname: x\nschedule: \"0 8 * * *\"\nworkspace: /p\ntask_mode: weekly\n---\nbody";
+        assert!(parse_schedule(bad).unwrap_err().contains("task_mode"));
     }
 }

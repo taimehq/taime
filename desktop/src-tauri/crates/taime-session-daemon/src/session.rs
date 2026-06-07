@@ -491,6 +491,13 @@ impl Session {
         }
     }
 
+    /// Snapshot of the cumulative fs-dirty set (Task rollups / detail surface).
+    /// Read-only — never mutates the badge or in-flight turn sets.
+    pub fn fs_dirty_paths(&self) -> Vec<String> {
+        let st = self.inner.state.lock().unwrap();
+        st.fs_all_dirty.iter().cloned().collect()
+    }
+
     /// Clear the accumulated dirty set (the user reviewed the diff). Resets both
     /// the badge set and the in-flight turn set so future pushes start fresh.
     pub fn clear_fs_dirty(&self) {
@@ -541,6 +548,9 @@ impl Session {
             provider: self.inner.provider.clone(),
             status,
             protocol_version: taime_protocol::PROTOCOL_VERSION,
+            // Membership lives on the worktree row, not the live session —
+            // Manager::list() fills this from the store (the single fill site).
+            task_id: None,
         }
     }
 }

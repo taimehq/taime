@@ -47,9 +47,11 @@ pub const MAGIC: u32 = 0x7461_696d;
 ///     sessions/worktree/attribution — the route-layer migration).
 /// v8: parity pass — `StatusChanged` push (Phase 4), `FsDirty` push +
 ///     `TurnInfo.fs_dirty_paths` populated (Phase 6 daemon fs-watch).
+/// v9: Tasks — `ProvisionWorktree.task_id` + `SessionSummary.task_id`
+///     (workspace-scoped Task membership; attribution stays Agent-ID anchored).
 /// Postcard is positional, so these are wire-layout changes — a stale older
 /// daemon is rejected at handshake and the app falls back rather than misparsing.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Feature flags negotiated in the handshake (`capabilities` bitset). Reserving
 /// the bits now keeps app-update-while-old-daemon-running safe.
@@ -218,7 +220,15 @@ pub enum ClientMsg {
     /// Provision (or resolve) an isolated git worktree for an agent (Phase 3).
     /// The daemon mints the attribution key, runs `git worktree`, persists the
     /// row, and replies `Worktree`. `isolate=false` (or a non-git root) ⇒ shared.
-    ProvisionWorktree { req_id: u64, project_root: String, provider: String, isolate: bool },
+    /// `task_id` (v9) stamps Task membership onto the worktree row — the durable
+    /// anchor of the Task partition (`None` ⇒ Uncategorized).
+    ProvisionWorktree {
+        req_id: u64,
+        project_root: String,
+        provider: String,
+        isolate: bool,
+        task_id: Option<String>,
+    },
     /// Enqueue an inbox message for `receiver` (the attribution key of a live
     /// agent) — the Phase-5 message bus (ops/app entry; the agent-facing MCP
     /// `send_message` tool feeds the same inbox in-process). The daemon delivers
@@ -347,6 +357,9 @@ pub struct SessionSummary {
     pub status: Option<AgentStatus>,
     /// Protocol version the daemon serving this session speaks (upgrade UI).
     pub protocol_version: u16,
+    /// Task membership (v9) — filled from the agent's worktree row at list time
+    /// so reassignment shows on the next tick. `None` ⇒ Uncategorized.
+    pub task_id: Option<String>,
 }
 
 /// An agent's inferred lifecycle state — CAO's `TerminalStatus`, native to the
@@ -631,11 +644,13 @@ mod tests {
             project_root: "/p".into(),
             provider: "claude_code".into(),
             isolate: true,
+            task_id: Some("task-deadbeef".into()),
         };
         match parse_frame(BytesMut::from(&encode_client(&req).unwrap()[..])).unwrap() {
             Frame::Control(b) => match decode_client(&b).unwrap() {
-                ClientMsg::ProvisionWorktree { req_id, isolate, .. } => {
-                    assert_eq!((req_id, isolate), (3, true))
+                ClientMsg::ProvisionWorktree { req_id, isolate, task_id, .. } => {
+                    assert_eq!((req_id, isolate), (3, true));
+                    assert_eq!(task_id.as_deref(), Some("task-deadbeef"));
                 }
                 other => panic!("wrong msg {other:?}"),
             },

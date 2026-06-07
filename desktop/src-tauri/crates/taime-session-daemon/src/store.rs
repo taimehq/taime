@@ -91,6 +91,8 @@ pub struct WorktreeRow {
     pub mode: Option<String>,
     pub provider: Option<String>,
     pub member_of: Option<String>,
+    /// Task membership (`None` ⇒ Uncategorized). The durable Task anchor.
+    pub task_id: Option<String>,
 }
 
 /// A schedule row (the `flows` table; user-facing term is "Schedule").
@@ -106,6 +108,13 @@ pub struct ScheduleRow {
     pub last_run: Option<u64>,
     pub next_run: Option<u64>,
     pub enabled: bool,
+    /// Workspace the fire runs in (cwd + worktree root). `None` = daemon cwd,
+    /// no task targeting possible (tasks are workspace-scoped).
+    pub workspace_root: Option<String>,
+    /// Explicit task behavior: `None`/"" = uncategorized, "fixed" = attach to
+    /// `task_id`, "per_run" = create a fresh task per fire (explicit opt-in).
+    pub task_mode: Option<String>,
+    pub task_id: Option<String>,
 }
 
 /// A workflow run row.
@@ -117,6 +126,24 @@ pub struct WorkflowRunRow {
     pub started_at: Option<u64>,
     pub ended_at: Option<u64>,
     pub error: Option<String>,
+    /// Task this run executes inside (`None` ⇒ Uncategorized). Node agents
+    /// inherit it at provision.
+    pub task_id: Option<String>,
+}
+
+/// A Task row — a named, workspace-scoped unit of user intent. Owns grouping,
+/// lifecycle, and review aggregation; never raw attribution (Agent-ID anchored).
+#[derive(Debug, Clone)]
+pub struct TaskRow {
+    pub id: String,
+    pub workspace_root: String,
+    pub title: String,
+    pub description: String,
+    /// `open` | `in_review` | `done` | `archived` (validated by the manager).
+    pub status: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub archived_at: Option<u64>,
 }
 
 /// The latest state of one node within a run.
@@ -162,6 +189,22 @@ impl Store {
         // ignore the "duplicate column" error to stay idempotent across versions).
         // `prompt` backs Schedules created in-app (the .md body, stored inline).
         let _ = conn.execute("ALTER TABLE flows ADD COLUMN prompt TEXT", []);
+        // Tasks (v9): membership is a nullable task_id on the durable records —
+        // the worktree row (agents) and the workflow run. NULL ⇒ Uncategorized.
+        let _ = conn.execute("ALTER TABLE taime_worktrees ADD COLUMN task_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE taime_workflow_runs ADD COLUMN task_id TEXT", []);
+        // Schedules gain a workspace target (prerequisite for task-scoped fires)
+        // and an explicit task behavior: task_mode ∈ NULL/'' (uncategorized) |
+        // 'fixed' (attach to task_id) | 'per_run' (create a task per fire).
+        let _ = conn.execute("ALTER TABLE flows ADD COLUMN workspace_root TEXT", []);
+        let _ = conn.execute("ALTER TABLE flows ADD COLUMN task_mode TEXT", []);
+        let _ = conn.execute("ALTER TABLE flows ADD COLUMN task_id TEXT", []);
+        // This index references the ALTER-added column, so it must run AFTER the
+        // ALTERs (a pre-existing DB's SCHEMA batch ran before task_id existed).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_worktrees_task ON taime_worktrees(task_id)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -526,24 +569,178 @@ impl Store {
     pub fn worktree_row(&self, terminal_id: &str) -> rusqlite::Result<Option<WorktreeRow>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT terminal_id, project_root, repo_root, worktree_path, branch, base_sha, \
-             mode, provider, member_of FROM taime_worktrees WHERE terminal_id = ?1",
+            &format!("SELECT {WORKTREE_COLS} FROM taime_worktrees WHERE terminal_id = ?1"),
             rusqlite::params![terminal_id],
-            |r| {
-                Ok(WorktreeRow {
-                    terminal_id: r.get(0)?,
-                    project_root: r.get(1)?,
-                    repo_root: r.get(2)?,
-                    worktree_path: r.get(3)?,
-                    branch: r.get(4)?,
-                    base_sha: r.get(5)?,
-                    mode: r.get(6)?,
-                    provider: r.get(7)?,
-                    member_of: r.get(8)?,
-                })
-            },
+            map_worktree,
         )
         .optional()
+    }
+
+    // ---- Tasks (v9): workspace-scoped intent grouping over agents + runs ----
+
+    /// Create a task (status `open`). The manager mints the id.
+    pub fn create_task(
+        &self,
+        id: &str,
+        workspace_root: &str,
+        title: &str,
+        description: &str,
+        now_unix: u64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO taime_tasks (id, workspace_root, title, description, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5)",
+            rusqlite::params![id, workspace_root, title, description, now_unix as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_task(&self, id: &str) -> rusqlite::Result<Option<TaskRow>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!("SELECT {TASK_COLS} FROM taime_tasks WHERE id = ?1"),
+            rusqlite::params![id],
+            map_task,
+        )
+        .optional()
+    }
+
+    /// Tasks for a workspace, newest first. `include_archived=false` hides
+    /// archived tasks (the default list view).
+    pub fn list_tasks(
+        &self,
+        workspace_root: &str,
+        include_archived: bool,
+    ) -> rusqlite::Result<Vec<TaskRow>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if include_archived {
+            format!(
+                "SELECT {TASK_COLS} FROM taime_tasks WHERE workspace_root = ?1 \
+                 ORDER BY created_at DESC"
+            )
+        } else {
+            format!(
+                "SELECT {TASK_COLS} FROM taime_tasks \
+                 WHERE workspace_root = ?1 AND status != 'archived' \
+                 ORDER BY created_at DESC"
+            )
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params![workspace_root], map_task)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Update title/description/status (each optional). Status `archived` stamps
+    /// `archived_at`; leaving `archived` clears it. `updated_at` always bumps.
+    pub fn update_task(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        status: Option<&str>,
+        now_unix: u64,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE taime_tasks SET \
+               title = COALESCE(?2, title), \
+               description = COALESCE(?3, description), \
+               status = COALESCE(?4, status), \
+               archived_at = CASE \
+                 WHEN ?4 = 'archived' THEN ?5 \
+                 WHEN ?4 IS NOT NULL THEN NULL \
+                 ELSE archived_at END, \
+               updated_at = ?5 \
+             WHERE id = ?1",
+            rusqlite::params![id, title, description, status, now_unix as i64],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Delete a task, demoting members to Uncategorized first (never touches
+    /// runtimes, worktrees, or attribution — the partition rule).
+    pub fn delete_task(&self, id: &str) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE taime_worktrees SET task_id = NULL WHERE task_id = ?1",
+            rusqlite::params![id],
+        )?;
+        tx.execute(
+            "UPDATE taime_workflow_runs SET task_id = NULL WHERE task_id = ?1",
+            rusqlite::params![id],
+        )?;
+        tx.execute("DELETE FROM taime_tasks WHERE id = ?1", rusqlite::params![id])?;
+        tx.commit()
+    }
+
+    /// Assign (or unassign with `None`) an agent's worktree row to a task.
+    pub fn set_worktree_task(
+        &self,
+        terminal_id: &str,
+        task_id: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE taime_worktrees SET task_id = ?2 WHERE terminal_id = ?1",
+            rusqlite::params![terminal_id, task_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// An agent's task membership (`None` ⇒ Uncategorized or unknown agent).
+    pub fn task_of_worktree(&self, terminal_id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT task_id FROM taime_worktrees WHERE terminal_id = ?1",
+            rusqlite::params![terminal_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Member agents (worktree rows) of a task, newest first.
+    pub fn agents_for_task(&self, task_id: &str) -> rusqlite::Result<Vec<WorktreeRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORKTREE_COLS} FROM taime_worktrees WHERE task_id = ?1 \
+             ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![task_id], map_worktree)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Workflow runs attached to a task, newest first.
+    pub fn runs_for_task(&self, task_id: &str) -> rusqlite::Result<Vec<WorkflowRunRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLS} FROM taime_workflow_runs WHERE task_id = ?1 \
+             ORDER BY started_at DESC"
+        ))?;
+        let rows =
+            stmt.query_map(rusqlite::params![task_id], map_run)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Member-agent counts per task for one workspace (the task-list rollup),
+    /// as `(task_id, agent_count)` pairs.
+    pub fn task_agent_counts(&self, workspace_root: &str) -> rusqlite::Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT w.task_id, COUNT(*) FROM taime_worktrees w \
+             JOIN taime_tasks t ON t.id = w.task_id \
+             WHERE t.workspace_root = ?1 GROUP BY w.task_id",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![workspace_root], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// A terminal's worktree attribution attributes: `(branch, mode, member_of)`,
@@ -684,8 +881,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO flows \
-             (name, file_path, schedule, agent_profile, provider, script, last_run, next_run, enabled, prompt) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (name, file_path, schedule, agent_profile, provider, script, last_run, next_run, \
+              enabled, prompt, workspace_root, task_mode, task_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 row.name,
                 row.file_path,
@@ -697,6 +895,9 @@ impl Store {
                 row.next_run.map(|v| v.to_string()),
                 row.enabled as i64,
                 row.prompt,
+                row.workspace_root,
+                row.task_mode,
+                row.task_id,
             ],
         )?;
         Ok(())
@@ -830,12 +1031,18 @@ impl Store {
         Ok(())
     }
 
-    pub fn create_run(&self, id: &str, workflow_name: &str, started_at: u64) -> rusqlite::Result<()> {
+    pub fn create_run(
+        &self,
+        id: &str,
+        workflow_name: &str,
+        started_at: u64,
+        task_id: Option<&str>,
+    ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO taime_workflow_runs (id, workflow_name, status, started_at) \
-             VALUES (?1, ?2, 'running', ?3)",
-            rusqlite::params![id, workflow_name, started_at as i64],
+            "INSERT INTO taime_workflow_runs (id, workflow_name, status, started_at, task_id) \
+             VALUES (?1, ?2, 'running', ?3, ?4)",
+            rusqlite::params![id, workflow_name, started_at as i64, task_id],
         )?;
         Ok(())
     }
@@ -858,8 +1065,7 @@ impl Store {
     pub fn get_run(&self, id: &str) -> rusqlite::Result<Option<WorkflowRunRow>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, workflow_name, status, started_at, ended_at, error \
-             FROM taime_workflow_runs WHERE id = ?1",
+            &format!("SELECT {RUN_COLS} FROM taime_workflow_runs WHERE id = ?1"),
             rusqlite::params![id],
             map_run,
         )
@@ -869,8 +1075,10 @@ impl Store {
     pub fn latest_run(&self, workflow_name: &str) -> rusqlite::Result<Option<WorkflowRunRow>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, workflow_name, status, started_at, ended_at, error \
-             FROM taime_workflow_runs WHERE workflow_name = ?1 ORDER BY started_at DESC LIMIT 1",
+            &format!(
+                "SELECT {RUN_COLS} FROM taime_workflow_runs \
+                 WHERE workflow_name = ?1 ORDER BY started_at DESC LIMIT 1"
+            ),
             rusqlite::params![workflow_name],
             map_run,
         )
@@ -948,6 +1156,9 @@ impl Store {
     }
 }
 
+/// Column list for a `WorkflowRunRow` SELECT (kept in sync with [`map_run`]).
+const RUN_COLS: &str = "id, workflow_name, status, started_at, ended_at, error, task_id";
+
 fn map_run(r: &rusqlite::Row) -> rusqlite::Result<WorkflowRunRow> {
     Ok(WorkflowRunRow {
         id: r.get(0)?,
@@ -956,12 +1167,49 @@ fn map_run(r: &rusqlite::Row) -> rusqlite::Result<WorkflowRunRow> {
         started_at: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
         ended_at: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
         error: r.get(5)?,
+        task_id: r.get(6)?,
+    })
+}
+
+/// Column list for a `WorktreeRow` SELECT (kept in sync with [`map_worktree`]).
+const WORKTREE_COLS: &str = "terminal_id, project_root, repo_root, worktree_path, branch, \
+     base_sha, mode, provider, member_of, task_id";
+
+fn map_worktree(r: &rusqlite::Row) -> rusqlite::Result<WorktreeRow> {
+    Ok(WorktreeRow {
+        terminal_id: r.get(0)?,
+        project_root: r.get(1)?,
+        repo_root: r.get(2)?,
+        worktree_path: r.get(3)?,
+        branch: r.get(4)?,
+        base_sha: r.get(5)?,
+        mode: r.get(6)?,
+        provider: r.get(7)?,
+        member_of: r.get(8)?,
+        task_id: r.get(9)?,
+    })
+}
+
+/// Column list for a `TaskRow` SELECT (kept in sync with [`map_task`]).
+const TASK_COLS: &str =
+    "id, workspace_root, title, description, status, created_at, updated_at, archived_at";
+
+fn map_task(r: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
+    Ok(TaskRow {
+        id: r.get(0)?,
+        workspace_root: r.get(1)?,
+        title: r.get(2)?,
+        description: r.get(3)?,
+        status: r.get(4)?,
+        created_at: r.get::<_, i64>(5)? as u64,
+        updated_at: r.get::<_, i64>(6)? as u64,
+        archived_at: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
     })
 }
 
 /// Column list for a `ScheduleRow` SELECT (kept in sync with [`map_schedule`]).
-const SCHEDULE_COLS: &str =
-    "name, file_path, schedule, agent_profile, provider, script, last_run, next_run, enabled, prompt";
+const SCHEDULE_COLS: &str = "name, file_path, schedule, agent_profile, provider, script, \
+     last_run, next_run, enabled, prompt, workspace_root, task_mode, task_id";
 
 fn map_schedule(r: &rusqlite::Row) -> rusqlite::Result<ScheduleRow> {
     let parse = |s: Option<String>| s.and_then(|x| x.trim().parse::<u64>().ok());
@@ -976,6 +1224,9 @@ fn map_schedule(r: &rusqlite::Row) -> rusqlite::Result<ScheduleRow> {
         next_run: parse(r.get(7)?),
         enabled: r.get::<_, i64>(8)? != 0,
         prompt: r.get(9)?,
+        workspace_root: r.get(10)?,
+        task_mode: r.get(11)?,
+        task_id: r.get(12)?,
     })
 }
 
@@ -1029,7 +1280,10 @@ CREATE TABLE IF NOT EXISTS flows (
     last_run TEXT,
     next_run TEXT,
     enabled INTEGER DEFAULT 1,
-    prompt TEXT
+    prompt TEXT,
+    workspace_root TEXT,
+    task_mode TEXT,
+    task_id TEXT
 );
 CREATE TABLE IF NOT EXISTS taime_worktrees (
     terminal_id TEXT PRIMARY KEY,
@@ -1042,7 +1296,8 @@ CREATE TABLE IF NOT EXISTS taime_worktrees (
     mode TEXT NOT NULL DEFAULT 'shared',
     provider TEXT,
     member_of TEXT,
-    created_at TEXT
+    created_at TEXT,
+    task_id TEXT
 );
 CREATE TABLE IF NOT EXISTS taime_agent_turns (
     id TEXT PRIMARY KEY,
@@ -1124,7 +1379,8 @@ CREATE TABLE IF NOT EXISTS taime_workflow_runs (
     status TEXT NOT NULL,
     started_at INTEGER,
     ended_at INTEGER,
-    error TEXT
+    error TEXT,
+    task_id TEXT
 );
 CREATE TABLE IF NOT EXISTS taime_workflow_node_runs (
     id TEXT PRIMARY KEY,
@@ -1139,6 +1395,23 @@ CREATE TABLE IF NOT EXISTS taime_workflow_node_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_wf_node_runs_run ON taime_workflow_node_runs(run_id);
 CREATE INDEX IF NOT EXISTS idx_wf_runs_name ON taime_workflow_runs(workflow_name, started_at);
+
+-- Tasks (v9): named, workspace-scoped units of user intent. A Task owns
+-- membership/lifecycle/review-state/rollups — NEVER raw attribution (that stays
+-- anchored to the Agent ID on taime_worktrees/turns/events). Membership is the
+-- nullable task_id on member rows; deleting a task demotes members to
+-- Uncategorized, archiving preserves them read-only.
+CREATE TABLE IF NOT EXISTS taime_tasks (
+    id TEXT PRIMARY KEY,
+    workspace_root TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    archived_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_root ON taime_tasks(workspace_root, status);
 "#;
 
 #[cfg(test)]
@@ -1159,8 +1432,16 @@ mod tests {
             last_run: None,
             next_run: next,
             enabled,
+            workspace_root: Some("/projects/app".into()),
+            task_mode: Some("fixed".into()),
+            task_id: Some("task-12345678".into()),
         };
         store.upsert_schedule(&mk(Some(100), true)).unwrap();
+        // Task-targeting columns roundtrip through the flows table.
+        let got = store.get_schedule("nightly").unwrap().unwrap();
+        assert_eq!(got.workspace_root.as_deref(), Some("/projects/app"));
+        assert_eq!(got.task_mode.as_deref(), Some("fixed"));
+        assert_eq!(got.task_id.as_deref(), Some("task-12345678"));
         let list = store.list_schedules().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].agent_profile, "security-reviewer");
@@ -1186,7 +1467,11 @@ mod tests {
         assert_eq!(store.list_workflows().unwrap().len(), 1);
         assert!(store.get_workflow("wf").unwrap().is_some());
 
-        store.create_run("run1", "wf", 10).unwrap();
+        store.create_run("run1", "wf", 10, Some("task-12345678")).unwrap();
+        assert_eq!(
+            store.get_run("run1").unwrap().unwrap().task_id.as_deref(),
+            Some("task-12345678")
+        );
         store.insert_node_run("nr1", "run1", "a", Some("agent1"), 1, 11).unwrap();
         let states = store.node_states("run1").unwrap();
         assert_eq!(states.len(), 1);
@@ -1205,6 +1490,112 @@ mod tests {
         assert_eq!(store.latest_run("wf").unwrap().unwrap().status, "completed");
         store.delete_workflow("wf").unwrap();
         assert!(store.list_workflows().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_upgrades_a_pre_v9_db() {
+        // A REAL upgrade: build the pre-v9 table shapes (no task_id /
+        // workspace_root / task_mode columns) in a file DB, then open it — the
+        // ALTERs must actually run (not be swallowed as duplicates) and the
+        // ordering-sensitive idx_worktrees_task must build AFTER them.
+        let dir = std::env::temp_dir().join(format!("taime-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pre-v9.sqlite");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE taime_worktrees (terminal_id TEXT PRIMARY KEY, session_name TEXT, \
+                   project_root TEXT NOT NULL, repo_root TEXT, worktree_path TEXT NOT NULL, \
+                   branch TEXT, base_sha TEXT, mode TEXT NOT NULL DEFAULT 'shared', \
+                   provider TEXT, member_of TEXT, created_at TEXT);
+                 CREATE TABLE flows (name TEXT PRIMARY KEY, file_path TEXT NOT NULL, \
+                   schedule TEXT NOT NULL, agent_profile TEXT NOT NULL, provider TEXT NOT NULL, \
+                   script TEXT, last_run TEXT, next_run TEXT, enabled INTEGER DEFAULT 1, prompt TEXT);
+                 CREATE TABLE taime_workflow_runs (id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL, \
+                   status TEXT NOT NULL, started_at INTEGER, ended_at INTEGER, error TEXT);
+                 INSERT INTO taime_worktrees (terminal_id, project_root, worktree_path, mode) \
+                   VALUES ('old-agent', '/p', '/wt', 'worktree');",
+            )
+            .unwrap();
+        }
+        let store = Store::open_at(&path).unwrap();
+        // The pre-existing row survives with task_id = NULL (Uncategorized)…
+        let row = store.worktree_row("old-agent").unwrap().unwrap();
+        assert_eq!(row.task_id, None);
+        // …and the upgraded columns are fully usable end-to-end.
+        store.create_task("task-up", "/p", "Upgraded", "", 1).unwrap();
+        assert!(store.set_worktree_task("old-agent", Some("task-up")).unwrap());
+        assert_eq!(store.task_of_worktree("old-agent").as_deref(), Some("task-up"));
+        store.create_run("r-up", "wf", 2, Some("task-up")).unwrap();
+        assert_eq!(store.runs_for_task("task-up").unwrap().len(), 1);
+        let idx: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_worktrees_task'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(idx, 1, "ALTER-dependent index must exist after upgrade");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tasks_crud_membership_and_demote() {
+        let store = Store::open_at(std::path::Path::new(":memory:")).unwrap();
+        store.create_task("task-1", "/p", "Fix login bug", "", 100).unwrap();
+        store.create_task("task-2", "/p", "Add feature", "desc", 110).unwrap();
+        store.create_task("task-3", "/other", "Elsewhere", "", 120).unwrap();
+
+        // Workspace-scoped, newest first; other workspaces never bleed in.
+        let tasks = store.list_tasks("/p", false).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "task-2");
+
+        // Membership = nullable task_id on the worktree row (the durable anchor).
+        let info = WorktreeInfo {
+            terminal_key: "agent-a".into(),
+            project_root: "/p".into(),
+            repo_root: None,
+            worktree_path: "/p".into(),
+            branch: None,
+            base_sha: None,
+            mode: "shared".into(),
+            error: None,
+        };
+        store.upsert_worktree(&info, "claude_code", 100).unwrap();
+        assert!(store.set_worktree_task("agent-a", Some("task-1")).unwrap());
+        assert_eq!(store.task_of_worktree("agent-a").as_deref(), Some("task-1"));
+        assert_eq!(store.agents_for_task("task-1").unwrap().len(), 1);
+        assert_eq!(store.task_agent_counts("/p").unwrap(), vec![("task-1".to_string(), 1)]);
+
+        // Archive: stamps archived_at, hides from the default list, PRESERVES
+        // membership (read-only history). Un-archiving clears the stamp.
+        assert!(store.update_task("task-1", None, None, Some("archived"), 200).unwrap());
+        let t = store.get_task("task-1").unwrap().unwrap();
+        assert_eq!((t.status.as_str(), t.archived_at), ("archived", Some(200)));
+        assert_eq!(store.list_tasks("/p", false).unwrap().len(), 1);
+        assert_eq!(store.list_tasks("/p", true).unwrap().len(), 2);
+        assert_eq!(store.task_of_worktree("agent-a").as_deref(), Some("task-1"));
+        assert!(store.update_task("task-1", None, None, Some("open"), 300).unwrap());
+        assert_eq!(store.get_task("task-1").unwrap().unwrap().archived_at, None);
+
+        // Runs attach to tasks too.
+        store.create_run("r1", "wf", 10, Some("task-1")).unwrap();
+        assert_eq!(store.runs_for_task("task-1").unwrap().len(), 1);
+
+        // Delete DEMOTES members + detaches runs — never deletes their rows.
+        store.delete_task("task-1").unwrap();
+        assert!(store.get_task("task-1").unwrap().is_none());
+        assert_eq!(store.task_of_worktree("agent-a"), None);
+        assert!(store.worktree_row("agent-a").unwrap().is_some(), "agent row survives");
+        assert_eq!(store.get_run("r1").unwrap().unwrap().task_id, None);
+
+        // Unknown ids are reported, not silently absorbed.
+        assert!(!store.update_task("task-x", None, None, Some("open"), 1).unwrap());
+        assert!(!store.set_worktree_task("nobody", Some("task-2")).unwrap());
     }
 
     fn row(id: &str) -> SessionRow {
