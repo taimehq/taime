@@ -244,6 +244,11 @@ interface Store {
   selectedWorkflow: string | null;
   /** Selected schedule (Schedules section). */
   selectedSchedule: string | null;
+  /** Selected settings nav entry (Settings section sidebar). */
+  settingsTab: string;
+  /** When true, the title-bar workspace switcher dropdown is open. Store-owned
+   *  so the ⌘O global shortcut can toggle it from the dispatcher. */
+  wsSwitcherOpen: boolean;
 
   // workspace (single active project)
   workspaceDir: string | null;
@@ -316,6 +321,8 @@ interface Store {
   clearTaskInitialTab: () => void;
   setSelectedWorkflow: (id: string | null) => void;
   setSelectedSchedule: (id: string | null) => void;
+  setSettingsTab: (tab: string) => void;
+  setWsSwitcherOpen: (open: boolean) => void;
 
   // workspaces
   /** Open a workspace (the existing workspace-open flow): persists it, fronts
@@ -446,6 +453,8 @@ export const useStore = create<Store>((set, get) => ({
   taskInitialTab: null,
   selectedWorkflow: null,
   selectedSchedule: null,
+  settingsTab: "workspace",
+  wsSwitcherOpen: false,
 
   workspaceDir: bootWorkspaceDir,
   activeWorkspaceRoot: bootWorkspaceDir,
@@ -516,6 +525,8 @@ export const useStore = create<Store>((set, get) => ({
 
   setSelectedWorkflow: (selectedWorkflow) => set({ selectedWorkflow }),
   setSelectedSchedule: (selectedSchedule) => set({ selectedSchedule }),
+  setSettingsTab: (settingsTab) => set({ settingsTab }),
+  setWsSwitcherOpen: (wsSwitcherOpen) => set({ wsSwitcherOpen }),
 
   switchWorkspace: (root) => {
     if (root === get().workspaceDir) return;

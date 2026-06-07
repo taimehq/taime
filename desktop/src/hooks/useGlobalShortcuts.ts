@@ -93,10 +93,19 @@ export function useGlobalShortcuts() {
       }
 
       // --- Command palette (Cmd+K) toggles the navigation/action surface ---
+      // ⌘K is the palette ONLY — the workspace switcher is ⌘O.
       if (e.key.toLowerCase() === "k") {
         e.preventDefault();
         const s = useStore.getState();
         s.setCommandPaletteOpen(!s.commandPaletteOpen);
+        return;
+      }
+
+      // --- Workspace switcher (Cmd+O) toggles the title-bar dropdown ---
+      if (e.key.toLowerCase() === "o") {
+        e.preventDefault();
+        const s = useStore.getState();
+        s.setWsSwitcherOpen(!s.wsSwitcherOpen);
         return;
       }
 
