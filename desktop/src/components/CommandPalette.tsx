@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore, type Frame } from "../store";
 import { providerTitle } from "../lib/providerLabel";
-import { prettySessionText } from "../lib/sessionName";
 import { statusLabel } from "./StatusBadge";
 
 /**
@@ -32,14 +31,11 @@ const GROUP_ORDER = [
 ];
 
 function frameLabel(f: Frame): string {
-  const role =
+  const profile =
     f.agentProfile && f.agentProfile !== "default"
       ? ` · ${f.agentProfile.replace(/_/g, " ")}`
       : "";
-  const session = f.sessionName
-    ? ` — ${prettySessionText(f.sessionName)}`
-    : "";
-  return `${providerTitle(f.provider)}${role}${session}`;
+  return `${providerTitle(f.provider)}${profile}`;
 }
 
 function basename(p: string): string {
@@ -113,7 +109,7 @@ function PaletteBody() {
         group,
         label: frameLabel(f),
         hint: hint || undefined,
-        keywords: `${f.provider} ${f.sessionName ?? ""} ${f.agentProfile ?? ""}`,
+        keywords: `${f.provider} ${f.agentProfile ?? ""}`,
         run: () => {
           setActiveFrameGuarded(f.key);
           close();
@@ -248,7 +244,7 @@ function PaletteBody() {
           onKeyDown={onKeyDown}
           placeholder="Jump to an agent, review changes, launch…"
           spellCheck={false}
-          className="w-full border-b border-ink-600 bg-transparent px-4 py-3 text-sm text-zinc-100 placeholder:text-zinc-500 focus:outline-none"
+          className="w-full border-b border-ink-600 bg-transparent px-4 py-3 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-accent/60 focus:outline-none"
         />
         <div ref={listRef} className="max-h-[50vh] overflow-y-auto py-1">
           {items.length === 0 && (

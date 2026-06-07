@@ -29,4 +29,29 @@ self.MonacoEnvironment = {
   },
 };
 
+// House theme on the design-system ladder: the code well is the darkest
+// surface (#070809, same as the terminal), status green/red for diff tints.
+monaco.editor.defineTheme("taime-dark", {
+  base: "vs-dark",
+  inherit: true,
+  rules: [],
+  colors: {
+    "editor.background": "#070809",
+    "editor.foreground": "#c8c7c2",
+    "editor.lineHighlightBackground": "#111419",
+    "editor.selectionBackground": "#2f4a7a",
+    "editorLineNumber.foreground": "#4a505b",
+    "editorLineNumber.activeForeground": "#6f7681",
+    "editorWidget.background": "#111419",
+    "editorWidget.border": "#232936",
+    "diffEditor.insertedTextBackground": "#46c46e26",
+    "diffEditor.removedTextBackground": "#ef5b5026",
+    "diffEditor.insertedLineBackground": "#46c46e14",
+    "diffEditor.removedLineBackground": "#ef5b5014",
+    "scrollbarSlider.background": "#ffffff14",
+    "scrollbarSlider.hoverBackground": "#ffffff24",
+    "scrollbarSlider.activeBackground": "#ffffff2e",
+  },
+});
+
 loader.config({ monaco });

@@ -15,7 +15,6 @@ import { LaunchAgentDialog } from "./components/LaunchAgentDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { Snackbar } from "./components/Snackbar";
 import { ContextSwitchGuard } from "./components/ContextSwitchGuard";
-import { useTurnCheckpoints } from "./hooks/useTurnCheckpoints";
 import { useTerminalFileDrop } from "./hooks/useTerminalFileDrop";
 import { useRustPtyReconcile } from "./hooks/useRustPtyReconcile";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
@@ -62,7 +61,6 @@ export default function App() {
   }, []);
 
   useBackendSync();
-  useTurnCheckpoints();
   useTerminalFileDrop();
   useRustPtyReconcile();
   useGlobalShortcuts();

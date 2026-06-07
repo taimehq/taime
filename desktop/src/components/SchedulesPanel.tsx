@@ -4,18 +4,7 @@ import { api, type ScheduleInfo } from "../api";
 import { useStore } from "../store";
 import { AddScheduleDialog } from "./AddScheduleDialog";
 import { basename } from "../lib/recentProjects";
-
-/** Provider display names (the daemon's 4 CLIs). */
-const PROVIDER_LABELS: Record<string, string> = {
-  claude_code: "Claude Code",
-  codex: "Codex CLI",
-  gemini_cli: "Gemini CLI",
-  grok_cli: "Grok Build CLI",
-};
-
-function providerLabel(name: string): string {
-  return PROVIDER_LABELS[name] ?? name;
-}
+import { providerTitle } from "../lib/providerLabel";
 
 /** Compact relative time from a unix-seconds timestamp (e.g. "in 3h", "5m ago"). */
 function relativeTime(nextRun: number | null, enabled: boolean): string {
@@ -166,7 +155,7 @@ export function SchedulesPanel() {
                         </span>
                       )}
                       <span className="truncate text-[10px] text-zinc-600">
-                        {providerLabel(s.provider)} · {s.agent_profile}
+                        {providerTitle(s.provider)} · {s.agent_profile}
                       </span>
                     </div>
                     <div className="mt-0.5 flex items-center gap-1 text-[10px] text-zinc-500">

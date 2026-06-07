@@ -2,28 +2,22 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { X, GitBranch, RefreshCw, AlertTriangle, FileText, Users, CornerDownRight } from "lucide-react";
 import { api, type ActivityGraph as Graph } from "../api";
 import { useStore } from "../store";
-
-const PROVIDER_NAME: Record<string, string> = {
-  claude_code: "Claude Code",
-  codex: "Codex CLI",
-  gemini_cli: "Gemini CLI",
-  grok_cli: "Grok Build CLI",
-};
+import { providerTitle } from "../lib/providerLabel";
 
 /** Edges that define the team tree (who spawned / handed work to whom). */
 const TREE_KINDS = new Set(["assign", "handoff"]);
 
 /** Color + human label per edge kind (matches the daemon's emitted kinds).
- *  Palette: blue (#4493f8) is the primary structural edge; amber for handoffs;
+ *  Palette: blue (#5b8def) is the primary structural edge; amber for handoffs;
  *  light blue + zinc neutrals for the chatter so it stays legible without new hues. */
 const EDGE: Record<string, { color: string; label: string }> = {
-  assign: { color: "#4493f8", label: "assigned" },
-  handoff: { color: "#d29922", label: "handed off" },
-  message: { color: "#8bbcfb", label: "messaged" },
-  request: { color: "#8f8f8f", label: "asked" },
-  reply: { color: "#6f6f6f", label: "replied" },
+  assign: { color: "#5b8def", label: "assigned" },
+  handoff: { color: "#e3a93a", label: "handed off" },
+  message: { color: "#8db1f5", label: "messaged" },
+  request: { color: "#8a919d", label: "asked" },
+  reply: { color: "#6f7681", label: "replied" },
 };
-const edgeStyle = (kind: string) => EDGE[kind] ?? { color: "#71717a", label: kind };
+const edgeStyle = (kind: string) => EDGE[kind] ?? { color: "#6f7681", label: kind };
 
 /** Status → dot color. Accepts the live inferred status (SCREAMING_SNAKE) or the
  *  graph's lifecycle value (running/exited) as a fallback. */
@@ -121,7 +115,7 @@ export function ActivityGraph() {
       const g = graph?.agents.find((a) => a.agent_id === tid);
       const fr = frames.find((f) => f.terminalId === tid);
       const prov = g?.provider ?? fr?.provider ?? "";
-      return PROVIDER_NAME[prov] ?? prov ?? tid.slice(0, 6);
+      return prov ? providerTitle(prov) : tid.slice(0, 6);
     },
     [graph, frames],
   );
@@ -204,14 +198,14 @@ export function ActivityGraph() {
               className="mb-4"
               aria-hidden="true"
             >
-              <path d="M44 18 L24 44 M44 18 L64 44" stroke="#3f3f46" strokeWidth="1.5" />
-              <circle cx="44" cy="14" r="10" fill="#0f0f0f" stroke="#3f3f46" strokeWidth="1.5" />
-              <circle cx="24" cy="50" r="10" fill="#0f0f0f" stroke="#3f3f46" strokeWidth="1.5" />
-              <circle cx="64" cy="50" r="10" fill="#0f0f0f" stroke="#3f3f46" strokeWidth="1.5" />
+              <path d="M44 18 L24 44 M44 18 L64 44" stroke="#232936" strokeWidth="1.5" />
+              <circle cx="44" cy="14" r="10" fill="#0c0e13" stroke="#232936" strokeWidth="1.5" />
+              <circle cx="24" cy="50" r="10" fill="#0c0e13" stroke="#232936" strokeWidth="1.5" />
+              <circle cx="64" cy="50" r="10" fill="#0c0e13" stroke="#232936" strokeWidth="1.5" />
             </svg>
             <p className="text-[13px] text-zinc-300">No agents yet</p>
             <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
-              Launch an agent to see it here. Pick the orchestrator role and ask
+              Launch an agent to see it here. Pick the orchestrator profile and ask
               it to delegate — its workers nest below it as the team forms.
             </p>
             <button
@@ -280,7 +274,7 @@ export function ActivityGraph() {
                       {label} →
                     </span>
                     <span className="truncate text-zinc-300">{nameFor(e.target)}</span>
-                    {e.ts && <span className="ml-auto shrink-0 font-mono text-[9px] text-zinc-600">{fmtTime(e.ts)}</span>}
+                    {e.ts && <span className="ml-auto shrink-0 font-mono text-[9px] tabular-nums text-zinc-600">{fmtTime(e.ts)}</span>}
                   </li>
                 );
               })}

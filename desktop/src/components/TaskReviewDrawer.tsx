@@ -307,7 +307,7 @@ export function TaskReviewDrawer() {
                 <li key={r.id} className="flex items-center gap-2 text-[11px] text-zinc-400">
                   <span className={`h-2 w-2 shrink-0 rounded-full ${runDotClass(r.status)}`} />
                   <span className="truncate text-zinc-300">{r.workflow_name}</span>
-                  <span className="ml-auto shrink-0 font-mono text-[9px] text-zinc-600">
+                  <span className="ml-auto shrink-0 font-mono text-[9px] tabular-nums text-zinc-600">
                     {fmtRunTime(r.started_at)}
                   </span>
                 </li>
@@ -338,7 +338,7 @@ export function TaskReviewDrawer() {
             <button
               onClick={runWorkflow}
               disabled={!selectedWorkflow || running || !detail}
-              className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-primary-hover disabled:opacity-50"
+              className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:opacity-50"
             >
               {running ? "Starting…" : "Run"}
             </button>

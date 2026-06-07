@@ -13,8 +13,6 @@ vi.mock("./api", () => ({
   api: {
     provisionWorktree: vi.fn(),
     listAgents: vi.fn(async () => []),
-    deleteSession: vi.fn(async () => ({ success: true, deleted: [], errors: [] })),
-    getTerminalStatus: vi.fn(async () => null),
     clearDaemonDirty: vi.fn(async () => true),
   },
 }));
@@ -105,7 +103,6 @@ function makeFrame(over: Partial<Frame> = {}): Frame {
     terminalId: "term-1",
     provider: "claude_code",
     agentProfile: null,
-    sessionName: null,
     pending: false,
     transport: "daemon",
     ptySessionId: "sess-1",

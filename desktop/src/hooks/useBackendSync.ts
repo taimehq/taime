@@ -7,30 +7,26 @@ import { useStore } from "../store";
  * reflects whether the daemon truly responds, independent of the Rust supervisor's
  * self-reported status (which is unavailable when running outside the webview).
  *
- *  - agent roster (10s)   → connectivity probe + reconcile input
- *  - terminal statuses (3s) for frames currently open (no-ops when none)
+ *  - agent roster (10s) → connectivity probe + reconcile input
+ *
+ * Per-frame status arrives over the daemon attach channel + reconcile tick
+ * (useRustPtyReconcile), not from polling here.
  */
 export function useBackendSync() {
   const fetchAgents = useStore((s) => s.fetchAgents);
-  const refreshStatuses = useStore((s) => s.refreshStatuses);
 
   useEffect(() => {
     let alive = true;
 
     fetchAgents();
-    refreshStatuses();
 
     const agentsTimer = setInterval(() => {
       if (alive) fetchAgents();
     }, 10000);
-    const statusTimer = setInterval(() => {
-      if (alive) refreshStatuses();
-    }, 3000);
 
     return () => {
       alive = false;
       clearInterval(agentsTimer);
-      clearInterval(statusTimer);
     };
-  }, [fetchAgents, refreshStatuses]);
+  }, [fetchAgents]);
 }

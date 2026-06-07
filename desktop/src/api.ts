@@ -293,7 +293,7 @@ export const api = {
 
   /** Agent profiles from the daemon's profile store (`~/.taime/agents/*.toml`
    *  plus the built-in `default`/`orchestrator`). The launcher renders these as
-   *  selectable roles; the chosen name flows back to the daemon at spawn. */
+   *  selectable profiles; the chosen name flows back to the daemon at spawn. */
   listProfiles: () =>
     daemonQuery<AgentProfileInfo[]>("profiles", {}, [
       { name: "default", description: "Plain agent — no orchestration tools.", source: "builtin" },
@@ -376,7 +376,6 @@ export const api = {
   /** The daemon's agents (its registry is the only roster); the tmux-shaped
    *  session grouping is gone. */
   listAgents: () => daemonQuery<AgentSummary[]>("agents", {}, []),
-  deleteSession: async (_name: string) => ({ success: true, deleted: [] as string[], errors: [] as unknown[] }),
 
   getWorkingDirectory: (id: string) =>
     daemonQuery<{ working_directory: string | null }>(
@@ -387,8 +386,6 @@ export const api = {
       const raw = w as unknown as { worktree_path?: string; working_directory?: string | null };
       return { working_directory: raw.worktree_path ?? raw.working_directory ?? null };
     }),
-
-  getTerminalStatus: (_id: string): Promise<string | null> => Promise.resolve(null),
 
   getTerminalDiff: (id: string) =>
     daemonQuery<TerminalDiff>("terminal_diff", { agent_id: id }, {
@@ -517,9 +514,6 @@ export const api = {
   getContention: (session: string) =>
     daemonQuery<{ path: string; terminals: string[] }[]>("contention", { session }, []),
 
-  /** The daemon records turns natively; checkpoints are a no-op now. */
-  postCheckpoint: async (_terminalId: string, _boundary: "turn_start" | "turn_end") => ({}),
-
   /** The activity graph: daemon agents + inter-agent edges, mapped to the shape
    *  the ActivityGraph component expects. */
   getGraph: async (session: string): Promise<ActivityGraph> => {
@@ -553,8 +547,6 @@ export const api = {
    *  its diff), so the next `FsDirty` push starts fresh. */
   clearDaemonDirty: (agentId: string) =>
     daemonQuery<boolean>("clear_dirty", { agent_id: agentId }, true),
-
-  getActivity: async (_params?: { session?: string; terminalId?: string; limit?: number }): Promise<ActivityEvent[]> => [],
 };
 
 export interface GraphTurn {
@@ -583,20 +575,4 @@ export interface ActivityGraph {
   }[];
   edges: { kind: string; source: string | null; target: string | null; ts: string | null }[];
   contention: { path: string; terminals: string[] }[];
-}
-
-export interface ActivityEvent {
-  id: string;
-  ts: string | null;
-  kind: string;
-  agent_id: string | null;
-  session_name: string | null;
-  agent_profile: string | null;
-  provider: string | null;
-  target_agent_id: string | null;
-  path: string | null;
-  change_kind: string | null;
-  turn_id: string | null;
-  snapshot_sha: string | null;
-  meta: Record<string, unknown> | null;
 }

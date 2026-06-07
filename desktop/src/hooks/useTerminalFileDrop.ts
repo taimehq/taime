@@ -11,8 +11,9 @@ import {
 
 /**
  * Drag a file or screenshot from Finder onto a terminal → its absolute path is
- * typed at that terminal's cursor (works for both transports). Claude Code (and
- * other CLIs) read images/files by path, so this covers "drop a screenshot in".
+ * typed at that terminal's cursor (via the registered terminal writer). Claude
+ * Code (and other CLIs) read images/files by path, so this covers "drop a
+ * screenshot in".
  *
  * Tauri captures the OS drop at the webview level and gives us REAL absolute
  * paths + a drop position (the HTML `drop` event does not fire / has no paths).

@@ -28,11 +28,11 @@ import {
   type TurnEvent,
   type DaemonSessionSummary,
 } from "./pty";
-import { providerTitle } from "./lib/providerLabel";
+import { providerTitle, PROVIDER_ORDER } from "./lib/providerLabel";
 
 /** Providers the daemon can launch via its provider registry. Every launch —
  *  any profile — routes through the daemon; it is the only transport. */
-const DAEMON_PROVIDERS = new Set(["claude_code", "codex", "gemini_cli", "grok_cli"]);
+const DAEMON_PROVIDERS = new Set(PROVIDER_ORDER);
 
 /** Best-effort provider id from a daemon session's program path (for adopting a
  *  crash-surviving session before the daemon reports provider on the wire). */
@@ -44,13 +44,12 @@ function providerFromProgram(program: string): string {
   return "claude_code";
 }
 
-/** Which transport carries a frame's terminal I/O. Only `daemon` exists now (the
- *  detached session daemon / Rust PTY path; survives crashes). `cao_ws` is a
- *  retired legacy variant kept so older persisted state still parses. */
-export type TerminalTransport = "cao_ws" | "daemon";
+/** Which transport carries a frame's terminal I/O. Only `daemon` exists (the
+ *  detached session daemon / Rust PTY path; survives crashes). */
+export type TerminalTransport = "daemon";
 
-/** Frame transports that render in the xterm daemon view (vs the CAO WebSocket
- *  terminal). */
+/** Frame transports that render in the xterm daemon view (a frame without a
+ *  transport is a transient placeholder, not a live daemon view). */
 export function isDaemonTransport(t: TerminalTransport | undefined): boolean {
   return t === "daemon";
 }
@@ -80,13 +79,12 @@ export interface Frame {
   terminalId: string | null; // null while pending
   provider: string;
   agentProfile: string | null;
-  sessionName: string | null;
   /** Task membership at launch (null ⇒ Uncategorized). The durable source of
    *  truth is the worktree row; this is the display copy for tabs/headers. */
   taskId?: string | null;
   pending: boolean;
   error?: string;
-  /** Transport for this frame's terminal (default cao_ws). */
+  /** Transport for this frame's terminal (always the daemon once spawned). */
   transport?: TerminalTransport;
   /** Daemon session id (when transport === "daemon"). */
   ptySessionId?: string;
@@ -125,16 +123,6 @@ export interface DirtyState {
   paths: string[];
 }
 
-/** One attributed file change in a terminal's activity timeline. */
-export interface TimelineEvent {
-  path: string;
-  kind: string;
-  ts: number;
-}
-
-/** Cap on retained per-terminal timeline events (most recent kept). */
-const TIMELINE_CAP = 200;
-
 let frameCounter = 0;
 const nextKey = () => `frame-${++frameCounter}`;
 
@@ -165,8 +153,6 @@ interface Store {
    *  (most recent last, capped). The flagship substrate landing in the app. */
   frameTurns: Record<string, TurnEvent[]>;
   dirty: Record<string, DirtyState>;
-  /** Per-terminal attributed file-change timeline (most recent last). */
-  timeline: Record<string, TimelineEvent[]>;
   /** Terminal ids whose auto-surfaced frame the user explicitly closed; the
    *  reconciler must not reopen these. (Manually reopening clears the flag.) */
   dismissedTerminalIds: Set<string>;
@@ -202,10 +188,6 @@ interface Store {
   setIsolationEnabled: (enabled: boolean) => void;
   /** Refresh the daemon agent roster — also the connectivity probe. */
   fetchAgents: () => Promise<void>;
-  refreshStatuses: () => Promise<void>;
-  /** Legacy session-removal hook (no daemon equivalent — agents are standalone);
-   *  kept for the pipeline UI's empty session list. */
-  killSession: (name: string) => Promise<void>;
 
   // grid actions
   launchAgent: (
@@ -213,17 +195,11 @@ interface Store {
     agentProfile: string,
     opts?: { taskId?: string | null; workingDirectory?: string },
   ) => Promise<void>;
-  openTerminalFrame: (t: {
-    terminalId: string;
-    provider: string;
-    agentProfile?: string | null;
-    sessionName?: string | null;
-  }) => void;
   /** Launch a provider on the detached session daemon (the Rust PTY path; survives
    *  app crashes). `profile` is the daemon profile name (`~/.taime/agents/*.toml`
    *  + built-in `default`/`orchestrator`); the daemon resolves it to fill the
    *  system prompt / model / tools and injects the MCP orchestration tools for a
-   *  supervisor role. `taskId` (optional) is the Task the agent joins — stamped
+   *  supervisor profile. `taskId` (optional) is the Task the agent joins — stamped
    *  onto its worktree row at provision (null ⇒ Uncategorized); `projectRoot`
    *  (optional) overrides the worktree fork root (defaults to the active
    *  `workspaceDir`). Returns true on success. */
@@ -279,7 +255,6 @@ interface Store {
   // dirty state
   setDirty: (terminalId: string, dirty: DirtyState) => void;
   clearDirty: (terminalId: string) => void;
-  appendTimeline: (terminalId: string, events: TimelineEvent[]) => void;
 
   // misc
   setTerminalStatus: (id: string, status: string | null) => void;
@@ -314,7 +289,6 @@ export const useStore = create<Store>((set, get) => ({
   rustPtySessions: {},
   frameTurns: {},
   dirty: {},
-  timeline: {},
   dismissedTerminalIds: new Set(),
   reviewedFrames: {},
   pendingSwitchKey: null,
@@ -365,51 +339,13 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  refreshStatuses: async () => {
-    const ids = get()
-      // Daemon frames carry a CAO terminalId only for the attribution surface
-      // (it's a provisioned worktree id, not a tmux terminal). Their lifecycle
-      // comes from daemon_list via useRustPtyReconcile — polling CAO /terminals/{id}
-      // for them just 404s every tick. Skip them here.
-      .frames.filter((f) => !f.ptySessionId)
-      .map((f) => f.terminalId)
-      .filter((x): x is string => !!x);
-    if (ids.length === 0) return;
-    await Promise.all(
-      ids.map(async (id) => {
-        try {
-          const status = await api.getTerminalStatus(id);
-          get().setTerminalStatus(id, status);
-        } catch {
-          /* ignore transient */
-        }
-      }),
-    );
-  },
-
-  killSession: async (name) => {
-    // Close any open frames for this session first (UI only). The session-delete
-    // below is a no-op stub since the CAO removal (tmux-shaped sessions are
-    // gone) — daemon agents are killed per-frame, not per-session.
-    const victims = get().frames.filter((f) => f.sessionName === name);
-    for (const f of victims) await get().closeFrame(f.key);
-    try {
-      await api.deleteSession(name);
-      get().showSnackbar({ type: "info", message: `Removed session ${name}` });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      get().showSnackbar({ type: "error", message: `Couldn't remove ${name}: ${msg}` });
-    }
-    await get().fetchAgents();
-  },
-
   launchAgent: async (provider, agentProfile, opts) => {
     // Daemon-only after the CAO/tmux removal: every supported CLI launches on the
     // detached session daemon (the Rust PTY path), in its own worktree. The
     // chosen profile name flows to the daemon, which resolves it against its
     // profile store (~/.taime/agents/*.toml + built-in default/orchestrator) to
     // fill the system prompt / model / tools and inject orchestration for a
-    // supervisor role.
+    // supervisor profile.
     if (!DAEMON_PROVIDERS.has(provider)) {
       get().showSnackbar({ type: "error", message: `Unknown provider ${provider}` });
       return;
@@ -430,45 +366,11 @@ export const useStore = create<Store>((set, get) => ({
     if (ok && firstAgent) get().setGraphOpen(true);
   },
 
-  openTerminalFrame: ({ terminalId, provider, agentProfile, sessionName }) => {
-    // Opening a terminal (manually or via reconcile) clears any prior dismissal
-    // so its surfacing lifecycle resets.
-    const undismiss = (s: Store): Partial<Store> =>
-      s.dismissedTerminalIds.has(terminalId)
-        ? {
-            dismissedTerminalIds: new Set(
-              [...s.dismissedTerminalIds].filter((id) => id !== terminalId),
-            ),
-          }
-        : {};
-    const existing = get().frames.find((f) => f.terminalId === terminalId);
-    if (existing) {
-      set((s) => ({ ...undismiss(s), activeFrameKey: existing.key }));
-      return;
-    }
-    const key = nextKey();
-    set((s) => ({
-      ...undismiss(s),
-      frames: [
-        ...s.frames,
-        {
-          key,
-          terminalId,
-          provider,
-          agentProfile: agentProfile ?? null,
-          sessionName: sessionName ?? null,
-          pending: false,
-        },
-      ],
-      activeFrameKey: key,
-    }));
-  },
-
   launchAgentDaemon: async (provider, profile = "default", taskId = null, projectRoot = null) => {
     // Provision from the active workspace (or an explicit override root) — the
     // worktree row is the durable anchor for attribution AND Task membership.
     const dir = projectRoot ?? get().workspaceDir;
-    // The built-in "orchestrator" role is a supervisor; the daemon also infers
+    // The built-in "orchestrator" profile is a supervisor; the daemon also infers
     // this from a file profile's `orchestrator = true`, but pass the hint so a
     // pre-resolution path still injects the tools.
     const orchestrate = profile === "orchestrator";
@@ -505,7 +407,7 @@ export const useStore = create<Store>((set, get) => ({
       set((s) => {
         // If the reconcile tick already surfaced this freshly-spawned session as a
         // frame (a concurrent daemonList can list it before this set() runs), reuse
-        // that frame instead of adding a duplicate — just focus it + label its role.
+        // that frame instead of adding a duplicate — just focus it + label its profile.
         const existing = s.frames.find((f) => f.ptySessionId === sessionId);
         const frames = existing
           ? s.frames.map((f) =>
@@ -520,7 +422,6 @@ export const useStore = create<Store>((set, get) => ({
                 terminalId,
                 provider,
                 agentProfile: profile,
-                sessionName: null,
                 taskId: taskId ?? null,
                 pending: false,
                 transport: "daemon" as const,
@@ -660,13 +561,10 @@ export const useStore = create<Store>((set, get) => ({
           terminalId: meta.terminalId,
           provider: meta.provider,
           agentProfile: null,
-          sessionName: null,
           // Carry membership from the (reconcile-synced) meta so reattached /
           // adopted agents cross-link in DiffView like manually launched ones.
           taskId: meta.taskId ?? null,
           pending: false,
-          // Reattach via the backend that owns the session (daemon vs in-app),
-          // or the in-app default for pre-existing records without a transport.
           transport: "daemon",
           ptySessionId,
         },
@@ -708,8 +606,8 @@ export const useStore = create<Store>((set, get) => ({
     // Remove from the grid immediately (closing a frame ≠ stopping the agent).
     set((s) => {
       const frames = s.frames.filter((f) => f.key !== key);
-      // Remember explicitly-closed CAO terminals so the reconciler doesn't
-      // immediately reopen them. Rust-PTY frames are excluded — they have their
+      // Remember explicitly-closed non-daemon frames so the reconciler doesn't
+      // immediately reopen them. Daemon frames are excluded — they have their
       // own detached-agent lifecycle (close detaches, doesn't kill).
       const dismissedTerminalIds =
         frame && !isDaemonTransport(frame.transport) && frame.terminalId
@@ -760,14 +658,6 @@ export const useStore = create<Store>((set, get) => ({
       return { dirty: next };
     });
   },
-
-  appendTimeline: (terminalId, events) =>
-    set((s) => {
-      if (events.length === 0) return s;
-      const prev = s.timeline[terminalId] ?? [];
-      const merged = [...prev, ...events].slice(-TIMELINE_CAP);
-      return { timeline: { ...s.timeline, [terminalId]: merged } };
-    }),
 
   setActiveFrameGuarded: (key) => {
     const s = get();

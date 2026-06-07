@@ -2,8 +2,8 @@
  * Transport-agnostic terminal input injection.
  *
  * Drag-and-drop (and any future "send text to this terminal" feature) needs to
- * write into a terminal without knowing whether it's the CAO WebSocket or the
- * Rust PTY. Each terminal view registers a writer keyed by its terminal/session
+ * write into a terminal without coupling to the transport (the daemon Rust
+ * PTY). Each terminal view registers a writer keyed by its terminal/session
  * id; the drop handler looks up the writer for whichever frame the file landed
  * on and writes the (shell-escaped) path(s) at the cursor — no submit, so the
  * user can keep typing.
