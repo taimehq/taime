@@ -66,6 +66,12 @@ export interface ScheduleInfo {
   /** Unix seconds of the last fire / next scheduled fire, or null. */
   last_run: number | null;
   next_run: number | null;
+  /** Workspace the fire runs in (null = daemon cwd; no task targeting). */
+  workspace_root: string | null;
+  /** Explicit task behavior: null = uncategorized, "fixed" = attach to
+   *  `task_id`, "per_run" = create a task per fire (explicit opt-in). */
+  task_mode: "fixed" | "per_run" | string | null;
+  task_id: string | null;
 }
 
 /** Fields the Add-schedule dialog sends to create/replace a schedule. */
@@ -76,6 +82,48 @@ export interface ScheduleInput {
   provider: string;
   prompt: string;
   script?: string | null;
+  workspace_root?: string | null;
+  task_mode?: "fixed" | "per_run" | null;
+  task_id?: string | null;
+}
+
+// ── Tasks (v9): workspace-scoped units of user intent ───────────────────────
+// Membership is a nullable task_id on the agent's durable record; a Task owns
+// grouping/lifecycle/review rollups — never raw attribution (Agent-ID anchored).
+
+export type TaskStatus = "open" | "in_review" | "done" | "archived";
+
+export interface TaskInfo {
+  id: string;
+  workspace_root: string;
+  title: string;
+  description: string;
+  status: TaskStatus | string;
+  /** Unix seconds. */
+  created_at: number;
+  updated_at: number;
+  archived_at: number | null;
+  /** Member-agent count (derived rollup, computed daemon-side). */
+  agent_count: number;
+}
+
+/** One member agent in a task detail: worktree row + live status + dirty rollup. */
+export interface TaskAgent {
+  terminal_id: string;
+  provider: string | null;
+  branch: string | null;
+  mode: string | null;
+  worktree_path: string | null;
+  status: string | null;
+  alive: boolean;
+  dirty_count: number;
+  dirty_paths: string[];
+}
+
+export interface TaskDetail {
+  task: TaskInfo;
+  agents: TaskAgent[];
+  runs: WorkflowRunSummary[];
 }
 
 // ── Workflows (the loopable agent step-graph) ───────────────────────────────
@@ -103,6 +151,8 @@ export interface WorkflowRunSummary {
   started_at: number | null;
   ended_at: number | null;
   error: string | null;
+  /** Task this run executes inside (null ⇒ Uncategorized). */
+  task_id: string | null;
   /** node_id → its latest state in this run. */
   node_states: Record<string, WorkflowNodeState>;
 }
@@ -237,6 +287,8 @@ export interface WorktreeInfo {
   base_sha: string | null;
   provider: string | null;
   member_of?: string | null;
+  /** Task membership (null ⇒ Uncategorized). */
+  task_id?: string | null;
 }
 
 export interface LaunchIsolation {
@@ -314,14 +366,16 @@ export const api = {
    *  with its node/edge graph and most-recent run state. */
   listWorkflows: () => daemonQuery<WorkflowInfo[]>("workflows", {}, []),
   /** Start a run of a workflow now; returns the run id, or an error string.
-   *  `projectRoot` (the active workspace) is where the nodes' worktrees fork from. */
+   *  `projectRoot` (the active workspace) is where the nodes' worktrees fork
+   *  from; `taskId` attaches the run (and its node agents) to a Task. */
   runWorkflow: async (
     name: string,
     projectRoot?: string | null,
+    taskId?: string | null,
   ): Promise<{ run_id?: string; error?: string }> =>
     daemonQuery<{ run_id?: string; error?: string }>(
       "workflow_run",
-      { name, project_root: projectRoot ?? null },
+      { name, project_root: projectRoot ?? null, task_id: taskId ?? null },
       { error: "daemon unavailable" },
     ),
   /** Live status of a run (poll while a run is active). */
@@ -379,12 +433,14 @@ export const api = {
     project_root: string;
     provider?: string;
     isolate?: boolean;
-    session_name?: string;
+    /** Task membership stamped onto the worktree row (null ⇒ Uncategorized). */
+    task_id?: string | null;
   }): Promise<WorktreeInfo> => {
     const wt = await daemonProvisionWorktree(
       body.project_root,
       body.provider ?? "claude_code",
       body.isolate ?? false,
+      body.task_id ?? null,
     );
     return {
       terminal_id: wt.terminal_key,
@@ -396,8 +452,66 @@ export const api = {
       base_sha: wt.base_sha,
       provider: body.provider ?? null,
       member_of: null,
+      task_id: body.task_id ?? null,
     };
   },
+
+  // ── Tasks (workspace-scoped intent grouping; all on the Query RPC) ────────
+  /** Tasks of a workspace (newest first; archived hidden unless asked). */
+  listTasks: (workspaceRoot: string, includeArchived = false) =>
+    daemonQuery<TaskInfo[]>(
+      "tasks",
+      { workspace_root: workspaceRoot, include_archived: includeArchived },
+      [],
+    ),
+  /** Create a task (status `open`); returns it, or null on error. */
+  createTask: async (
+    workspaceRoot: string,
+    title: string,
+    description = "",
+  ): Promise<TaskInfo | null> => {
+    const r = await daemonQuery<TaskInfo | { error: string }>(
+      "task_create",
+      { workspace_root: workspaceRoot, title, description },
+      { error: "daemon unavailable" },
+    );
+    return "error" in r ? null : r;
+  },
+  /** Update title/description/status. Status is the lifecycle enum; `archived`
+   *  stamps archived_at. Returns an error string, else null. */
+  updateTask: async (
+    id: string,
+    patch: { title?: string; description?: string; status?: TaskStatus },
+  ): Promise<string | null> => {
+    const r = await daemonQuery<{ ok?: boolean; error?: string }>(
+      "task_update",
+      { id, ...patch },
+      { error: "daemon unavailable" },
+    );
+    return r.error ?? null;
+  },
+  /** Delete a task — members are DEMOTED to Uncategorized (never killed). */
+  deleteTask: async (id: string): Promise<string | null> => {
+    const r = await daemonQuery<{ ok?: boolean; error?: string }>(
+      "task_delete",
+      { id },
+      { error: "daemon unavailable" },
+    );
+    return r.error ?? null;
+  },
+  /** Assign (or unassign with null) an agent to a task — membership is the
+   *  nullable task_id pointer; at most one task per agent. */
+  assignAgentTask: async (agentKey: string, taskId: string | null): Promise<string | null> => {
+    const r = await daemonQuery<{ ok?: boolean; error?: string }>(
+      "task_assign",
+      { agent_key: agentKey, task_id: taskId },
+      { error: "daemon unavailable" },
+    );
+    return r.error ?? null;
+  },
+  /** One task + member agents (live status, dirty rollup) + attached runs —
+   *  the Task Review surface. */
+  getTaskDetail: (id: string) => daemonQuery<TaskDetail | null>("task_detail", { id }, null),
 
   getFileDiffs: (id: string) =>
     daemonQuery<FileDiffsResponse>("file_diffs", { terminal_key: id }, { terminal_id: id, files: [] }),
@@ -445,6 +559,7 @@ export const api = {
         mode: a.mode ?? null,
         branch: a.branch ?? null,
         member_of: a.member_of ?? null,
+        task_id: a.task_id ?? null,
         turns: (a.turns ?? []).map((t) => ({
           id: t.id,
           turn_index: t.turn_index,
@@ -488,6 +603,8 @@ export interface ActivityGraph {
     mode: string | null;
     branch: string | null;
     member_of: string | null;
+    /** Task membership (null ⇒ Uncategorized) — for task-filtered views. */
+    task_id: string | null;
     turns: GraphTurn[];
   }[];
   edges: { kind: string; source: string | null; target: string | null; ts: string | null }[];

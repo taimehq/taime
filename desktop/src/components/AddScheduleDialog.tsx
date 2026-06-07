@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
 import { X } from "lucide-react";
-import { api, type ProviderInfo, type AgentProfileInfo } from "../api";
+import {
+  api,
+  type ProviderInfo,
+  type AgentProfileInfo,
+  type TaskInfo,
+} from "../api";
+import { useStore } from "../store";
+import { basename } from "../lib/recentProjects";
 
 /** Provider display names (the daemon's 4 CLIs). */
 const PROVIDER_LABELS: Record<string, string> = {
@@ -25,12 +32,19 @@ export function AddScheduleDialog({
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const workspaceDir = useStore((s) => s.workspaceDir);
+
   const [name, setName] = useState("");
   const [schedule, setSchedule] = useState("");
   const [profiles, setProfiles] = useState<AgentProfileInfo[]>([]);
   const [profile, setProfile] = useState("default");
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [provider, setProvider] = useState("");
+  // Workspace-targeted schedules are the common case — default to the active one.
+  const [workspace, setWorkspace] = useState(workspaceDir ?? "");
+  // "" = Uncategorized, "__per_run__" = fresh task per fire, else a task id.
+  const [taskSel, setTaskSel] = useState("");
+  const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [prompt, setPrompt] = useState("");
   const [script, setScript] = useState("");
   const [busy, setBusy] = useState(false);
@@ -57,6 +71,27 @@ export function AddScheduleDialog({
       .catch(() => setProviders([]));
   }, []);
 
+  // Open tasks for the targeted workspace (the Task field hides when none).
+  useEffect(() => {
+    setTaskSel("");
+    if (workspace === "") {
+      setTasks([]);
+      return;
+    }
+    let stale = false;
+    api
+      .listTasks(workspace)
+      .then((list) => {
+        if (!stale) setTasks(list.filter((t) => t.status === "open"));
+      })
+      .catch(() => {
+        if (!stale) setTasks([]);
+      });
+    return () => {
+      stale = true;
+    };
+  }, [workspace]);
+
   const canSubmit =
     !busy && name.trim() !== "" && schedule.trim() !== "" && prompt.trim() !== "";
 
@@ -72,6 +107,10 @@ export function AddScheduleDialog({
       provider,
       prompt: prompt.trim(),
       script: trimmedScript === "" ? null : trimmedScript,
+      workspace_root: workspace || null,
+      task_mode:
+        taskSel === "__per_run__" ? "per_run" : taskSel ? "fixed" : null,
+      task_id: taskSel && taskSel !== "__per_run__" ? taskSel : null,
     });
     setBusy(false);
     if (result) {
@@ -181,6 +220,50 @@ export function AddScheduleDialog({
             </option>
           ))}
         </select>
+
+        {/* Workspace — only the active one is offered; other roots ship as .md. */}
+        <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">
+          Workspace
+        </label>
+        <select
+          value={workspace}
+          onChange={(e) => setWorkspace(e.target.value)}
+          className="mb-4 w-full rounded-lg border border-ink-500 bg-ink-700 px-3 py-2 text-sm text-zinc-200"
+        >
+          <option value="">None (daemon home)</option>
+          {workspaceDir && (
+            <option value={workspaceDir}>
+              {basename(workspaceDir)} — {workspaceDir}
+            </option>
+          )}
+        </select>
+
+        {/* Task — explicit behavior; default Uncategorized, per-run is opt-in. */}
+        {workspace !== "" && (
+          <div className="mb-4">
+            <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">
+              Task
+            </label>
+            <select
+              value={taskSel}
+              onChange={(e) => setTaskSel(e.target.value)}
+              className="w-full rounded-lg border border-ink-500 bg-ink-700 px-3 py-2 text-sm text-zinc-200"
+            >
+              <option value="">Uncategorized</option>
+              {tasks.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.title}
+                </option>
+              ))}
+              <option value="__per_run__">New task per run</option>
+            </select>
+            {taskSel === "__per_run__" && (
+              <p className="mt-1 text-[10px] text-zinc-600">
+                Each fire creates a fresh task (explicit opt-in).
+              </p>
+            )}
+          </div>
+        )}
 
         {/* Prompt */}
         <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">

@@ -112,9 +112,11 @@ export function DiffView() {
       setAttribution(attr);
       setSelected((prev) => prev ?? fd.files[0]?.path ?? null);
       if (wt?.mode === "shared" || wt?.mode === "worktree") {
-        const sess = frame?.sessionName;
-        if (sess) {
-          const c = await api.getContention(sess).catch(() => []);
+        // Contention is workspace-wide: key off the worktree's project root
+        // (the workspace-grouping id), not a frame label.
+        const root = wt?.project_root;
+        if (root) {
+          const c = await api.getContention(root).catch(() => []);
           setContended(new Set(c.map((r) => r.path)));
         }
       }
@@ -182,12 +184,14 @@ export function DiffView() {
     worktree?.provider ??
     "agent";
 
+  // Sibling agents = same Task (the membership grouping; Uncategorized agents
+  // don't cross-link). Replaces the legacy sessionName label match.
   const otherAgents = frames.filter(
     (f) =>
       f.terminalId &&
       f.terminalId !== terminalId &&
-      f.sessionName &&
-      f.sessionName === frame?.sessionName,
+      f.taskId &&
+      f.taskId === frame?.taskId,
   );
 
   const allIdx = (path: string) =>

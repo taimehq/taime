@@ -232,12 +232,13 @@ impl DaemonClient {
         project_root: String,
         provider: String,
         isolate: bool,
+        task_id: Option<String>,
     ) -> Result<WorktreeInfo, String> {
         let req_id = self.next_req();
         let mut conn = self.connect_handshake().await?;
         send(
             &mut conn,
-            &ClientMsg::ProvisionWorktree { req_id, project_root, provider, isolate },
+            &ClientMsg::ProvisionWorktree { req_id, project_root, provider, isolate, task_id },
         )
         .await?;
         match read_server(&mut conn).await? {
