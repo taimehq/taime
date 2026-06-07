@@ -43,7 +43,13 @@ vi.mock("./lib/preferences", () => ({
   saveSidebarCollapsed: vi.fn(),
 }));
 
-import { useStore, type Frame, type RustPtyMeta } from "./store";
+import {
+  useStore,
+  unreadCount,
+  termModeFor,
+  type Frame,
+  type RustPtyMeta,
+} from "./store";
 import { api, type WorktreeInfo } from "./api";
 import { daemonSpawnAgent, type DaemonSessionSummary } from "./pty";
 
@@ -507,5 +513,311 @@ describe("task review / graph drawer exclusivity", () => {
     useStore.getState().openTaskReview("task-1");
     useStore.getState().closeTaskReview();
     expect(useStore.getState().taskReviewId).toBeNull();
+  });
+});
+
+// ── section navigation (guard-gated) ────────────────────────────────────────
+
+/** An agents-section state with one dirty, unreviewed active frame. */
+function seedUnreviewedAgent() {
+  useStore.setState({
+    section: "agents",
+    frames: [makeFrame({ key: "f1", terminalId: "term-1" })],
+    activeFrameKey: "f1",
+    dirty: { "term-1": { count: 2, paths: ["a.ts", "b.ts"] } },
+    reviewedFrames: {},
+  });
+}
+
+describe("section navigation", () => {
+  it("defaults to dashboard with empty selections", () => {
+    const s = useStore.getState();
+    expect(s.section).toBe("dashboard");
+    expect(s.selectedTaskId).toBeNull();
+    expect(s.taskInitialTab).toBeNull();
+    expect(s.selectedWorkflow).toBeNull();
+    expect(s.selectedSchedule).toBeNull();
+  });
+
+  it("setSection switches freely when no unreviewed work", () => {
+    useStore.getState().setSection("tasks");
+    expect(useStore.getState().section).toBe("tasks");
+    expect(useStore.getState().pendingSwitch).toBeNull();
+  });
+
+  it("per-section selection persists across section switches", () => {
+    useStore.getState().selectTask("task-1");
+    useStore.getState().setSelectedWorkflow("wf-1");
+    useStore.getState().setSelectedSchedule("sch-1");
+
+    useStore.getState().setSection("settings");
+    useStore.getState().setSection("tasks");
+
+    const s = useStore.getState();
+    expect(s.selectedTaskId).toBe("task-1");
+    expect(s.selectedWorkflow).toBe("wf-1");
+    expect(s.selectedSchedule).toBe("sch-1");
+  });
+
+  it("leaving agents with unreviewed work raises the guard instead of switching", () => {
+    seedUnreviewedAgent();
+
+    useStore.getState().setSection("dashboard");
+
+    const s = useStore.getState();
+    expect(s.section).toBe("agents"); // did NOT navigate
+    expect(s.pendingSwitch).toEqual({ kind: "section", section: "dashboard" });
+  });
+
+  it("ignores further navigation while the guard is open", () => {
+    seedUnreviewedAgent();
+    useStore.getState().setSection("dashboard");
+
+    useStore.getState().setSection("settings");
+    useStore.getState().selectTask("task-9");
+
+    const s = useStore.getState();
+    expect(s.pendingSwitch).toEqual({ kind: "section", section: "dashboard" }); // not retargeted
+    expect(s.section).toBe("agents");
+    expect(s.selectedTaskId).toBeNull();
+  });
+
+  it("resolveSwitch(true) applies the section and marks the agent reviewed by agent id", () => {
+    seedUnreviewedAgent();
+    useStore.getState().setSection("dashboard");
+
+    useStore.getState().resolveSwitch(true);
+
+    const s = useStore.getState();
+    expect(s.section).toBe("dashboard");
+    expect(s.pendingSwitch).toBeNull();
+    expect(s.reviewedFrames["term-1"]).toBe(true); // keyed by agent id, not frame key
+  });
+
+  it("resolveSwitch(false) cancels and stays", () => {
+    seedUnreviewedAgent();
+    useStore.getState().setSection("dashboard");
+
+    useStore.getState().resolveSwitch(false);
+
+    const s = useStore.getState();
+    expect(s.section).toBe("agents");
+    expect(s.pendingSwitch).toBeNull();
+    expect(s.reviewedFrames["term-1"]).toBeUndefined();
+  });
+
+  it("already-reviewed work (by agent id) does not raise the guard", () => {
+    seedUnreviewedAgent();
+    useStore.setState({ reviewedFrames: { "term-1": true } });
+
+    useStore.getState().setSection("dashboard");
+
+    expect(useStore.getState().section).toBe("dashboard");
+    expect(useStore.getState().pendingSwitch).toBeNull();
+  });
+
+  it("no guard when leaving a non-agents section, even with dirty work", () => {
+    seedUnreviewedAgent();
+    useStore.setState({ section: "dashboard" }); // already away from the agent
+
+    useStore.getState().setSection("settings");
+
+    expect(useStore.getState().section).toBe("settings");
+    expect(useStore.getState().pendingSwitch).toBeNull();
+  });
+
+  it("selectTask navigates to tasks with the deep-link tab when clean", () => {
+    useStore.getState().selectTask("task-1", "review");
+
+    const s = useStore.getState();
+    expect(s.section).toBe("tasks");
+    expect(s.selectedTaskId).toBe("task-1");
+    expect(s.taskInitialTab).toBe("review");
+
+    s.clearTaskInitialTab();
+    expect(useStore.getState().taskInitialTab).toBeNull();
+  });
+
+  it("selectTask is gated leaving agents; resolveSwitch(true) completes the deep link", () => {
+    seedUnreviewedAgent();
+
+    useStore.getState().selectTask("task-1", "review");
+
+    let s = useStore.getState();
+    expect(s.section).toBe("agents");
+    expect(s.selectedTaskId).toBeNull();
+    expect(s.pendingSwitch).toEqual({ kind: "task", taskId: "task-1", tab: "review" });
+
+    useStore.getState().resolveSwitch(true);
+
+    s = useStore.getState();
+    expect(s.section).toBe("tasks");
+    expect(s.selectedTaskId).toBe("task-1");
+    expect(s.taskInitialTab).toBe("review");
+    expect(s.reviewedFrames["term-1"]).toBe(true);
+  });
+
+  it("frame switches still guard (pendingSwitch kind frame) and honor agent-id review state", () => {
+    seedUnreviewedAgent();
+    useStore.setState({
+      frames: [
+        makeFrame({ key: "f1", terminalId: "term-1" }),
+        makeFrame({ key: "f2", terminalId: "term-2", ptySessionId: "sess-2" }),
+      ],
+    });
+
+    useStore.getState().setActiveFrameGuarded("f2");
+    expect(useStore.getState().pendingSwitch).toEqual({ kind: "frame", key: "f2" });
+    expect(useStore.getState().activeFrameKey).toBe("f1");
+
+    useStore.getState().resolveSwitch(true);
+    const s = useStore.getState();
+    expect(s.activeFrameKey).toBe("f2");
+    expect(s.reviewedFrames["term-1"]).toBe(true);
+  });
+});
+
+// ── notifications ───────────────────────────────────────────────────────────
+
+describe("notifications", () => {
+  it("first fs-dirty push notifies kind review; growth does not re-notify", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().markDaemonFsDirty("sess-1", ["a.ts"]);
+
+    let s = useStore.getState();
+    expect(s.notifications).toHaveLength(1);
+    const n = s.notifications[0];
+    expect(n.kind).toBe("review");
+    expect(n.agentId).toBe("term-1");
+    expect(n.taskId).toBe("task-1");
+    expect(n.text).toContain("Claude Code");
+    expect(n.read).toBe(false);
+
+    useStore.getState().markDaemonFsDirty("sess-1", ["a.ts", "b.ts"]);
+
+    s = useStore.getState();
+    expect(s.dirty["term-1"].count).toBe(2); // set still grows
+    expect(s.notifications).toHaveLength(1); // no second item
+  });
+
+  it("status push WAITING_USER_ANSWER notifies kind blocked, once per transition", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().setDaemonSessionStatus("sess-1", "WAITING_USER_ANSWER");
+    useStore.getState().setDaemonSessionStatus("sess-1", "WAITING_USER_ANSWER");
+
+    const s = useStore.getState();
+    expect(s.notifications).toHaveLength(1);
+    expect(s.notifications[0].kind).toBe("blocked");
+    expect(s.notifications[0].agentId).toBe("term-1");
+  });
+
+  it("poll-path setTerminalStatus dedupes against the push path (same status map)", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().setDaemonSessionStatus("sess-1", "WAITING_USER_ANSWER");
+    useStore.getState().setTerminalStatus("term-1", "WAITING_USER_ANSWER");
+
+    expect(useStore.getState().notifications).toHaveLength(1);
+  });
+
+  it("setTerminalStatus ERROR notifies kind error", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().setTerminalStatus("term-1", "ERROR");
+
+    const s = useStore.getState();
+    expect(s.notifications).toHaveLength(1);
+    expect(s.notifications[0].kind).toBe("error");
+  });
+
+  it("exit notifies kind exited exactly once (idempotent with the lifecycle flip)", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().markRustPtyExited("sess-1");
+    useStore.getState().markRustPtyExited("sess-1"); // no-op
+
+    const s = useStore.getState();
+    expect(s.notifications).toHaveLength(1);
+    expect(s.notifications[0].kind).toBe("exited");
+    expect(s.notifications[0].text).toContain("exited");
+  });
+
+  it("caps at 200, evicting oldest first (FIFO)", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+    for (let i = 0; i < 205; i++) {
+      // Alternate to force a real transition (and thus a push) every call.
+      useStore
+        .getState()
+        .setTerminalStatus("term-1", i % 2 === 0 ? "WAITING_USER_ANSWER" : "ERROR");
+    }
+    const s = useStore.getState();
+    expect(s.notifications).toHaveLength(200);
+    // Oldest were evicted: the newest item is the 205th push.
+    expect(s.notifications[199].kind).toBe("blocked"); // i=204 is even → blocked
+  });
+
+  it("markRead marks one item; unknown id is an identity no-op", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+    useStore.getState().setTerminalStatus("term-1", "ERROR");
+    useStore.getState().markRustPtyExited("sess-1");
+    const [first, second] = useStore.getState().notifications;
+    expect(unreadCount(useStore.getState())).toBe(2);
+
+    useStore.getState().markRead(first.id);
+
+    let s = useStore.getState();
+    expect(s.notifications.find((n) => n.id === first.id)?.read).toBe(true);
+    expect(s.notifications.find((n) => n.id === second.id)?.read).toBe(false);
+    expect(unreadCount(s)).toBe(1);
+
+    const before = useStore.getState();
+    useStore.getState().markRead("nope");
+    useStore.getState().markRead(first.id); // already read
+    expect(useStore.getState()).toBe(before);
+  });
+
+  it("markAllRead clears the unread count; second call is an identity no-op", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+    useStore.getState().setTerminalStatus("term-1", "ERROR");
+    useStore.getState().markRustPtyExited("sess-1");
+
+    useStore.getState().markAllRead();
+
+    const after = useStore.getState();
+    expect(unreadCount(after)).toBe(0);
+    expect(after.notifications.every((n) => n.read)).toBe(true);
+
+    useStore.getState().markAllRead();
+    expect(useStore.getState()).toBe(after);
+  });
+});
+
+// ── termModes ───────────────────────────────────────────────────────────────
+
+describe("termModes", () => {
+  it("defaults to terminal for any agent", () => {
+    expect(termModeFor(useStore.getState(), "agent-x")).toBe("terminal");
+    expect(termModeFor(useStore.getState(), null)).toBe("terminal");
+  });
+
+  it("setTermMode records the per-agent mode", () => {
+    useStore.getState().setTermMode("agent-x", "console");
+
+    const s = useStore.getState();
+    expect(s.termModes["agent-x"]).toBe("console");
+    expect(termModeFor(s, "agent-x")).toBe("console");
+    expect(termModeFor(s, "agent-y")).toBe("terminal"); // others unaffected
+  });
+
+  it("setting the current mode is an identity no-op", () => {
+    useStore.getState().setTermMode("agent-x", "console");
+    const before = useStore.getState();
+
+    useStore.getState().setTermMode("agent-x", "console");
+    useStore.getState().setTermMode("agent-y", "terminal"); // already the default
+
+    expect(useStore.getState()).toBe(before);
   });
 });

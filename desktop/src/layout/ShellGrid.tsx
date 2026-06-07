@@ -1,6 +1,7 @@
 import { useStore, isDaemonTransport, type Frame } from "../store";
 import { TerminalViewRustPty } from "../components/TerminalViewRustPty";
-import { StatusBadge, statusDotClass } from "../components/StatusBadge";
+import { StatusBadge } from "../components/StatusBadge";
+import { statusDotClass } from "../lib/agentStatus";
 import { providerTitle } from "../lib/providerLabel";
 import { Loader2, X, TerminalSquare, Power, LayoutGrid } from "lucide-react";
 

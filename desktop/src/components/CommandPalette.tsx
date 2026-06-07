@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore, type Frame } from "../store";
 import { providerTitle } from "../lib/providerLabel";
-import { statusLabel } from "./StatusBadge";
+import { statusLabel, uiStatus } from "../lib/agentStatus";
 
 /**
  * Cmd+K command palette — the primary navigation/action surface. It is NOT a
@@ -92,7 +92,7 @@ function PaletteBody() {
           : undefined;
       const d = f.terminalId ? dirty[f.terminalId] : undefined;
       const isDirty = !!d && d.count > 0;
-      const needsYou = raw === "WAITING_USER_ANSWER";
+      const needsYou = uiStatus(raw) === "blocked";
       const group = needsYou
         ? "Needs you"
         : isDirty

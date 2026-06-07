@@ -12,21 +12,33 @@ export function ContextSwitchGuard({
 }: {
   onReview: (terminalId: string) => void;
 }) {
-  const pendingSwitchKey = useStore((s) => s.pendingSwitchKey);
+  const pendingSwitch = useStore((s) => s.pendingSwitch);
   const frames = useStore((s) => s.frames);
   const activeFrameKey = useStore((s) => s.activeFrameKey);
   const dirty = useStore((s) => s.dirty);
   const resolveSwitch = useStore((s) => s.resolveSwitch);
 
-  if (!pendingSwitchKey) return null;
+  if (!pendingSwitch) return null;
 
   const current = frames.find((f) => f.key === activeFrameKey);
-  const next = frames.find((f) => f.key === pendingSwitchKey);
   const d = current?.terminalId ? dirty[current.terminalId] : undefined;
   if (!current || !d) return null;
 
   const fromName = providerTitle(current.provider);
-  const toName = next ? providerTitle(next.provider) : "another agent";
+  // Where the blocked switch is headed: another agent's frame, a rail
+  // section, or a task screen.
+  const next =
+    pendingSwitch.kind === "frame"
+      ? frames.find((f) => f.key === pendingSwitch.key)
+      : undefined;
+  const toName =
+    pendingSwitch.kind === "frame"
+      ? next
+        ? providerTitle(next.provider)
+        : "another agent"
+      : pendingSwitch.kind === "task"
+        ? "the task view"
+        : `the ${pendingSwitch.section} section`;
 
   // Contended files: paths this agent changed that ANOTHER live agent also has
   // dirty — a real cross-agent collision signal, surfaced before the switch.
