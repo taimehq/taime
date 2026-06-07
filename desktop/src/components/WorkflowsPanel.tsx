@@ -82,14 +82,22 @@ export function WorkflowsPanel() {
   const run = async (wf: WorkflowInfo) => {
     setRunningName(wf.name);
     try {
-      await api.runWorkflow(wf.name, useStore.getState().workspaceDir);
+      const result = await api.runWorkflow(wf.name, useStore.getState().workspaceDir);
+      if (result.error) {
+        // runWorkflow resolves with `.error` instead of throwing — surface it.
+        useStore.getState().showSnackbar({
+          type: "error",
+          message: `Couldn't run "${wf.name}": ${result.error}`,
+        });
+        return;
+      }
+      if (!mounted.current) return;
+      // Open the graph for the live view (it polls the run itself).
+      setSelected(wf);
+      refresh();
     } finally {
       if (mounted.current) setRunningName(null);
     }
-    if (!mounted.current) return;
-    // Open the graph for the live view (it polls the run itself).
-    setSelected(wf);
-    refresh();
   };
 
   const remove = async (name: string) => {

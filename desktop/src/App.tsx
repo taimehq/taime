@@ -1,5 +1,4 @@
 import { lazy, Suspense, useEffect, useState } from "react";
-import { getConfig, type ResolvedConfig } from "./config";
 import {
   getBackendStatus,
   onBackendStatus,
@@ -19,7 +18,6 @@ import { ContextSwitchGuard } from "./components/ContextSwitchGuard";
 import { useTurnCheckpoints } from "./hooks/useTurnCheckpoints";
 import { useTerminalFileDrop } from "./hooks/useTerminalFileDrop";
 import { useRustPtyReconcile } from "./hooks/useRustPtyReconcile";
-import { useTerminalReconcile } from "./hooks/useTerminalReconcile";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
 import {
   LayoutGrid,
@@ -42,7 +40,6 @@ const TaskReviewDrawer = lazy(() =>
 );
 
 export default function App() {
-  const [cfg, setCfg] = useState<ResolvedConfig | null>(null);
   const [rustBackend, setRustBackend] = useState<BackendState>(UNKNOWN_BACKEND);
   // Launch-dialog visibility lives in the store so the command palette can open
   // it too (not just the sidebar button).
@@ -52,10 +49,9 @@ export default function App() {
   const openDiff = useStore((s) => s.openDiff);
   const setGraphOpen = useStore((s) => s.setGraphOpen);
 
-  // Discover backend URL + subscribe to live supervisor status (Tauri only).
+  // Subscribe to live supervisor status (Tauri only).
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    getConfig().then(setCfg);
     if (inTauri()) {
       getBackendStatus().then(setRustBackend);
       onBackendStatus(setRustBackend).then((fn) => {
@@ -69,7 +65,6 @@ export default function App() {
   useTurnCheckpoints();
   useTerminalFileDrop();
   useRustPtyReconcile();
-  useTerminalReconcile();
   useGlobalShortcuts();
 
   // Inside the webview the supervisor (Rust) is the source of truth for the
@@ -84,7 +79,9 @@ export default function App() {
           : "Backend not reachable",
         external: true,
         pid: null,
-        apiUrl: cfg?.apiUrl ?? "",
+        // No HTTP backend exists anymore (the session daemon is a Unix socket);
+        // the pill only renders status/detail, never a URL.
+        apiUrl: "",
       };
 
   return (

@@ -382,8 +382,6 @@ export const useStore = create<Store>((set, get) => ({
       const prev = get();
       if (!prev.connected || !jsonEqual(prev.sessions, sessions)) {
         set({ sessions, connected: true });
-      } else if (!prev.connected) {
-        set({ connected: true });
       }
     } catch {
       if (get().connected) set({ connected: false });
