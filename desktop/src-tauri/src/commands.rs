@@ -195,6 +195,12 @@ pub async fn daemon_attach(
     daemon.attach(session_id, rows, cols, on_data).await
 }
 
+/// Terminal input. `String` is correct at this boundary, deliberately: the only
+/// input source is xterm.js `onData`, which yields JS strings — serde carries
+/// any JS string as valid UTF-8, and the PTY receives those bytes verbatim
+/// (`into_bytes` never re-encodes). Arbitrary non-UTF-8 bytes can't originate
+/// from the webview; if a future non-xterm source needs them, add a raw-body
+/// variant rather than widening this one.
 #[tauri::command]
 pub async fn daemon_write(
     daemon: State<'_, DaemonClient>,
@@ -272,8 +278,26 @@ pub async fn daemon_available(daemon: State<'_, DaemonClient>) -> Result<bool, S
 #[cfg(target_os = "macos")]
 #[tauri::command]
 pub fn set_clipboard_image_from_path(path: String) -> Result<(), String> {
-    // AppleScript image class for the clipboard, by extension.
-    let ext = std::path::Path::new(&path)
+    // Defense in depth: this path is interpolated into an AppleScript source
+    // string. The escaping below handles `"` and `\`, but a newline (or other
+    // control char) would terminate the string literal and let the remainder
+    // of the path execute as a fresh AppleScript statement (e.g. `do shell
+    // script`). Reject control characters outright, and a leading '-' so the
+    // value can never be misread as an osascript flag.
+    if path.chars().any(|c| c.is_control()) {
+        return Err("invalid path: contains control characters".to_string());
+    }
+    if path.starts_with('-') {
+        return Err("invalid path: leading '-'".to_string());
+    }
+    let p = std::path::Path::new(&path);
+    if !p.is_file() {
+        return Err(format!("not a file: {path}"));
+    }
+    // AppleScript image class for the clipboard, by extension. Only known image
+    // extensions are accepted (mirrors IMAGE_EXTS in src/lib/terminalInput.ts);
+    // anything else is refused before osascript is ever invoked.
+    let ext = p
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -282,7 +306,8 @@ pub fn set_clipboard_image_from_path(path: String) -> Result<(), String> {
         "jpg" | "jpeg" => "«class JPEG»",
         "gif" => "«class GIFf»",
         "tif" | "tiff" => "«class TIFF»",
-        _ => "«class PNGf»", // png + default
+        "png" | "webp" | "bmp" | "heic" | "svg" => "«class PNGf»",
+        _ => return Err(format!("unsupported image extension: {ext:?}")),
     };
     let esc = path.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!("set the clipboard to (read (POSIX file \"{esc}\") as {class})");
