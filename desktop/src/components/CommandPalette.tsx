@@ -1,13 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useStore, type Frame } from "../store";
+import { useStore, type Section } from "../store";
 import { providerTitle } from "../lib/providerLabel";
 import { statusLabel, uiStatus } from "../lib/agentStatus";
+import { useTasks } from "../hooks/useTasks";
+import { pickDirectory } from "../lib/pickDirectory";
+import { inTauri } from "../backend";
 
 /**
  * Cmd+K command palette — the primary navigation/action surface. It is NOT a
- * status replacement: it reads store data directly (frames, terminalStatuses,
- * dirty) and EVERY frame jump goes through setActiveFrameGuarded so the
- * dirty-state guard always applies. Hand-rolled (no cmdk dep) against the store.
+ * status replacement: it indexes the store live (agents, tasks, workspaces)
+ * and EVERY jump goes through the guard-routed store actions
+ * (setActiveFrameGuarded / setSection / selectTask) so the dirty-state guard
+ * always applies. Hand-rolled (no cmdk dep) against the store.
+ *
+ * Inventory: Workspaces (switch/add) · Sections · Tasks (open / open review)
+ * · Agents (open / open console) · Actions (launch agent, new task,
+ * new schedule).
  */
 
 interface Cmd {
@@ -22,21 +30,16 @@ interface Cmd {
 }
 
 // Display order for the section headers.
-const GROUP_ORDER = [
-  "Needs you",
-  "Uncommitted changes",
-  "Open frames",
-  "Actions",
-  "Switch project",
-];
+const GROUP_ORDER = ["Workspaces", "Sections", "Tasks", "Agents", "Actions"];
 
-function frameLabel(f: Frame): string {
-  const profile =
-    f.agentProfile && f.agentProfile !== "default"
-      ? ` · ${f.agentProfile.replace(/_/g, " ")}`
-      : "";
-  return `${providerTitle(f.provider)}${profile}`;
-}
+const SECTIONS: { id: Section; label: string }[] = [
+  { id: "dashboard", label: "Go to dashboard" },
+  { id: "tasks", label: "Go to tasks" },
+  { id: "agents", label: "Go to agents" },
+  { id: "workflows", label: "Go to workflows" },
+  { id: "schedules", label: "Go to schedules" },
+  { id: "settings", label: "Go to settings" },
+];
 
 function basename(p: string): string {
   return p.replace(/\/+$/, "").split("/").pop() || p;
@@ -50,6 +53,16 @@ function matches(query: string, hay: string): boolean {
   return q.split(/\s+/).every((t) => h.includes(t));
 }
 
+/** Jump to an agent's terminal in the Agents section (guard-routed). */
+function openAgentSession(ptySessionId: string): void {
+  const s = useStore.getState();
+  s.setSection("agents");
+  const frame = s.frames.find((f) => f.ptySessionId === ptySessionId);
+  if (frame) s.setActiveFrameGuarded(frame.key);
+  else if (s.rustPtySessions[ptySessionId]?.status === "running")
+    s.reopenRustPty(ptySessionId);
+}
+
 export function CommandPalette() {
   const open = useStore((s) => s.commandPaletteOpen);
   if (!open) return null;
@@ -57,19 +70,14 @@ export function CommandPalette() {
 }
 
 function PaletteBody() {
-  const frames = useStore((s) => s.frames);
+  // Live store indexing — these subscriptions keep the list fresh while open.
+  const rustPtySessions = useStore((s) => s.rustPtySessions);
   const terminalStatuses = useStore((s) => s.terminalStatuses);
   const dirty = useStore((s) => s.dirty);
-  const recentProjects = useStore((s) => s.recentProjects);
+  const workspaces = useStore((s) => s.workspaces);
   const workspaceDir = useStore((s) => s.workspaceDir);
-  const activeFrameKey = useStore((s) => s.activeFrameKey);
-
-  const setActiveFrameGuarded = useStore((s) => s.setActiveFrameGuarded);
-  const openDiff = useStore((s) => s.openDiff);
-  const setLaunchOpen = useStore((s) => s.setLaunchOpen);
-  const setGraphOpen = useStore((s) => s.setGraphOpen);
-  const setWorkspaceDir = useStore((s) => s.setWorkspaceDir);
   const setOpen = useStore((s) => s.setCommandPaletteOpen);
+  const { tasks } = useTasks(workspaceDir);
 
   const [query, setQuery] = useState("");
   const [sel, setSel] = useState(0);
@@ -84,119 +92,184 @@ function PaletteBody() {
     const close = () => setOpen(false);
     const out: Cmd[] = [];
 
-    for (const f of frames) {
-      const raw = f.pending
-        ? "PENDING"
-        : f.terminalId
-          ? terminalStatuses[f.terminalId]
-          : undefined;
-      const d = f.terminalId ? dirty[f.terminalId] : undefined;
-      const isDirty = !!d && d.count > 0;
-      const needsYou = uiStatus(raw) === "blocked";
-      const group = needsYou
-        ? "Needs you"
-        : isDirty
-          ? "Uncommitted changes"
-          : "Open frames";
-      const hint = [
-        isDirty ? `${d!.count} dirty` : "",
-        raw ? statusLabel(raw) : "",
-      ]
-        .filter(Boolean)
-        .join(" · ");
+    // ── Workspaces: switch / add ──────────────────────────────────────────
+    for (const root of workspaces) {
+      if (root === workspaceDir) continue;
       out.push({
-        id: `frame:${f.key}`,
-        group,
-        label: frameLabel(f),
-        hint: hint || undefined,
-        keywords: `${f.provider} ${f.agentProfile ?? ""}`,
+        id: `ws:${root}`,
+        group: "Workspaces",
+        label: `Switch workspace: ${basename(root)}`,
+        hint: root,
+        keywords: `${root} project open`,
         run: () => {
-          setActiveFrameGuarded(f.key);
           close();
+          useStore.getState().switchWorkspace(root);
+        },
+      });
+    }
+    out.push({
+      id: "ws:add",
+      group: "Workspaces",
+      label: "Add workspace…",
+      keywords: "open folder project directory new",
+      run: () => {
+        close();
+        void pickDirectory(workspaceDir ?? undefined).then((dir) => {
+          const s = useStore.getState();
+          if (dir) s.switchWorkspace(dir);
+          // null = cancelled (Tauri) or no native dialog (dev browser) — only
+          // the latter needs a pointer to the manual-path fallback.
+          else if (!inTauri())
+            s.showSnackbar({
+              type: "info",
+              message: "Folder picker unavailable — set the workspace in Settings",
+            });
+        });
+      },
+    });
+
+    // ── Sections (guard-routed via setSection) ────────────────────────────
+    for (const sec of SECTIONS) {
+      out.push({
+        id: `section:${sec.id}`,
+        group: "Sections",
+        label: sec.label,
+        keywords: `section navigate ${sec.id}`,
+        run: () => {
+          close();
+          useStore.getState().setSection(sec.id);
         },
       });
     }
 
-    // Review current changes — only when the active frame is dirty.
-    const active = frames.find((f) => f.key === activeFrameKey);
-    const activeDirty = active?.terminalId
-      ? dirty[active.terminalId]
-      : undefined;
-    if (active?.terminalId && activeDirty && activeDirty.count > 0) {
-      const tid = active.terminalId;
+    // ── Tasks: open / open review (active workspace, non-archived) ────────
+    for (const t of tasks) {
+      if (t.status === "archived") continue;
+      const hint = `${String(t.status).replace(/_/g, " ")} · ${t.agent_count} agent${
+        t.agent_count === 1 ? "" : "s"
+      }`;
       out.push({
-        id: "action:review",
-        group: "Actions",
-        label: "Review current changes",
-        hint: `${activeDirty.count} files`,
-        keywords: "diff review attribution merge revert",
+        id: `task:${t.id}`,
+        group: "Tasks",
+        label: `Open task: ${t.title}`,
+        hint,
+        keywords: `task ${t.id}`,
         run: () => {
-          openDiff(tid);
-          setOpen(false);
+          close();
+          useStore.getState().selectTask(t.id);
+        },
+      });
+      out.push({
+        id: `task-review:${t.id}`,
+        group: "Tasks",
+        label: `Review task: ${t.title}`,
+        hint,
+        keywords: `task review diff merge aggregate ${t.id}`,
+        run: () => {
+          close();
+          // Deep-link straight to the Review tab (one-shot taskInitialTab).
+          useStore.getState().selectTask(t.id, "review");
         },
       });
     }
+
+    // ── Agents: open / open console (blocked first — attention routes on it)
+    const frames = useStore.getState().frames;
+    const agents = Object.values(rustPtySessions).sort((a, b) => {
+      const rank = (m: typeof a) => {
+        if (m.status === "exited") return 2;
+        return uiStatus(terminalStatuses[m.terminalId]) === "blocked" ? 0 : 1;
+      };
+      if (rank(a) !== rank(b)) return rank(a) - rank(b);
+      return b.startedAt - a.startedAt;
+    });
+    for (const m of agents) {
+      const hasFrame = frames.some((f) => f.ptySessionId === m.ptySessionId);
+      const exited = m.status === "exited";
+      if (exited && !hasFrame) continue; // nothing to open
+      const raw = exited ? "EXITED" : terminalStatuses[m.terminalId];
+      const d = dirty[m.terminalId]?.count ?? 0;
+      const hint = [m.terminalId, statusLabel(raw), d > 0 ? `${d} dirty` : ""]
+        .filter(Boolean)
+        .join(" · ");
+      out.push({
+        id: `agent:${m.ptySessionId}`,
+        group: "Agents",
+        label: `Open agent: ${providerTitle(m.provider)}`,
+        hint,
+        keywords: `${m.provider} ${m.terminalId} ${m.branch ?? ""} terminal`,
+        run: () => {
+          close();
+          openAgentSession(m.ptySessionId);
+        },
+      });
+      if (!exited && m.terminalId) {
+        out.push({
+          id: `agent-console:${m.ptySessionId}`,
+          group: "Agents",
+          label: `Open console: ${providerTitle(m.provider)}`,
+          hint: m.terminalId,
+          keywords: `${m.provider} ${m.terminalId} console blocks turns stdin`,
+          run: () => {
+            close();
+            const s = useStore.getState();
+            // Console is a tab of the focused AgentDetail — persist the mode,
+            // then focus the agent (the guard still gates the switch).
+            s.setTermMode(m.terminalId, "console");
+            s.setLayoutMode("focus");
+            openAgentSession(m.ptySessionId);
+          },
+        });
+      }
+    }
+
+    // ── Actions ───────────────────────────────────────────────────────────
     out.push({
       id: "action:launch",
       group: "Actions",
       label: "Launch agent…",
-      keywords: "new start spawn claude codex gemini grok",
+      keywords: "new start spawn claude codex gemini grok profile",
       run: () => {
-        setLaunchOpen(true);
-        setOpen(false);
+        close();
+        useStore.getState().setLaunchOpen(true);
       },
     });
-    out.push({
-      id: "action:graph",
-      group: "Actions",
-      label: "View agent team / activity graph",
-      hint: "⌘⇧A",
-      keywords: "team orchestrator agents flow delegation graph activity who assigned",
-      run: () => {
-        setGraphOpen(true);
-        setOpen(false);
-      },
-    });
-
-    for (const p of recentProjects) {
-      if (p === workspaceDir) continue;
+    if (workspaceDir) {
       out.push({
-        id: `project:${p}`,
-        group: "Switch project",
-        label: basename(p),
-        hint: p,
-        keywords: p,
+        id: "action:new-task",
+        group: "Actions",
+        label: "New task",
+        keywords: "create task intent group",
         run: () => {
-          setWorkspaceDir(p);
-          setOpen(false);
+          close();
+          useStore.getState().setNewTaskOpen(true);
         },
       });
     }
+    out.push({
+      id: "action:new-schedule",
+      group: "Actions",
+      label: "New schedule",
+      keywords: "create cron automate recurring schedule",
+      run: () => {
+        close();
+        useStore.getState().setNewScheduleOpen(true);
+      },
+    });
 
     out.sort(
       (a, b) => GROUP_ORDER.indexOf(a.group) - GROUP_ORDER.indexOf(b.group),
     );
     return out;
-  }, [
-    frames,
-    terminalStatuses,
-    dirty,
-    recentProjects,
-    workspaceDir,
-    activeFrameKey,
-    setActiveFrameGuarded,
-    openDiff,
-    setLaunchOpen,
-    setWorkspaceDir,
-    setOpen,
-  ]);
+  }, [rustPtySessions, terminalStatuses, dirty, workspaces, workspaceDir, tasks, setOpen]);
 
   const items = useMemo(
     () => commands.filter((c) => matches(query, `${c.label} ${c.keywords ?? ""}`)),
     [commands, query],
   );
 
-  // Keep the selection in range as the filtered list changes.
+  // Keep the selection in range as the filtered list changes — the cursor is
+  // always on a real row (visible in every mode).
   const clampedSel = Math.min(sel, Math.max(0, items.length - 1));
 
   // Scroll the active row into view on keyboard movement.
@@ -242,7 +315,7 @@ function PaletteBody() {
             setSel(0);
           }}
           onKeyDown={onKeyDown}
-          placeholder="Jump to an agent, review changes, launch…"
+          placeholder="Jump to a task or agent, switch workspace, launch…"
           spellCheck={false}
           className="w-full border-b border-ink-600 bg-transparent px-4 py-3 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-accent/60 focus:outline-none"
         />
@@ -270,13 +343,21 @@ function PaletteBody() {
                     c.run();
                   }}
                   onMouseMove={() => setSel(i)}
-                  className={`flex w-full items-center justify-between gap-3 px-4 py-1.5 text-left text-sm ${
+                  className={`relative flex w-full items-center justify-between gap-3 px-4 py-1.5 text-left text-sm ${
                     selected ? "bg-ink-600 text-zinc-100" : "text-zinc-300"
                   }`}
                 >
-                  <span className="min-w-0 truncate">{c.label}</span>
+                  {selected && (
+                    <span className="absolute bottom-1 left-0 top-1 w-[2px] rounded-r bg-accent" />
+                  )}
+                  <span className="min-w-0 truncate" title={c.label}>
+                    {c.label}
+                  </span>
                   {c.hint && (
-                    <span className="shrink-0 truncate text-[11px] text-zinc-500">
+                    <span
+                      className="max-w-[45%] shrink-0 truncate font-mono text-[11px] text-zinc-500"
+                      title={c.hint}
+                    >
                       {c.hint}
                     </span>
                   )}

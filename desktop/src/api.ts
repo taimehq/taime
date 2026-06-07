@@ -105,8 +105,16 @@ export interface TaskDetail {
 // ── Workflows (the loopable agent step-graph) ───────────────────────────────
 export interface WorkflowNode {
   id: string;
-  role: string;
+  /** Agent profile the node spawns. The daemon serializes `profile`
+   *  (workflow.rs); `role` is only a parse alias older payloads carried —
+   *  read `profile ?? role`. */
+  profile?: string;
+  role?: string;
   prompt: string;
+  /** Provider override for this node (null/absent ⇒ the run default). */
+  provider?: string | null;
+  /** Key the node's final output is stored under for downstream prompts. */
+  output_key?: string | null;
 }
 export interface WorkflowEdge {
   from: string;

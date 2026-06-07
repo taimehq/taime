@@ -516,6 +516,43 @@ describe("task review / graph drawer exclusivity", () => {
   });
 });
 
+// ── launch dialog task preset / task-selection clear ────────────────────────
+
+describe("setLaunchOpen task preset", () => {
+  it("stores the preset on open and clears it on close", () => {
+    useStore.getState().setLaunchOpen(true, "task-9");
+    let s = useStore.getState();
+    expect(s.launchOpen).toBe(true);
+    expect(s.launchPresetTaskId).toBe("task-9");
+
+    useStore.getState().setLaunchOpen(false);
+    s = useStore.getState();
+    expect(s.launchOpen).toBe(false);
+    expect(s.launchPresetTaskId).toBeNull();
+  });
+
+  it("open without a preset defaults to null (Uncategorized)", () => {
+    useStore.getState().setLaunchOpen(true, "task-9");
+    useStore.getState().setLaunchOpen(false);
+    useStore.getState().setLaunchOpen(true);
+    expect(useStore.getState().launchPresetTaskId).toBeNull();
+  });
+});
+
+describe("clearSelectedTask", () => {
+  it("clears the selection and any pending deep-link tab", () => {
+    useStore.getState().selectTask("task-1", "review");
+    expect(useStore.getState().selectedTaskId).toBe("task-1");
+
+    useStore.getState().clearSelectedTask();
+    const s = useStore.getState();
+    expect(s.selectedTaskId).toBeNull();
+    expect(s.taskInitialTab).toBeNull();
+    // The section is untouched — only the selection clears.
+    expect(s.section).toBe("tasks");
+  });
+});
+
 // ── section navigation (guard-gated) ────────────────────────────────────────
 
 /** An agents-section state with one dirty, unreviewed active frame. */
