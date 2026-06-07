@@ -8,7 +8,8 @@ import {
 } from "lucide-react";
 import { useStore, type RustPtyMeta } from "../store";
 import { api, type TaskInfo } from "../api";
-import { StatusBadge, statusDotClass } from "../components/StatusBadge";
+import { StatusBadge } from "../components/StatusBadge";
+import { statusDotClass } from "../lib/agentStatus";
 import { FileInventory } from "../components/FileInventory";
 import { SchedulesPanel } from "../components/SchedulesPanel";
 import { WorkflowsPanel } from "../components/WorkflowsPanel";

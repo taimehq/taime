@@ -72,7 +72,7 @@ export function DiffView() {
   const markReviewed = useStore((s) => s.markReviewed);
   const showSnackbar = useStore((s) => s.showSnackbar);
   const frames = useStore((s) => s.frames);
-  const pendingSwitchKey = useStore((s) => s.pendingSwitchKey);
+  const pendingSwitch = useStore((s) => s.pendingSwitch);
   const resolveSwitch = useStore((s) => s.resolveSwitch);
 
   const [files, setFiles] = useState<FileDiffEntry[]>([]);
@@ -331,9 +331,10 @@ export function DiffView() {
 
   const onMarkReviewed = () => {
     clearDirty(terminalId);
-    if (frame) markReviewed(frame.key);
+    // Review state is keyed by agent id — it outlives this frame.
+    markReviewed(terminalId);
     closeDiff();
-    if (pendingSwitchKey) resolveSwitch(true);
+    if (pendingSwitch) resolveSwitch(true);
   };
 
   const totalAdd = files.reduce((n, f) => n + f.additions, 0);
