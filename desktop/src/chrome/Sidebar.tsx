@@ -459,10 +459,11 @@ function WorkflowsSidebar() {
       </SidebarHead>
       <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-2">
         {workflows.length === 0 ? (
-          <p className="px-2 py-1 text-[11px] text-zinc-600">
-            No workflows yet — write one as JSON, have an agent generate it,
-            or drop a JSON in ~/.taime/workflows.
-          </p>
+          <div className="flex flex-1 items-center justify-center px-2">
+            <p className="text-center text-sm font-semibold tracking-tight text-zinc-300">
+              No workflows yet
+            </p>
+          </div>
         ) : (
           workflows.map((wf) => (
             <button
@@ -529,9 +530,11 @@ function SchedulesSidebar() {
       </SidebarHead>
       <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-2">
         {schedules.length === 0 ? (
-          <p className="px-2 py-1 text-[11px] text-zinc-600">
-            No schedules yet — automate a recurring agent run.
-          </p>
+          <div className="flex flex-1 items-center justify-center px-2">
+            <p className="text-center text-sm font-semibold tracking-tight text-zinc-300">
+              No schedules yet
+            </p>
+          </div>
         ) : (
           schedules.map((sc) => (
             <button
