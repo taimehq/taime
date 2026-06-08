@@ -56,8 +56,8 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
     () => useStore.getState().launchPresetTaskId ?? "",
   );
   const [newTaskTitle, setNewTaskTitle] = useState<string>("");
-  // The per-agent intent. Collected here; threading it to the daemon as the
-  // agent's opening prompt is an integrator step (see `remaining`).
+  // The per-agent intent — delivered once as the agent's first prompt when its
+  // terminal is ready (store.pendingAssignments, the one-shot delivery path).
   const [assignment, setAssignment] = useState<string>("");
   const [wtMode, setWtMode] = useState<WtMode>(
     isolationEnabled ? "isolated" : "shared",
@@ -189,13 +189,10 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
     if (s.isolationEnabled !== (wtMode === "isolated"))
       s.setIsolationEnabled(wtMode === "isolated");
     onClose(); // optimistic: close immediately, frame appears as pending
-    // TODO(daemon): thread `assignment` as the agent's opening prompt. The wire
-    // field exists (AgentSpawnSpec.seed_prompt, taime-protocol) but the daemon's
-    // LaunchOpts marks it reserved/dead-code — providers never write it to the
-    // PTY. Once the daemon seeds it, thread assignment through store.launchAgent
-    // → daemonSpawnAgent → the Tauri command's default_agent_spec.
-    void assignment;
-    await launchAgent(selected, profile, { taskId });
+    await launchAgent(selected, profile, {
+      taskId,
+      assignment: assignment.trim() || null,
+    });
   };
 
   const handleKey = (e: React.KeyboardEvent) => {
@@ -416,8 +413,11 @@ export function LaunchAgentDialog({ onClose }: { onClose: () => void }) {
         placeholder="What should this agent do?"
         rows={3}
         autoFocus
-        className={`mb-4 w-full resize-y rounded-lg border border-ink-500 bg-ink-700 px-3 py-2 text-sm leading-relaxed text-zinc-200 placeholder:text-zinc-600 ${FOCUS_RING}`}
+        className={`mb-1.5 w-full resize-y rounded-lg border border-ink-500 bg-ink-700 px-3 py-2 text-sm leading-relaxed text-zinc-200 placeholder:text-zinc-600 ${FOCUS_RING}`}
       />
+      <p className="mb-4 text-[11px] text-zinc-600">
+        Sent as the first prompt when the terminal is ready.
+      </p>
 
       {/* Provider */}
       <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">

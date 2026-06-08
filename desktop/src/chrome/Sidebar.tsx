@@ -34,7 +34,7 @@ export function Sidebar() {
   return (
     <aside
       style={{ width }}
-      className="relative flex shrink-0 flex-col border-r border-ink-600 bg-ink-800"
+      className="relative flex shrink-0 flex-col border-r border-hairline bg-ink-800"
     >
       {section === "workflows" ? (
         <WorkflowsSidebar />
@@ -87,7 +87,7 @@ function SidebarHead({
   children?: React.ReactNode;
 }) {
   return (
-    <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-ink-700 px-3">
+    <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-hairline px-3">
       <span className="flex-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
         {title}
       </span>

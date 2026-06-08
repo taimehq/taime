@@ -33,7 +33,7 @@ export function Rail() {
   return (
     <nav
       aria-label="Sections"
-      className="flex w-12 shrink-0 flex-col items-center border-r border-ink-600 bg-ink-800 py-2"
+      className="flex w-12 shrink-0 flex-col items-center border-r border-hairline bg-ink-800 py-2"
     >
       <div className="flex flex-1 flex-col items-center gap-0.5 px-2 pt-1">
         {ITEMS.map((item) => (

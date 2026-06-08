@@ -60,10 +60,12 @@ function absoluteTime(ts: number | null): string {
   });
 }
 
-/** The wire may grow a `prompt` field (the markdown body); api.ts's
- *  ScheduleInfo doesn't declare it yet. Read it defensively. */
+/** The schedule's markdown body. The daemon serializes `prompt`; `body` is the
+ *  alias older payloads carried — read tolerantly. Null (absent/blank) keeps
+ *  the screen's fallback copy. */
 function scheduleBody(sc: ScheduleInfo): string | null {
-  const body = (sc as ScheduleInfo & { prompt?: string | null }).prompt;
+  const row = sc as ScheduleInfo & { body?: string | null };
+  const body = row.prompt ?? row.body ?? null;
   return typeof body === "string" && body.trim() !== "" ? body : null;
 }
 

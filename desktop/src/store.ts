@@ -26,9 +26,12 @@ import {
   daemonSpawnAgent,
   daemonKill,
   daemonCloseView,
+  daemonPing,
+  daemonCheckpoint,
   type TurnEvent,
   type DaemonSessionSummary,
 } from "./pty";
+import { sendToTerminal } from "./lib/terminalInput";
 import { providerTitle, PROVIDER_ORDER } from "./lib/providerLabel";
 
 /** Providers the daemon can launch via its provider registry. Every launch —
@@ -287,6 +290,11 @@ interface Store {
   /** When set, a context switch (frame, section, or task navigation) is
    *  blocked pending review of the current agent's unreviewed work. */
   pendingSwitch: PendingSwitch | null;
+  /** Launch-collected assignments awaiting one-shot delivery, keyed by agent
+   *  id (minted at provision). Sent as the agent's first prompt the first time
+   *  its terminal view is attached AND it reports IDLE, then cleared — at most
+   *  once, never to adopted/pre-existing agents (only launches stamp entries). */
+  pendingAssignments: Record<string, string>;
   /** Attention items derived from daemon pushes (capped FIFO at 200). */
   notifications: AppNotification[];
   /** Per-agent terminal rendering mode (absent ⇒ "terminal"). */
@@ -363,7 +371,13 @@ interface Store {
   launchAgent: (
     provider: string,
     agentProfile: string,
-    opts?: { taskId?: string | null; workingDirectory?: string },
+    opts?: {
+      taskId?: string | null;
+      workingDirectory?: string;
+      /** The per-agent intent — delivered once as the first prompt when the
+       *  agent's terminal is ready (see `pendingAssignments`). */
+      assignment?: string | null;
+    },
   ) => Promise<void>;
   /** Launch a provider on the detached session daemon (the Rust PTY path; survives
    *  app crashes). `profile` is the daemon profile name (`~/.taime/agents/*.toml`
@@ -372,13 +386,21 @@ interface Store {
    *  supervisor profile. `taskId` (optional) is the Task the agent joins — stamped
    *  onto its worktree row at provision (null ⇒ Uncategorized); `projectRoot`
    *  (optional) overrides the worktree fork root (defaults to the active
-   *  `workspaceDir`). Returns true on success. */
+   *  `workspaceDir`); `assignment` (optional) is stamped into
+   *  `pendingAssignments` for one-shot first-prompt delivery. Returns true on
+   *  success. */
   launchAgentDaemon: (
     provider: string,
     profile?: string,
     taskId?: string | null,
     projectRoot?: string | null,
+    assignment?: string | null,
   ) => Promise<boolean>;
+  /** Attempt the one-shot assignment delivery for `agentId`: no-op unless a
+   *  pending entry exists AND the view's writer is attached for `sessionId`.
+   *  Writes the text + submits through the same path user keystrokes use,
+   *  then clears the entry (at most once). */
+  deliverAssignment: (agentId: string, sessionId: string) => void;
   /** Refresh each tracked agent's Task membership from a daemon list (the
    *  reconcile tick) — keeps the sidebar grouping fresh after reassignment. */
   syncDaemonTaskIds: (sessions: DaemonSessionSummary[]) => void;
@@ -487,6 +509,7 @@ export const useStore = create<Store>((set, get) => ({
   dismissedTerminalIds: new Set(),
   reviewedFrames: {},
   pendingSwitch: null,
+  pendingAssignments: {},
   notifications: [],
   termModes: {},
   diffTerminalId: null,
@@ -636,6 +659,15 @@ export const useStore = create<Store>((set, get) => ({
     // nothing about the daemon, so never let it claim reachability. The whole
     // UI then presents its designed daemon-down surfaces (the honest state).
     if (!inTauri()) return;
+    // The same split-brain exists IN Tauri: daemon.rs serves the query fallback
+    // when the daemon is dead, so a resolved listAgents proves nothing either.
+    // daemon_ping (connect-only; never spawns) is the one connectivity source.
+    const connected = await daemonPing();
+    if (!connected) {
+      if (get().connected) set({ connected: false });
+      // Keep the last real roster — never overwrite it with the fallback.
+      return;
+    }
     try {
       const agents = await api.listAgents();
       const prev = get();
@@ -670,11 +702,18 @@ export const useStore = create<Store>((set, get) => ({
       agentProfile || "default",
       opts?.taskId ?? null,
       opts?.workingDirectory ?? null,
+      opts?.assignment ?? null,
     );
     if (ok && firstAgent) get().setGraphOpen(true);
   },
 
-  launchAgentDaemon: async (provider, profile = "default", taskId = null, projectRoot = null) => {
+  launchAgentDaemon: async (
+    provider,
+    profile = "default",
+    taskId = null,
+    projectRoot = null,
+    assignment = null,
+  ) => {
     // Provision from the active workspace (or an explicit override root) — the
     // worktree row is the durable anchor for attribution AND Task membership.
     const dir = projectRoot ?? get().workspaceDir;
@@ -739,6 +778,17 @@ export const useStore = create<Store>((set, get) => ({
         return {
           frames,
           activeFrameKey: existing ? existing.key : key,
+          // Stamp the assignment for one-shot delivery once the agent's view
+          // attaches AND it reports ready. Keyed by the freshly-minted agent id,
+          // so adopted/pre-existing agents can never receive one.
+          ...(assignment?.trim() && terminalId
+            ? {
+                pendingAssignments: {
+                  ...s.pendingAssignments,
+                  [terminalId]: assignment.trim(),
+                },
+              }
+            : {}),
           rustPtySessions: terminalId
           ? {
               ...s.rustPtySessions,
@@ -773,6 +823,28 @@ export const useStore = create<Store>((set, get) => ({
       });
       return false;
     }
+  },
+
+  deliverAssignment: (agentId, sessionId) => {
+    const text = get().pendingAssignments[agentId];
+    if (!text) return;
+    // The same write path user keystrokes use (TerminalViewRustPty registers
+    // the writer on attach) — false means the view isn't attached yet, so the
+    // entry stays pending and the next IDLE report retries.
+    if (!sendToTerminal(sessionId, text)) return;
+    // Submit on a separate, delayed write: a trailing \r inside the same burst
+    // reads as pasted text to CLIs with paste detection (it would insert a
+    // newline instead of submitting). The checkpoint mirrors the user-submit
+    // path's attribution signal.
+    setTimeout(() => {
+      sendToTerminal(sessionId, "\r");
+      daemonCheckpoint(sessionId, "submit");
+    }, 150);
+    set((s) => {
+      const next = { ...s.pendingAssignments };
+      delete next[agentId];
+      return { pendingAssignments: next };
+    });
   },
 
   markRustPtyExited: (ptySessionId) =>
@@ -1057,9 +1129,9 @@ export const useStore = create<Store>((set, get) => ({
     set({ sidebarCollapsed: next });
   },
 
-  setTerminalStatus: (id, status) =>
+  setTerminalStatus: (id, status) => {
+    const normalized = status ? status.toUpperCase() : "UNKNOWN";
     set((s) => {
-      const normalized = status ? status.toUpperCase() : "UNKNOWN";
       if (s.terminalStatuses[id] === normalized) return s;
       // Blocked/error transitions become attention items. Both status paths
       // (this poll mirror + the per-session push) write the same map, so the
@@ -1078,13 +1150,23 @@ export const useStore = create<Store>((set, get) => ({
         terminalStatuses: { ...s.terminalStatuses, [id]: normalized },
         ...(notifications ? { notifications } : {}),
       };
-    }),
+    });
+    // One-shot assignment delivery: IDLE is the ready signal. Outside the
+    // status-unchanged dedupe on purpose — the reconcile poll re-reports IDLE
+    // every tick, retrying until the view's writer is attached.
+    if (normalized === "IDLE") {
+      const meta = Object.values(get().rustPtySessions).find(
+        (m) => m.terminalId === id,
+      );
+      if (meta) get().deliverAssignment(id, meta.ptySessionId);
+    }
+  },
 
-  setDaemonSessionStatus: (sessionId, status) =>
+  setDaemonSessionStatus: (sessionId, status) => {
+    const normalized = status ? status.toUpperCase() : "UNKNOWN";
     set((s) => {
       const tid = s.rustPtySessions[sessionId]?.terminalId;
       if (!tid) return s;
-      const normalized = status ? status.toUpperCase() : "UNKNOWN";
       if (s.terminalStatuses[tid] === normalized) return s;
       // Keep the daemon-session map's own status field coherent too (used by the
       // Agents panel), mapping the inferred status onto the lifecycle label.
@@ -1116,7 +1198,14 @@ export const useStore = create<Store>((set, get) => ({
             : { ...s.rustPtySessions, [sessionId]: { ...m, status: lifecycle } },
         ...(notifications ? { notifications } : {}),
       };
-    }),
+    });
+    // One-shot assignment delivery (the push path — this status arrived over
+    // the attach channel, so the view's writer is already registered).
+    if (normalized === "IDLE") {
+      const tid = get().rustPtySessions[sessionId]?.terminalId;
+      if (tid) get().deliverAssignment(tid, sessionId);
+    }
+  },
 
   markDaemonFsDirty: (sessionId, paths) =>
     set((s) => {
