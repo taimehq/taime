@@ -14,10 +14,10 @@ const NODE_STYLE: Record<
   string,
   { dot: string; border: string; fill: string; text: string }
 > = {
-  pending: { dot: "#6f6f6f", border: "#2a2a2a", fill: "#0f0f0f", text: "#a1a1a1" },
-  running: { dot: "#4493f8", border: "#4493f8", fill: "#0f0f0f", text: "#ededed" },
-  completed: { dot: "#3fb950", border: "#3fb950", fill: "#0f0f0f", text: "#ededed" },
-  failed: { dot: "#fb7185", border: "#fb7185", fill: "#0f0f0f", text: "#ededed" },
+  pending: { dot: "#6f7681", border: "#1c212a", fill: "#0c0e13", text: "#a4abb6" },
+  running: { dot: "#5b8def", border: "#5b8def", fill: "#0c0e13", text: "#c8c7c2" },
+  completed: { dot: "#46c46e", border: "#46c46e", fill: "#0c0e13", text: "#c8c7c2" },
+  failed: { dot: "#ef5b50", border: "#ef5b50", fill: "#0c0e13", text: "#c8c7c2" },
 };
 function nodeStyle(status: string | undefined) {
   return NODE_STYLE[status ?? "pending"] ?? NODE_STYLE.pending;
@@ -66,14 +66,18 @@ interface Placed {
  * step-graph, laid out top-to-bottom by topological depth from `entry`. Nodes are
  * colored by the current run's per-node state; forward edges curve down with a
  * `when` label, back-edges (loops) arc in amber. A Run button starts a run and the
- * drawer polls live status while it runs. Clicking a node that has an `agent_key`
+ * drawer polls live status while it runs. Clicking a node that has an `agent_id`
  * opens that agent's diff.
  */
 export function WorkflowGraph({
   workflow,
+  taskId = null,
   onClose,
 }: {
   workflow: WorkflowInfo;
+  /** Run scope: the Task new runs (and their node agents) join — the screen's
+   *  run-scope selector threads it here so the drawer's Run matches. */
+  taskId?: string | null;
   onClose: () => void;
 }) {
   const [runId, setRunId] = useState<string | null>(workflow.last_run?.id ?? null);
@@ -127,7 +131,11 @@ export function WorkflowGraph({
     setStarting(true);
     setStartError(null);
     try {
-      const res = await api.runWorkflow(workflow.name, useStore.getState().workspaceDir);
+      const res = await api.runWorkflow(
+        workflow.name,
+        useStore.getState().workspaceDir,
+        taskId,
+      );
       if (!mounted.current) return;
       if (res.error || !res.run_id) {
         setStartError(res.error ?? "Failed to start run");
@@ -140,7 +148,7 @@ export function WorkflowGraph({
     } finally {
       if (mounted.current) setStarting(false);
     }
-  }, [workflow.name]);
+  }, [workflow.name, taskId]);
 
   const nodeStates: Record<string, WorkflowNodeState> = run?.node_states ?? {};
 
@@ -216,7 +224,7 @@ export function WorkflowGraph({
   const pill = statusPill(run?.status);
 
   return (
-    <aside className="fixed right-0 top-12 bottom-0 z-40 flex w-[460px] flex-col border-l border-t border-ink-600 bg-ink-900 shadow-2xl">
+    <aside className="fixed right-0 top-10 bottom-0 z-40 flex w-[460px] flex-col border-l border-t border-ink-600 bg-ink-900 shadow-2xl">
       {/* Header */}
       <div className="flex items-center gap-2 border-b border-ink-600 bg-ink-800 px-3 py-2.5">
         <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -251,9 +259,9 @@ export function WorkflowGraph({
         {workflow.nodes.length === 0 ? (
           <div className="mt-16 flex flex-col items-center px-6 text-center">
             <svg width="80" height="56" viewBox="0 0 80 56" fill="none" className="mb-4" aria-hidden>
-              <path d="M40 16 L40 36" stroke="#3a3a3a" strokeWidth="1.5" />
-              <rect x="22" y="2" width="36" height="14" rx="3" fill="#0f0f0f" stroke="#3a3a3a" strokeWidth="1.5" />
-              <rect x="22" y="38" width="36" height="14" rx="3" fill="#0f0f0f" stroke="#3a3a3a" strokeWidth="1.5" />
+              <path d="M40 16 L40 36" stroke="#232936" strokeWidth="1.5" />
+              <rect x="22" y="2" width="36" height="14" rx="3" fill="#0c0e13" stroke="#232936" strokeWidth="1.5" />
+              <rect x="22" y="38" width="36" height="14" rx="3" fill="#0c0e13" stroke="#232936" strokeWidth="1.5" />
             </svg>
             <p className="text-[13px] text-zinc-300">No steps</p>
             <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
@@ -277,7 +285,7 @@ export function WorkflowGraph({
                 orient="auto"
                 markerUnits="userSpaceOnUse"
               >
-                <path d="M0,0 L6,3 L0,6 Z" fill="#3a3a3a" />
+                <path d="M0,0 L6,3 L0,6 Z" fill="#232936" />
               </marker>
               <marker
                 id="wf-arrow-loop"
@@ -288,7 +296,7 @@ export function WorkflowGraph({
                 orient="auto"
                 markerUnits="userSpaceOnUse"
               >
-                <path d="M0,0 L6,3 L0,6 Z" fill="#d29922" />
+                <path d="M0,0 L6,3 L0,6 Z" fill="#e3a93a" />
               </marker>
             </defs>
 
@@ -318,7 +326,7 @@ export function WorkflowGraph({
                     <path
                       d={path}
                       fill="none"
-                      stroke="#d29922"
+                      stroke="#e3a93a"
                       strokeWidth="1.5"
                       strokeDasharray="3 3"
                       markerEnd="url(#wf-arrow-loop)"
@@ -343,7 +351,7 @@ export function WorkflowGraph({
                   <path
                     d={path}
                     fill="none"
-                    stroke="#3a3a3a"
+                    stroke="#232936"
                     strokeWidth="1.5"
                     markerEnd="url(#wf-arrow)"
                   />
@@ -351,7 +359,7 @@ export function WorkflowGraph({
                     x={labelX}
                     y={midY - 2}
                     fontSize="9"
-                    fill={faint ? "#6f6f6f" : "#a1a1a1"}
+                    fill={faint ? "#6f7681" : "#a4abb6"}
                     textAnchor="middle"
                   >
                     {text}
@@ -366,15 +374,17 @@ export function WorkflowGraph({
               if (!p) return null;
               const st = nodeStates[n.id];
               const style = nodeStyle(st?.status);
-              const clickable = !!st?.agent_key;
+              const clickable = !!st?.agent_id;
               const iter = st && st.iteration > 1 ? `×${st.iteration}` : "";
+              // The daemon serializes `profile`; `role` is the legacy alias.
+              const profileLabel = n.profile ?? n.role ?? "default";
               return (
                 <g
                   key={n.id}
                   transform={`translate(${p.x}, ${p.y})`}
                   onClick={
                     clickable
-                      ? () => useStore.getState().openDiff(st!.agent_key as string)
+                      ? () => useStore.getState().openDiff(st!.agent_id as string)
                       : undefined
                   }
                   style={{ cursor: clickable ? "pointer" : "default" }}
@@ -397,8 +407,10 @@ export function WorkflowGraph({
                   >
                     {n.id.length > 18 ? `${n.id.slice(0, 17)}…` : n.id}
                   </text>
-                  <text x="13" y="34" fontSize="9" fill="#8f8f8f">
-                    {n.role.length > 22 ? `${n.role.slice(0, 21)}…` : n.role}
+                  <text x="13" y="34" fontSize="9" fill="#8a919d">
+                    {profileLabel.length > 22
+                      ? `${profileLabel.slice(0, 21)}…`
+                      : profileLabel}
                   </text>
                   {iter && (
                     <text
@@ -412,7 +424,7 @@ export function WorkflowGraph({
                     </text>
                   )}
                   {n.id === workflow.entry && (
-                    <text x={NODE_W - 8} y="34" fontSize="8" fill="#6f6f6f" textAnchor="end">
+                    <text x={NODE_W - 8} y="34" fontSize="8" fill="#6f7681" textAnchor="end">
                       entry
                     </text>
                   )}
@@ -432,17 +444,17 @@ export function WorkflowGraph({
           <p className="mb-1.5 break-words text-[11px] text-rose-400">{run.error}</p>
         )}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-zinc-600">
-          <Legend dot="#6f6f6f" label="pending" />
-          <Legend dot="#4493f8" label="running" />
-          <Legend dot="#3fb950" label="completed" />
-          <Legend dot="#fb7185" label="failed" />
+          <Legend dot="#6f7681" label="pending" />
+          <Legend dot="#5b8def" label="running" />
+          <Legend dot="#46c46e" label="completed" />
+          <Legend dot="#ef5b50" label="failed" />
           <span className="flex items-center gap-1">
-            <span className="inline-block h-0.5 w-3" style={{ background: "#d29922" }} />
+            <span className="inline-block h-0.5 w-3" style={{ background: "#e3a93a" }} />
             loop
           </span>
         </div>
         {(run?.node_states &&
-          Object.values(run.node_states).some((s) => s.agent_key)) && (
+          Object.values(run.node_states).some((s) => s.agent_id)) && (
           <p className="mt-1.5 text-[10px] text-zinc-600">
             Click a node to open its agent's diff.
           </p>

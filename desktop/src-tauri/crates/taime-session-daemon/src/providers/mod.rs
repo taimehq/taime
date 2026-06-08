@@ -265,7 +265,7 @@ impl Registry {
             cwd: req.cwd.clone(),
             rows: req.rows,
             cols: req.cols,
-            attribution_key: req.attribution_key.clone(),
+            attribution_key: req.agent_id.clone(),
             seed_prompt: req.seed_prompt.clone(),
         };
         let mut prepared = provider
@@ -279,7 +279,7 @@ impl Registry {
         env.extend(std::mem::take(&mut prepared.spec.env));
         env.extend(req.env.iter().cloned());
         prepared.spec.env = env;
-        prepared.spec.attribution_key = req.attribution_key.clone();
+        prepared.spec.attribution_key = req.agent_id.clone();
         Ok(prepared)
     }
 
@@ -315,7 +315,7 @@ mod tests {
             cwd: Some("/tmp/wt".into()),
             rows: 24,
             cols: 80,
-            attribution_key: Some("term-1".into()),
+            agent_id: Some("term-1".into()),
             seed_prompt: None,
             env: vec![],
             inject_orchestration: false,

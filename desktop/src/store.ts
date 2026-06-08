@@ -1,9 +1,9 @@
 import { create } from "zustand";
 import {
   api,
-  type Session,
-  type SessionDetail,
+  type AgentSummary,
 } from "./api";
+import { inTauri } from "./backend";
 import {
   loadRecentProjects,
   saveRecentProjects,
@@ -26,14 +26,17 @@ import {
   daemonSpawnAgent,
   daemonKill,
   daemonCloseView,
+  daemonPing,
+  daemonCheckpoint,
   type TurnEvent,
   type DaemonSessionSummary,
 } from "./pty";
-import { providerTitle } from "./lib/providerLabel";
+import { sendToTerminal } from "./lib/terminalInput";
+import { providerTitle, PROVIDER_ORDER } from "./lib/providerLabel";
 
 /** Providers the daemon can launch via its provider registry. Every launch —
  *  any profile — routes through the daemon; it is the only transport. */
-const DAEMON_PROVIDERS = new Set(["claude_code", "codex", "gemini_cli", "grok_cli"]);
+const DAEMON_PROVIDERS = new Set(PROVIDER_ORDER);
 
 /** Best-effort provider id from a daemon session's program path (for adopting a
  *  crash-surviving session before the daemon reports provider on the wire). */
@@ -45,13 +48,12 @@ function providerFromProgram(program: string): string {
   return "claude_code";
 }
 
-/** Which transport carries a frame's terminal I/O. Only `daemon` exists now (the
- *  detached session daemon / Rust PTY path; survives crashes). `cao_ws` is a
- *  retired legacy variant kept so older persisted state still parses. */
-export type TerminalTransport = "cao_ws" | "daemon";
+/** Which transport carries a frame's terminal I/O. Only `daemon` exists (the
+ *  detached session daemon / Rust PTY path; survives crashes). */
+export type TerminalTransport = "daemon";
 
-/** Frame transports that render in the xterm daemon view (vs the CAO WebSocket
- *  terminal). */
+/** Frame transports that render in the xterm daemon view (a frame without a
+ *  transport is a transient placeholder, not a live daemon view). */
 export function isDaemonTransport(t: TerminalTransport | undefined): boolean {
   return t === "daemon";
 }
@@ -59,6 +61,48 @@ export function isDaemonTransport(t: TerminalTransport | undefined): boolean {
 /** Shell-grid layout: an auto-grid of all frames, or one focused frame with a
  *  tab strip of the rest. A view flag only — frames remain the source of truth. */
 export type LayoutMode = "grid" | "focus";
+
+/** Top-level app sections (the rail). Section selection persists per section —
+ *  navigating away and back must NOT lose selections (safe context switching). */
+export type Section =
+  | "dashboard"
+  | "tasks"
+  | "agents"
+  | "workflows"
+  | "schedules"
+  | "settings";
+
+/** Task-screen tab a navigation can deep-link to (null = no preference; the
+ *  screen keeps its own tab state). */
+export type TaskTab = "overview" | "review";
+
+/** A context switch held pending review of the current agent's unreviewed work.
+ *  One pending switch at a time — the guard owns the invariant; further switch
+ *  requests are ignored until it resolves. */
+export type PendingSwitch =
+  | { kind: "frame"; key: string }
+  | { kind: "section"; section: Section }
+  | { kind: "task"; taskId: string; tab: TaskTab | null };
+
+/** Per-agent terminal rendering mode: raw PTY (xterm) or the structured
+ *  console projection of the same stream. Absent ⇒ "terminal". */
+export type TermMode = "terminal" | "console";
+
+export type NotificationKind = "blocked" | "review" | "exited" | "error";
+
+/** An attention item derived from daemon pushes (status/fs-dirty/exit).
+ *  Frontend-local for now (a daemon-side notification log is a filed decision). */
+export interface AppNotification {
+  id: string;
+  kind: NotificationKind;
+  /** The agent id (attribution anchor) the event belongs to. */
+  agentId: string;
+  taskId: string | null;
+  text: string;
+  /** Epoch ms when the item was pushed. */
+  at: number;
+  read: boolean;
+}
 
 /** Re-render guard: only update when data actually changed. */
 function jsonEqual(a: unknown, b: unknown): boolean {
@@ -81,13 +125,12 @@ export interface Frame {
   terminalId: string | null; // null while pending
   provider: string;
   agentProfile: string | null;
-  sessionName: string | null;
   /** Task membership at launch (null ⇒ Uncategorized). The durable source of
    *  truth is the worktree row; this is the display copy for tabs/headers. */
   taskId?: string | null;
   pending: boolean;
   error?: string;
-  /** Transport for this frame's terminal (default cao_ws). */
+  /** Transport for this frame's terminal (always the daemon once spawned). */
   transport?: TerminalTransport;
   /** Daemon session id (when transport === "daemon"). */
   ptySessionId?: string;
@@ -104,7 +147,8 @@ export type RustPtyStatus = "running" | "exited";
 
 export interface RustPtyMeta {
   ptySessionId: string;
-  /** Provisioned worktree terminal id — the attribution key (dirty/diff/graph). */
+  /** The agent's id (provisioned worktree row) — the attribution anchor
+   *  (dirty/diff/graph). Local name kept as terminalId to limit churn. */
   terminalId: string;
   provider: string;
   branch: string | null;
@@ -125,45 +169,98 @@ export interface DirtyState {
   paths: string[];
 }
 
-/** One attributed file change in a terminal's activity timeline. */
-export interface TimelineEvent {
-  path: string;
-  kind: string;
-  ts: number;
-}
-
-/** Cap on retained per-terminal timeline events (most recent kept). */
-const TIMELINE_CAP = 200;
-
-/**
- * Per-session status counts shown at-a-glance on a collapsed sidebar row.
- * Buckets mirror the StatusBadge normalization (PROCESSING→working,
- * WAITING_USER_ANSWER→needsYou, ERROR→error, COMPLETED→done, IDLE→idle); other
- * states (PENDING/UNKNOWN) count toward `total` only.
- */
-export interface SessionStatusRollup {
-  working: number;
-  needsYou: number;
-  error: number;
-  done: number;
-  idle: number;
-  total: number;
-}
-
 let frameCounter = 0;
 const nextKey = () => `frame-${++frameCounter}`;
 
+let notificationCounter = 0;
+const NOTIFICATION_CAP = 200;
+
+/** Append a notification, evicting the oldest beyond the cap (FIFO). */
+function appendNotification(
+  items: AppNotification[],
+  n: Omit<AppNotification, "id" | "at" | "read">,
+): AppNotification[] {
+  const item: AppNotification = {
+    ...n,
+    id: `notif-${++notificationCounter}`,
+    at: Date.now(),
+    read: false,
+  };
+  return [...items, item].slice(-NOTIFICATION_CAP);
+}
+
+/** Notifications for a wire-status transition (already-deduped by the caller's
+ *  status-unchanged early return). Only blocked/error states notify. */
+function statusNotifications(
+  items: AppNotification[],
+  agentId: string,
+  taskId: string | null,
+  providerName: string,
+  normalized: string,
+): AppNotification[] | null {
+  const kind: NotificationKind | null =
+    normalized === "WAITING_USER_ANSWER"
+      ? "blocked"
+      : normalized === "ERROR"
+        ? "error"
+        : null;
+  if (!kind) return null;
+  const text =
+    kind === "blocked"
+      ? `${providerName} needs your answer`
+      : `${providerName} reported an error`;
+  return appendNotification(items, { kind, agentId, taskId, text });
+}
+
+/** Known workspace roots: the active root first, then the recents history. */
+function deriveWorkspaces(dir: string | null, recents: string[]): string[] {
+  return dir ? [dir, ...recents.filter((p) => p !== dir)] : [...recents];
+}
+
+/** Unread notification count (derived — pass the store state). */
+export function unreadCount(s: Pick<Store, "notifications">): number {
+  return s.notifications.reduce((n, item) => (item.read ? n : n + 1), 0);
+}
+
+/** Terminal mode for an agent (derived — absent ⇒ "terminal"). */
+export function termModeFor(
+  s: Pick<Store, "termModes">,
+  agentId: string | null | undefined,
+): TermMode {
+  return (agentId && s.termModes[agentId]) || "terminal";
+}
+
 interface Store {
   // backend-derived
-  sessions: Session[];
-  activeSessionDetail: SessionDetail | null;
+  agents: AgentSummary[];
   connected: boolean;
   terminalStatuses: Record<string, string>;
-  /** Per-session status counts for the collapsed sidebar rows (polled, 10s). */
-  sessionStatusRollup: Record<string, SessionStatusRollup>;
+
+  // navigation (the rail + per-section selection; selections persist across
+  // section switches — navigating away must not lose them)
+  section: Section;
+  /** Selected task (Tasks section). Survives section switches. */
+  selectedTaskId: string | null;
+  /** One-shot deep-link: which tab the Task screen should open on (the screen
+   *  consumes + clears it). Null ⇒ no preference. */
+  taskInitialTab: TaskTab | null;
+  /** Selected workflow definition (Workflows section). */
+  selectedWorkflow: string | null;
+  /** Selected schedule (Schedules section). */
+  selectedSchedule: string | null;
+  /** Selected settings nav entry (Settings section sidebar). */
+  settingsTab: string;
+  /** When true, the title-bar workspace switcher dropdown is open. Store-owned
+   *  so the ⌘O global shortcut can toggle it from the dispatcher. */
+  wsSwitcherOpen: boolean;
 
   // workspace (single active project)
   workspaceDir: string | null;
+  /** The active workspace root — alias of `workspaceDir` (kept in lockstep by
+   *  setWorkspaceDir; new screens read this name, per the lexicon). */
+  activeWorkspaceRoot: string | null;
+  /** Known workspace roots: active root + recents (derived, kept in sync). */
+  workspaces: string[];
   /** Most-recent-first history of opened project directories (persisted). */
   recentProjects: string[];
   /** When true (default), each launched agent runs in its own git worktree for
@@ -183,15 +280,25 @@ interface Store {
    *  (most recent last, capped). The flagship substrate landing in the app. */
   frameTurns: Record<string, TurnEvent[]>;
   dirty: Record<string, DirtyState>;
-  /** Per-terminal attributed file-change timeline (most recent last). */
-  timeline: Record<string, TimelineEvent[]>;
   /** Terminal ids whose auto-surfaced frame the user explicitly closed; the
    *  reconciler must not reopen these. (Manually reopening clears the flag.) */
   dismissedTerminalIds: Set<string>;
-  /** Frames whose dirty changes the user has acknowledged (for the switch guard). */
+  /** Agents (by agent id) whose dirty changes the user has acknowledged (for
+   *  the switch guard). Keyed by agent_id so review state survives frame
+   *  close/reopen and is shared by every view of the same agent. */
   reviewedFrames: Record<string, boolean>;
-  /** When set, a context switch is blocked pending review of the current frame. */
-  pendingSwitchKey: string | null;
+  /** When set, a context switch (frame, section, or task navigation) is
+   *  blocked pending review of the current agent's unreviewed work. */
+  pendingSwitch: PendingSwitch | null;
+  /** Launch-collected assignments awaiting one-shot delivery, keyed by agent
+   *  id (minted at provision). Sent as the agent's first prompt the first time
+   *  its terminal view is attached AND it reports IDLE, then cleared — at most
+   *  once, never to adopted/pre-existing agents (only launches stamp entries). */
+  pendingAssignments: Record<string, string>;
+  /** Attention items derived from daemon pushes (capped FIFO at 200). */
+  notifications: AppNotification[];
+  /** Per-agent terminal rendering mode (absent ⇒ "terminal"). */
+  termModes: Record<string, TermMode>;
   /** When set, the Monaco diff-review overlay is open for this terminal. */
   diffTerminalId: string | null;
   /** When true, the activity-graph overlay is open. */
@@ -201,6 +308,16 @@ interface Store {
   /** When true, the launch-agent dialog is open. Store-owned so both the
    *  sidebar button and the command palette can open it. */
   launchOpen: boolean;
+  /** Task the launch dialog should preselect (set alongside launchOpen by the
+   *  Task screen's "Launch one" buttons; null ⇒ Uncategorized default). The
+   *  dialog consumes it at mount; closing the dialog clears it. */
+  launchPresetTaskId: string | null;
+  /** When true, the New-task dialog is open (palette / sidebar "+"). */
+  newTaskOpen: boolean;
+  /** When true, the Add-schedule dialog is open (palette / schedules "+"). */
+  newScheduleOpen: boolean;
+  /** When true, the New-workflow dialog is open (workflows screen / sidebar "+"). */
+  newWorkflowOpen: boolean;
   snackbar: Snackbar | null;
 
   // preferences (persisted via lib/preferences.ts)
@@ -212,54 +329,83 @@ interface Store {
   /** When true, the sidebar is collapsed to a thin rail (Cmd+\). */
   sidebarCollapsed: boolean;
 
+  // navigation
+  /** Switch the rail section — guarded: leaving the agents section with an
+   *  agent's unreviewed work raises the context-switch guard instead. */
+  setSection: (section: Section) => void;
+  /** Navigate to a task (Tasks section), optionally deep-linking to a tab —
+   *  guarded the same way as setSection. */
+  selectTask: (taskId: string, tab?: TaskTab) => void;
+  /** The Task screen consumes the one-shot deep-link tab, then clears it. */
+  clearTaskInitialTab: () => void;
+  /** Clear the task selection (after a successful delete — the row is gone, so
+   *  the screen returns to its select-a-task hint instead of "not found"). */
+  clearSelectedTask: () => void;
+  setSelectedWorkflow: (id: string | null) => void;
+  setSelectedSchedule: (id: string | null) => void;
+  setSettingsTab: (tab: string) => void;
+  setWsSwitcherOpen: (open: boolean) => void;
+
+  // workspaces
+  /** Open a workspace (the existing workspace-open flow): persists it, fronts
+   *  the recents history, and clears workspace-scoped selections (tasks). */
+  switchWorkspace: (root: string) => void;
+  /** Record a workspace in the known list without activating it. */
+  addWorkspace: (root: string) => void;
+
+  // notifications
+  markRead: (id: string) => void;
+  markAllRead: () => void;
+
+  // per-agent UI prefs
+  setTermMode: (agentId: string, mode: TermMode) => void;
+
   // backend sync
   setConnected: (connected: boolean) => void;
   setWorkspaceDir: (dir: string | null) => void;
   removeRecentProject: (path: string) => void;
   clearRecentProjects: () => void;
   setIsolationEnabled: (enabled: boolean) => void;
-  fetchSessions: () => Promise<void>;
-  selectSessionDetail: (name: string | null) => Promise<void>;
-  refreshStatuses: () => Promise<void>;
-  /** Poll per-session terminal statuses and rebuild the collapsed-row rollups. */
-  refreshSessionRollups: () => Promise<void>;
-  /** Legacy session-removal hook (no daemon equivalent — agents are standalone);
-   *  kept for the pipeline UI's empty session list. */
-  killSession: (name: string) => Promise<void>;
+  /** Refresh the daemon agent roster — also the connectivity probe. */
+  fetchAgents: () => Promise<void>;
 
   // grid actions
   launchAgent: (
     provider: string,
     agentProfile: string,
-    opts?: { taskId?: string | null; workingDirectory?: string },
+    opts?: {
+      taskId?: string | null;
+      workingDirectory?: string;
+      /** The per-agent intent — delivered once as the first prompt when the
+       *  agent's terminal is ready (see `pendingAssignments`). */
+      assignment?: string | null;
+    },
   ) => Promise<void>;
-  openTerminalFrame: (t: {
-    terminalId: string;
-    provider: string;
-    agentProfile?: string | null;
-    sessionName?: string | null;
-  }) => void;
   /** Launch a provider on the detached session daemon (the Rust PTY path; survives
    *  app crashes). `profile` is the daemon profile name (`~/.taime/agents/*.toml`
    *  + built-in `default`/`orchestrator`); the daemon resolves it to fill the
    *  system prompt / model / tools and injects the MCP orchestration tools for a
-   *  supervisor role. `taskId` (optional) is the Task the agent joins — stamped
+   *  supervisor profile. `taskId` (optional) is the Task the agent joins — stamped
    *  onto its worktree row at provision (null ⇒ Uncategorized); `projectRoot`
    *  (optional) overrides the worktree fork root (defaults to the active
-   *  `workspaceDir`). Returns true on success. */
+   *  `workspaceDir`); `assignment` (optional) is stamped into
+   *  `pendingAssignments` for one-shot first-prompt delivery. Returns true on
+   *  success. */
   launchAgentDaemon: (
     provider: string,
     profile?: string,
     taskId?: string | null,
     projectRoot?: string | null,
+    assignment?: string | null,
   ) => Promise<boolean>;
+  /** Attempt the one-shot assignment delivery for `agentId`: no-op unless a
+   *  pending entry exists AND the view's writer is attached for `sessionId`.
+   *  Writes the text + submits through the same path user keystrokes use,
+   *  then clears the entry (at most once). */
+  deliverAssignment: (agentId: string, sessionId: string) => void;
   /** Refresh each tracked agent's Task membership from a daemon list (the
    *  reconcile tick) — keeps the sidebar grouping fresh after reassignment. */
   syncDaemonTaskIds: (sessions: DaemonSessionSummary[]) => void;
-  /** Task whose review drawer is open (null = closed). */
-  taskReviewId: string | null;
-  openTaskReview: (taskId: string) => void;
-  closeTaskReview: () => void;
   /** Reopen a detached (still-running) Rust-PTY agent in a new frame. */
   reopenRustPty: (ptySessionId: string, opts?: { focus?: boolean }) => void;
   /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
@@ -280,12 +426,18 @@ interface Store {
   /** Switch active frame, raising the dirty-state guard if needed. */
   setActiveFrameGuarded: (key: string) => void;
   resolveSwitch: (proceed: boolean) => void;
-  markReviewed: (key: string) => void;
+  /** Acknowledge an agent's dirty changes (keyed by agent id). */
+  markReviewed: (agentId: string) => void;
   openDiff: (terminalId: string) => void;
   closeDiff: () => void;
   setGraphOpen: (open: boolean) => void;
   setCommandPaletteOpen: (open: boolean) => void;
-  setLaunchOpen: (open: boolean) => void;
+  /** Open/close the launch dialog. `presetTaskId` preselects the Task step
+   *  (the Task screen's "Launch one" path); ignored on close, always cleared. */
+  setLaunchOpen: (open: boolean, presetTaskId?: string | null) => void;
+  setNewTaskOpen: (open: boolean) => void;
+  setNewScheduleOpen: (open: boolean) => void;
+  setNewWorkflowOpen: (open: boolean) => void;
   setLayoutMode: (mode: LayoutMode) => void;
   toggleLayoutMode: () => void;
 
@@ -299,7 +451,6 @@ interface Store {
   // dirty state
   setDirty: (terminalId: string, dirty: DirtyState) => void;
   clearDirty: (terminalId: string) => void;
-  appendTimeline: (terminalId: string, events: TimelineEvent[]) => void;
 
   // misc
   setTerminalStatus: (id: string, status: string | null) => void;
@@ -315,15 +466,37 @@ interface Store {
   hideSnackbar: () => void;
 }
 
+/** Does this frame's agent have dirty changes the user hasn't acknowledged?
+ *  (The guard condition — shared by frame switches and section navigation.) */
+function hasUnreviewedWork(
+  s: Pick<Store, "dirty" | "reviewedFrames">,
+  frame: Frame | undefined,
+): boolean {
+  if (!frame?.terminalId) return false;
+  const d = s.dirty[frame.terminalId];
+  return !!d && d.count > 0 && !s.reviewedFrames[frame.terminalId];
+}
+
+const bootWorkspaceDir = loadWorkspaceDir();
+const bootRecents = loadRecentProjects();
+
 export const useStore = create<Store>((set, get) => ({
-  sessions: [],
-  activeSessionDetail: null,
+  agents: [],
   connected: false,
   terminalStatuses: {},
-  sessionStatusRollup: {},
 
-  workspaceDir: loadWorkspaceDir(),
-  recentProjects: loadRecentProjects(),
+  section: "dashboard",
+  selectedTaskId: null,
+  taskInitialTab: null,
+  selectedWorkflow: null,
+  selectedSchedule: null,
+  settingsTab: "workspace",
+  wsSwitcherOpen: false,
+
+  workspaceDir: bootWorkspaceDir,
+  activeWorkspaceRoot: bootWorkspaceDir,
+  workspaces: deriveWorkspaces(bootWorkspaceDir, bootRecents),
+  recentProjects: bootRecents,
   isolationEnabled: true,
 
   terminalFontSize: loadTerminalFontSize(),
@@ -336,28 +509,132 @@ export const useStore = create<Store>((set, get) => ({
   rustPtySessions: {},
   frameTurns: {},
   dirty: {},
-  timeline: {},
   dismissedTerminalIds: new Set(),
   reviewedFrames: {},
-  pendingSwitchKey: null,
+  pendingSwitch: null,
+  pendingAssignments: {},
+  notifications: [],
+  termModes: {},
   diffTerminalId: null,
   graphOpen: false,
   commandPaletteOpen: false,
   launchOpen: false,
+  launchPresetTaskId: null,
+  newTaskOpen: false,
+  newScheduleOpen: false,
+  newWorkflowOpen: false,
   snackbar: null,
 
   setConnected: (connected) => {
     if (get().connected !== connected) set({ connected });
   },
 
+  setSection: (section) => {
+    const s = get();
+    // The guard owns the invariant: while a switch is pending review, ignore
+    // further navigation so a second keystroke/click cannot silently retarget
+    // the open guard modal.
+    if (s.pendingSwitch) return;
+    if (section === s.section) return;
+    // Leaving the agents section away from an agent with unreviewed changes
+    // raises the guard instead of navigating (same gate as frame switches).
+    if (
+      s.section === "agents" &&
+      hasUnreviewedWork(s, s.frames.find((f) => f.key === s.activeFrameKey))
+    ) {
+      set({ pendingSwitch: { kind: "section", section } });
+      return;
+    }
+    set({ section });
+  },
+
+  selectTask: (taskId, tab) => {
+    const s = get();
+    if (s.pendingSwitch) return;
+    if (
+      s.section === "agents" &&
+      hasUnreviewedWork(s, s.frames.find((f) => f.key === s.activeFrameKey))
+    ) {
+      set({ pendingSwitch: { kind: "task", taskId, tab: tab ?? null } });
+      return;
+    }
+    set({ section: "tasks", selectedTaskId: taskId, taskInitialTab: tab ?? null });
+  },
+
+  clearTaskInitialTab: () => {
+    if (get().taskInitialTab !== null) set({ taskInitialTab: null });
+  },
+
+  clearSelectedTask: () => set({ selectedTaskId: null, taskInitialTab: null }),
+
+  setSelectedWorkflow: (selectedWorkflow) => set({ selectedWorkflow }),
+  setSelectedSchedule: (selectedSchedule) => set({ selectedSchedule }),
+  setSettingsTab: (settingsTab) => set({ settingsTab }),
+  setWsSwitcherOpen: (wsSwitcherOpen) => set({ wsSwitcherOpen }),
+
+  switchWorkspace: (root) => {
+    if (root === get().workspaceDir) return;
+    // The existing workspace-open flow (persist + recents + derived list)…
+    get().setWorkspaceDir(root);
+    // …plus clearing the workspace-scoped selection: tasks belong to a
+    // workspace; workflow/schedule definitions are global and keep theirs.
+    set({ selectedTaskId: null, taskInitialTab: null });
+  },
+
+  addWorkspace: (root) => {
+    const s = get();
+    const recents = addRecent(s.recentProjects, root);
+    saveRecentProjects(recents);
+    set({
+      recentProjects: recents,
+      workspaces: deriveWorkspaces(s.workspaceDir, recents),
+    });
+  },
+
+  markRead: (id) =>
+    set((s) => {
+      const hit = s.notifications.find((n) => n.id === id && !n.read);
+      if (!hit) return s;
+      return {
+        notifications: s.notifications.map((n) =>
+          n.id === id ? { ...n, read: true } : n,
+        ),
+      };
+    }),
+
+  markAllRead: () =>
+    set((s) => {
+      if (s.notifications.every((n) => n.read)) return s;
+      return {
+        notifications: s.notifications.map((n) =>
+          n.read ? n : { ...n, read: true },
+        ),
+      };
+    }),
+
+  setTermMode: (agentId, mode) =>
+    set((s) => {
+      if (termModeFor(s, agentId) === mode) return s;
+      return { termModes: { ...s.termModes, [agentId]: mode } };
+    }),
+
   setWorkspaceDir: (workspaceDir) => {
     saveWorkspaceDir(workspaceDir);
     if (workspaceDir) {
       const recents = addRecent(get().recentProjects, workspaceDir);
       saveRecentProjects(recents);
-      set({ workspaceDir, recentProjects: recents });
+      set({
+        workspaceDir,
+        activeWorkspaceRoot: workspaceDir,
+        recentProjects: recents,
+        workspaces: deriveWorkspaces(workspaceDir, recents),
+      });
     } else {
-      set({ workspaceDir });
+      set({
+        workspaceDir,
+        activeWorkspaceRoot: workspaceDir,
+        workspaces: deriveWorkspaces(workspaceDir, get().recentProjects),
+      });
     }
   },
 
@@ -365,141 +642,45 @@ export const useStore = create<Store>((set, get) => ({
     set((s) => {
       const recents = s.recentProjects.filter((p) => p !== path);
       saveRecentProjects(recents);
-      return { recentProjects: recents };
+      return {
+        recentProjects: recents,
+        workspaces: deriveWorkspaces(s.workspaceDir, recents),
+      };
     }),
 
   clearRecentProjects: () => {
     saveRecentProjects([]);
-    set({ recentProjects: [] });
+    set((s) => ({
+      recentProjects: [],
+      workspaces: deriveWorkspaces(s.workspaceDir, []),
+    }));
   },
 
   setIsolationEnabled: (isolationEnabled) => set({ isolationEnabled }),
 
-  fetchSessions: async () => {
+  fetchAgents: async () => {
+    // Outside Tauri, daemonQuery answers with its static fallback — that proves
+    // nothing about the daemon, so never let it claim reachability. The whole
+    // UI then presents its designed daemon-down surfaces (the honest state).
+    if (!inTauri()) return;
+    // The same split-brain exists IN Tauri: daemon.rs serves the query fallback
+    // when the daemon is dead, so a resolved listAgents proves nothing either.
+    // daemon_ping (connect-only; never spawns) is the one connectivity source.
+    const connected = await daemonPing();
+    if (!connected) {
+      if (get().connected) set({ connected: false });
+      // Keep the last real roster — never overwrite it with the fallback.
+      return;
+    }
     try {
-      const sessions = await api.listSessions();
+      const agents = await api.listAgents();
       const prev = get();
-      if (!prev.connected || !jsonEqual(prev.sessions, sessions)) {
-        set({ sessions, connected: true });
+      if (!prev.connected || !jsonEqual(prev.agents, agents)) {
+        set({ agents, connected: true });
       }
     } catch {
       if (get().connected) set({ connected: false });
     }
-  },
-
-  selectSessionDetail: async (name) => {
-    if (!name) {
-      set({ activeSessionDetail: null });
-      return;
-    }
-    try {
-      const detail = await api.getSession(name);
-      if (!jsonEqual(get().activeSessionDetail, detail)) {
-        set({ activeSessionDetail: detail });
-      }
-    } catch {
-      /* leave previous detail */
-    }
-  },
-
-  refreshStatuses: async () => {
-    const ids = get()
-      // Daemon frames carry a CAO terminalId only for the attribution surface
-      // (it's a provisioned worktree id, not a tmux terminal). Their lifecycle
-      // comes from daemon_list via useRustPtyReconcile — polling CAO /terminals/{id}
-      // for them just 404s every tick. Skip them here.
-      .frames.filter((f) => !f.ptySessionId)
-      .map((f) => f.terminalId)
-      .filter((x): x is string => !!x);
-    if (ids.length === 0) return;
-    await Promise.all(
-      ids.map(async (id) => {
-        try {
-          const status = await api.getTerminalStatus(id);
-          get().setTerminalStatus(id, status);
-        } catch {
-          /* ignore transient */
-        }
-      }),
-    );
-  },
-
-  refreshSessionRollups: async () => {
-    const sessions = get().sessions;
-    if (sessions.length === 0) {
-      if (Object.keys(get().sessionStatusRollup).length > 0) {
-        set({ sessionStatusRollup: {} });
-      }
-      return;
-    }
-    // Bucket each session's agents by their LIVE status — the push-maintained
-    // `terminalStatuses` map (Phase 4), NOT the retired per-terminal status call.
-    // Query each session's detail by its UNIQUE root id (not the basename) so two
-    // same-basename workspaces never merge. Unreachable sessions are omitted.
-    const results = await Promise.all(
-      sessions.map(async (sess) => {
-        try {
-          const detail = await api.getSession(sess.id);
-          const statuses = get().terminalStatuses;
-          const roll: SessionStatusRollup = {
-            working: 0,
-            needsYou: 0,
-            error: 0,
-            done: 0,
-            idle: 0,
-            total: detail.terminals.length,
-          };
-          for (const t of detail.terminals) {
-            switch ((statuses[t.id] ?? "").toUpperCase()) {
-              case "PROCESSING":
-                roll.working++;
-                break;
-              case "WAITING_USER_ANSWER":
-                roll.needsYou++;
-                break;
-              case "ERROR":
-                roll.error++;
-                break;
-              case "COMPLETED":
-                roll.done++;
-                break;
-              case "IDLE":
-                roll.idle++;
-                break;
-            }
-          }
-          return [sess.id, roll] as const;
-        } catch {
-          return null; // skip unreachable session
-        }
-      }),
-    );
-    // Assign in `sessions` order (NOT Promise-resolution order) so the rebuilt
-    // map has deterministic key order — otherwise JSON.stringify in jsonEqual
-    // sees a different string each tick for identical content and set() churns.
-    const next: Record<string, SessionStatusRollup> = {};
-    for (const entry of results) {
-      if (entry) next[entry[0]] = entry[1];
-    }
-    if (!jsonEqual(get().sessionStatusRollup, next)) {
-      set({ sessionStatusRollup: next });
-    }
-  },
-
-  killSession: async (name) => {
-    // Close any open frames for this session first (UI only). The session-delete
-    // below is a no-op stub since the CAO removal (tmux-shaped sessions are
-    // gone) — daemon agents are killed per-frame, not per-session.
-    const victims = get().frames.filter((f) => f.sessionName === name);
-    for (const f of victims) await get().closeFrame(f.key);
-    try {
-      await api.deleteSession(name);
-      get().showSnackbar({ type: "info", message: `Removed session ${name}` });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      get().showSnackbar({ type: "error", message: `Couldn't remove ${name}: ${msg}` });
-    }
-    await get().fetchSessions();
   },
 
   launchAgent: async (provider, agentProfile, opts) => {
@@ -508,7 +689,7 @@ export const useStore = create<Store>((set, get) => ({
     // chosen profile name flows to the daemon, which resolves it against its
     // profile store (~/.taime/agents/*.toml + built-in default/orchestrator) to
     // fill the system prompt / model / tools and inject orchestration for a
-    // supervisor role.
+    // supervisor profile.
     if (!DAEMON_PROVIDERS.has(provider)) {
       get().showSnackbar({ type: "error", message: `Unknown provider ${provider}` });
       return;
@@ -525,56 +706,29 @@ export const useStore = create<Store>((set, get) => ({
       agentProfile || "default",
       opts?.taskId ?? null,
       opts?.workingDirectory ?? null,
+      opts?.assignment ?? null,
     );
     if (ok && firstAgent) get().setGraphOpen(true);
   },
 
-  openTerminalFrame: ({ terminalId, provider, agentProfile, sessionName }) => {
-    // Opening a terminal (manually or via reconcile) clears any prior dismissal
-    // so its surfacing lifecycle resets.
-    const undismiss = (s: Store): Partial<Store> =>
-      s.dismissedTerminalIds.has(terminalId)
-        ? {
-            dismissedTerminalIds: new Set(
-              [...s.dismissedTerminalIds].filter((id) => id !== terminalId),
-            ),
-          }
-        : {};
-    const existing = get().frames.find((f) => f.terminalId === terminalId);
-    if (existing) {
-      set((s) => ({ ...undismiss(s), activeFrameKey: existing.key }));
-      return;
-    }
-    const key = nextKey();
-    set((s) => ({
-      ...undismiss(s),
-      frames: [
-        ...s.frames,
-        {
-          key,
-          terminalId,
-          provider,
-          agentProfile: agentProfile ?? null,
-          sessionName: sessionName ?? null,
-          pending: false,
-        },
-      ],
-      activeFrameKey: key,
-    }));
-  },
-
-  launchAgentDaemon: async (provider, profile = "default", taskId = null, projectRoot = null) => {
+  launchAgentDaemon: async (
+    provider,
+    profile = "default",
+    taskId = null,
+    projectRoot = null,
+    assignment = null,
+  ) => {
     // Provision from the active workspace (or an explicit override root) — the
     // worktree row is the durable anchor for attribution AND Task membership.
     const dir = projectRoot ?? get().workspaceDir;
-    // The built-in "orchestrator" role is a supervisor; the daemon also infers
+    // The built-in "orchestrator" profile is a supervisor; the daemon also infers
     // this from a file profile's `orchestrator = true`, but pass the hint so a
     // pre-resolution path still injects the tools.
     const orchestrate = profile === "orchestrator";
     try {
       // Provision a daemon-owned worktree first (git worktree in Rust, persisted
-      // to the app-data store) so dirty/diff/graph key off this terminalId, and
-      // pass it to the daemon as the attribution_key so turn events carry it.
+      // to the app-data store) so dirty/diff/graph key off this agent id, and
+      // pass it to the daemon as the agent_id so turn events carry it.
       // `api.provisionWorktree` routes to the daemon (daemonProvisionWorktree).
       let terminalId: string | null = null;
       let cwd = dir;
@@ -586,7 +740,7 @@ export const useStore = create<Store>((set, get) => ({
           isolate: get().isolationEnabled,
           task_id: taskId,
         });
-        terminalId = wt.terminal_id;
+        terminalId = wt.agent_id;
         cwd = wt.worktree_path;
         branch = wt.branch;
       }
@@ -604,7 +758,7 @@ export const useStore = create<Store>((set, get) => ({
       set((s) => {
         // If the reconcile tick already surfaced this freshly-spawned session as a
         // frame (a concurrent daemonList can list it before this set() runs), reuse
-        // that frame instead of adding a duplicate — just focus it + label its role.
+        // that frame instead of adding a duplicate — just focus it + label its profile.
         const existing = s.frames.find((f) => f.ptySessionId === sessionId);
         const frames = existing
           ? s.frames.map((f) =>
@@ -619,7 +773,6 @@ export const useStore = create<Store>((set, get) => ({
                 terminalId,
                 provider,
                 agentProfile: profile,
-                sessionName: null,
                 taskId: taskId ?? null,
                 pending: false,
                 transport: "daemon" as const,
@@ -629,6 +782,17 @@ export const useStore = create<Store>((set, get) => ({
         return {
           frames,
           activeFrameKey: existing ? existing.key : key,
+          // Stamp the assignment for one-shot delivery once the agent's view
+          // attaches AND it reports ready. Keyed by the freshly-minted agent id,
+          // so adopted/pre-existing agents can never receive one.
+          ...(assignment?.trim() && terminalId
+            ? {
+                pendingAssignments: {
+                  ...s.pendingAssignments,
+                  [terminalId]: assignment.trim(),
+                },
+              }
+            : {}),
           rustPtySessions: terminalId
           ? {
               ...s.rustPtySessions,
@@ -665,6 +829,28 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
+  deliverAssignment: (agentId, sessionId) => {
+    const text = get().pendingAssignments[agentId];
+    if (!text) return;
+    // The same write path user keystrokes use (TerminalViewRustPty registers
+    // the writer on attach) — false means the view isn't attached yet, so the
+    // entry stays pending and the next IDLE report retries.
+    if (!sendToTerminal(sessionId, text)) return;
+    // Submit on a separate, delayed write: a trailing \r inside the same burst
+    // reads as pasted text to CLIs with paste detection (it would insert a
+    // newline instead of submitting). The checkpoint mirrors the user-submit
+    // path's attribution signal.
+    setTimeout(() => {
+      sendToTerminal(sessionId, "\r");
+      daemonCheckpoint(sessionId, "submit");
+    }, 150);
+    set((s) => {
+      const next = { ...s.pendingAssignments };
+      delete next[agentId];
+      return { pendingAssignments: next };
+    });
+  },
+
   markRustPtyExited: (ptySessionId) =>
     set((s) => {
       const m = s.rustPtySessions[ptySessionId];
@@ -674,6 +860,18 @@ export const useStore = create<Store>((set, get) => ({
           ...s.rustPtySessions,
           [ptySessionId]: { ...m, status: "exited" },
         },
+        // Surface the lifecycle transition (running → exited) as an attention
+        // item. Idempotent with the early return above — one push per exit.
+        ...(m.terminalId
+          ? {
+              notifications: appendNotification(s.notifications, {
+                kind: "exited",
+                agentId: m.terminalId,
+                taskId: m.taskId ?? null,
+                text: `${providerTitle(m.provider)} exited`,
+              }),
+            }
+          : {}),
       };
     }),
 
@@ -683,7 +881,7 @@ export const useStore = create<Store>((set, get) => ({
       if (s.rustPtySessions[summary.id]) return s;
       const meta: RustPtyMeta = {
         ptySessionId: summary.id,
-        terminalId: summary.attribution_key ?? "",
+        terminalId: summary.agent_id ?? "",
         // Daemon-reported provider (Phase 4); fall back to program inference for
         // a pre-Phase-4 daemon that doesn't report it.
         provider: summary.provider ?? providerFromProgram(summary.program),
@@ -728,12 +926,6 @@ export const useStore = create<Store>((set, get) => ({
       };
     }),
 
-  taskReviewId: null,
-  // The two right drawers (Task Review / Team graph) share the same geometry —
-  // opening one closes the other so they never stack invisibly.
-  openTaskReview: (taskId) => set({ taskReviewId: taskId, graphOpen: false }),
-  closeTaskReview: () => set({ taskReviewId: null }),
-
   recordTurn: (frameKey, turn) =>
     set((s) => {
       const prev = s.frameTurns[frameKey] ?? [];
@@ -759,13 +951,10 @@ export const useStore = create<Store>((set, get) => ({
           terminalId: meta.terminalId,
           provider: meta.provider,
           agentProfile: null,
-          sessionName: null,
           // Carry membership from the (reconcile-synced) meta so reattached /
           // adopted agents cross-link in DiffView like manually launched ones.
           taskId: meta.taskId ?? null,
           pending: false,
-          // Reattach via the backend that owns the session (daemon vs in-app),
-          // or the in-app default for pre-existing records without a transport.
           transport: "daemon",
           ptySessionId,
         },
@@ -807,8 +996,8 @@ export const useStore = create<Store>((set, get) => ({
     // Remove from the grid immediately (closing a frame ≠ stopping the agent).
     set((s) => {
       const frames = s.frames.filter((f) => f.key !== key);
-      // Remember explicitly-closed CAO terminals so the reconciler doesn't
-      // immediately reopen them. Rust-PTY frames are excluded — they have their
+      // Remember explicitly-closed non-daemon frames so the reconciler doesn't
+      // immediately reopen them. Daemon frames are excluded — they have their
       // own detached-agent lifecycle (close detaches, doesn't kill).
       const dismissedTerminalIds =
         frame && !isDaemonTransport(frame.transport) && frame.terminalId
@@ -860,29 +1049,18 @@ export const useStore = create<Store>((set, get) => ({
     });
   },
 
-  appendTimeline: (terminalId, events) =>
-    set((s) => {
-      if (events.length === 0) return s;
-      const prev = s.timeline[terminalId] ?? [];
-      const merged = [...prev, ...events].slice(-TIMELINE_CAP);
-      return { timeline: { ...s.timeline, [terminalId]: merged } };
-    }),
-
   setActiveFrameGuarded: (key) => {
     const s = get();
     // The guard owns the invariant: while a switch is pending review, ignore
     // further switch requests so a second keystroke/click cannot silently
     // retarget the open guard modal.
-    if (s.pendingSwitchKey) return;
+    if (s.pendingSwitch) return;
     if (key === s.activeFrameKey) return;
     const current = s.frames.find((f) => f.key === s.activeFrameKey);
-    const curDirty = current?.terminalId
-      ? s.dirty[current.terminalId]
-      : undefined;
     // If the agent we're switching AWAY from left unreviewed changes, raise the
     // guard instead of switching. The UI resolves it (review or proceed).
-    if (current && curDirty && curDirty.count > 0 && !s.reviewedFrames[current.key]) {
-      set({ pendingSwitchKey: key });
+    if (hasUnreviewedWork(s, current)) {
+      set({ pendingSwitch: { kind: "frame", key } });
       return;
     }
     set({ activeFrameKey: key });
@@ -890,31 +1068,45 @@ export const useStore = create<Store>((set, get) => ({
 
   resolveSwitch: (proceed) => {
     const s = get();
-    const target = s.pendingSwitchKey;
+    const target = s.pendingSwitch;
     if (!target) return;
-    if (proceed) {
-      const from = s.activeFrameKey;
-      set({
-        activeFrameKey: target,
-        pendingSwitchKey: null,
-        reviewedFrames: from
-          ? { ...s.reviewedFrames, [from]: true }
-          : s.reviewedFrames,
-      });
+    if (!proceed) {
+      set({ pendingSwitch: null });
+      return;
+    }
+    // Proceeding past the guard acknowledges the current agent's changes
+    // (keyed by agent id — review state outlives this frame).
+    const from = s.frames.find((f) => f.key === s.activeFrameKey);
+    const reviewedFrames = from?.terminalId
+      ? { ...s.reviewedFrames, [from.terminalId]: true }
+      : s.reviewedFrames;
+    if (target.kind === "frame") {
+      set({ activeFrameKey: target.key, pendingSwitch: null, reviewedFrames });
+    } else if (target.kind === "section") {
+      set({ section: target.section, pendingSwitch: null, reviewedFrames });
     } else {
-      set({ pendingSwitchKey: null });
+      set({
+        section: "tasks",
+        selectedTaskId: target.taskId,
+        taskInitialTab: target.tab,
+        pendingSwitch: null,
+        reviewedFrames,
+      });
     }
   },
 
-  markReviewed: (key) =>
-    set((s) => ({ reviewedFrames: { ...s.reviewedFrames, [key]: true } })),
+  markReviewed: (agentId) =>
+    set((s) => ({ reviewedFrames: { ...s.reviewedFrames, [agentId]: true } })),
 
   openDiff: (terminalId) => set({ diffTerminalId: terminalId }),
   closeDiff: () => set({ diffTerminalId: null }),
-  // Mutually exclusive with the Task Review drawer (same right-edge geometry).
-  setGraphOpen: (graphOpen) => set(graphOpen ? { graphOpen, taskReviewId: null } : { graphOpen }),
+  setGraphOpen: (graphOpen) => set({ graphOpen }),
   setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
-  setLaunchOpen: (launchOpen) => set({ launchOpen }),
+  setLaunchOpen: (launchOpen, presetTaskId) =>
+    set({ launchOpen, launchPresetTaskId: launchOpen ? (presetTaskId ?? null) : null }),
+  setNewTaskOpen: (newTaskOpen) => set({ newTaskOpen }),
+  setNewScheduleOpen: (newScheduleOpen) => set({ newScheduleOpen }),
+  setNewWorkflowOpen: (newWorkflowOpen) => set({ newWorkflowOpen }),
   setLayoutMode: (layoutMode) => set({ layoutMode }),
   toggleLayoutMode: () =>
     set((s) => ({ layoutMode: s.layoutMode === "grid" ? "focus" : "grid" })),
@@ -942,33 +1134,83 @@ export const useStore = create<Store>((set, get) => ({
     set({ sidebarCollapsed: next });
   },
 
-  setTerminalStatus: (id, status) =>
+  setTerminalStatus: (id, status) => {
+    const normalized = status ? status.toUpperCase() : "UNKNOWN";
     set((s) => {
-      const normalized = status ? status.toUpperCase() : "UNKNOWN";
       if (s.terminalStatuses[id] === normalized) return s;
+      // Blocked/error transitions become attention items. Both status paths
+      // (this poll mirror + the per-session push) write the same map, so the
+      // unchanged early return above dedupes between them.
+      const meta = Object.values(s.rustPtySessions).find(
+        (m) => m.terminalId === id,
+      );
+      const notifications = statusNotifications(
+        s.notifications,
+        id,
+        meta?.taskId ?? null,
+        meta ? providerTitle(meta.provider) : id,
+        normalized,
+      );
       return {
         terminalStatuses: { ...s.terminalStatuses, [id]: normalized },
+        ...(notifications ? { notifications } : {}),
       };
-    }),
+    });
+    // One-shot assignment delivery: IDLE is the ready signal. Outside the
+    // status-unchanged dedupe on purpose — the reconcile poll re-reports IDLE
+    // every tick, retrying until the view's writer is attached.
+    if (normalized === "IDLE") {
+      const meta = Object.values(get().rustPtySessions).find(
+        (m) => m.terminalId === id,
+      );
+      if (meta) get().deliverAssignment(id, meta.ptySessionId);
+    }
+  },
 
-  setDaemonSessionStatus: (sessionId, status) =>
+  setDaemonSessionStatus: (sessionId, status) => {
+    const normalized = status ? status.toUpperCase() : "UNKNOWN";
     set((s) => {
       const tid = s.rustPtySessions[sessionId]?.terminalId;
       if (!tid) return s;
-      const normalized = status ? status.toUpperCase() : "UNKNOWN";
       if (s.terminalStatuses[tid] === normalized) return s;
       // Keep the daemon-session map's own status field coherent too (used by the
       // Agents panel), mapping the inferred status onto the lifecycle label.
       const m = s.rustPtySessions[sessionId];
       const lifecycle = normalized === "EXITED" ? "exited" : m.status === "exited" ? "exited" : "running";
+      // Attention items: blocked/error transitions, plus an exit when THIS push
+      // (not markRustPtyExited) is what flips the lifecycle — mutually
+      // exclusive with markRustPtyExited's push, so no duplicates.
+      let notifications = statusNotifications(
+        s.notifications,
+        tid,
+        m.taskId ?? null,
+        providerTitle(m.provider),
+        normalized,
+      );
+      if (m.status === "running" && lifecycle === "exited") {
+        notifications = appendNotification(notifications ?? s.notifications, {
+          kind: "exited",
+          agentId: tid,
+          taskId: m.taskId ?? null,
+          text: `${providerTitle(m.provider)} exited`,
+        });
+      }
       return {
         terminalStatuses: { ...s.terminalStatuses, [tid]: normalized },
         rustPtySessions:
           m.status === lifecycle
             ? s.rustPtySessions
             : { ...s.rustPtySessions, [sessionId]: { ...m, status: lifecycle } },
+        ...(notifications ? { notifications } : {}),
       };
-    }),
+    });
+    // One-shot assignment delivery (the push path — this status arrived over
+    // the attach channel, so the view's writer is already registered).
+    if (normalized === "IDLE") {
+      const tid = get().rustPtySessions[sessionId]?.terminalId;
+      if (tid) get().deliverAssignment(tid, sessionId);
+    }
+  },
 
   markDaemonFsDirty: (sessionId, paths) =>
     set((s) => {
@@ -978,7 +1220,23 @@ export const useStore = create<Store>((set, get) => ({
       if (prev && prev.count === paths.length && prev.paths.join(" ") === paths.join(" ")) {
         return s;
       }
-      return { dirty: { ...s.dirty, [tid]: { count: paths.length, paths } } };
+      // First dirty since launch / last review-clear → one attention item.
+      // Subsequent pushes only grow the set; they don't re-notify.
+      const m = s.rustPtySessions[sessionId];
+      const notifications = !prev
+        ? appendNotification(s.notifications, {
+            kind: "review",
+            agentId: tid,
+            taskId: m.taskId ?? null,
+            text: `${providerTitle(m.provider)} · ${paths.length} path${
+              paths.length === 1 ? "" : "s"
+            } changed`,
+          })
+        : undefined;
+      return {
+        dirty: { ...s.dirty, [tid]: { count: paths.length, paths } },
+        ...(notifications ? { notifications } : {}),
+      };
     }),
 
   setFrameModel: (key, model) =>

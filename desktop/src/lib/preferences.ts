@@ -47,7 +47,7 @@ export function saveTerminalFontSize(size: number): void {
 const SIDEBAR_WIDTH_KEY = "taime.sidebarWidth";
 const SIDEBAR_COLLAPSED_KEY = "taime.sidebarCollapsed";
 
-export const SIDEBAR_WIDTH_DEFAULT = 320; // matches the old w-80
+export const SIDEBAR_WIDTH_DEFAULT = 248; // the task-first panel's design width
 export const SIDEBAR_WIDTH_MIN = 220;
 export const SIDEBAR_WIDTH_MAX = 480;
 /** Always leave at least this much room for the shell grid. */

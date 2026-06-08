@@ -2,8 +2,9 @@ import type { Terminal } from "@xterm/xterm";
 import { PASTE_TRIGGER } from "./terminalInput";
 
 /**
- * Cross-platform copy/paste for an xterm terminal, shared by EVERY transport
- * (CAO WebSocket + Rust PTY) so behavior never diverges. Returns a cleanup fn.
+ * Cross-platform copy/paste for an xterm terminal — ONE shared implementation
+ * (used by the daemon Rust-PTY view) so behavior never diverges. Returns a
+ * cleanup fn.
  *
  * Best practices applied:
  *  - COPY is explicit (⌘C on macOS, Ctrl+Shift+C on Win/Linux) and only when

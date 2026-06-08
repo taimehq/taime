@@ -61,9 +61,9 @@ fn project_slug(repo_root: &str) -> String {
     format!("{safe}-{:08x}", fnv1a32(repo_root))
 }
 
-fn shared(project_root: &str, terminal_key: &str, error: Option<String>) -> WorktreeInfo {
+fn shared(project_root: &str, agent_id: &str, error: Option<String>) -> WorktreeInfo {
     WorktreeInfo {
-        terminal_key: terminal_key.to_string(),
+        agent_id: agent_id.to_string(),
         project_root: project_root.to_string(),
         repo_root: None,
         worktree_path: project_root.to_string(),
@@ -142,46 +142,46 @@ pub fn gc_one(
     GcOutcome::Removed
 }
 
-/// Provision (or idempotently resolve) an isolated worktree for `terminal_key`.
-/// Branch is `taime/<provider>-<terminal_key>`, matching CAO.
+/// Provision (or idempotently resolve) an isolated worktree for `agent_id`.
+/// Branch is `taime/<provider>-<agent_id>`, matching CAO.
 pub fn provision(
     project_root: &str,
     provider: &str,
     isolate: bool,
-    terminal_key: &str,
+    agent_id: &str,
 ) -> WorktreeInfo {
     if !isolate {
-        return shared(project_root, terminal_key, None);
+        return shared(project_root, agent_id, None);
     }
     let proj = Path::new(project_root);
     if !proj.is_dir() {
-        return shared(project_root, terminal_key, Some("project root is not a directory".into()));
+        return shared(project_root, agent_id, Some("project root is not a directory".into()));
     }
     let repo_root = match git_stdout(proj, &["rev-parse", "--show-toplevel"]) {
         Some(r) => r,
-        None => return shared(project_root, terminal_key, Some("not a git repository".into())),
+        None => return shared(project_root, agent_id, Some("not a git repository".into())),
     };
     let repo = Path::new(&repo_root);
     let base_sha = match git_stdout(repo, &["rev-parse", "HEAD"]) {
         Some(s) => s,
-        None => return shared(project_root, terminal_key, Some("no commits (empty repo)".into())),
+        None => return shared(project_root, agent_id, Some("no commits (empty repo)".into())),
     };
 
-    let branch = format!("taime/{provider}-{terminal_key}");
-    let wt_dir = worktrees_dir().join(project_slug(&repo_root)).join(terminal_key);
+    let branch = format!("taime/{provider}-{agent_id}");
+    let wt_dir = worktrees_dir().join(project_slug(&repo_root)).join(agent_id);
     if let Some(parent) = wt_dir.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let wt_path = wt_dir.to_string_lossy().to_string();
 
     let ok = WorktreeInfo {
-        terminal_key: terminal_key.to_string(),
+        agent_id: agent_id.to_string(),
         project_root: project_root.to_string(),
         repo_root: Some(repo_root.clone()),
         worktree_path: wt_path.clone(),
         branch: Some(branch.clone()),
         base_sha: Some(base_sha.clone()),
-        mode: "worktree".to_string(),
+        mode: "isolated".to_string(),
         error: None,
     };
 
@@ -201,7 +201,7 @@ pub fn provision(
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
                 .unwrap_or_default();
-            return shared(project_root, terminal_key, Some(format!("git worktree add failed: {err}")));
+            return shared(project_root, agent_id, Some(format!("git worktree add failed: {err}")));
         }
     }
     link_gitignored_deps(repo, &wt_dir);
@@ -275,7 +275,7 @@ mod tests {
     fn git_repo_provisions_isolated_worktree() {
         let repo = temp_repo();
         let info = provision(repo.to_str().unwrap(), "claude_code", true, "abc12345");
-        assert_eq!(info.mode, "worktree", "error: {:?}", info.error);
+        assert_eq!(info.mode, "isolated", "error: {:?}", info.error);
         assert_eq!(info.branch.as_deref(), Some("taime/claude_code-abc12345"));
         assert!(info.base_sha.is_some());
         let wt = Path::new(&info.worktree_path);
@@ -285,7 +285,7 @@ mod tests {
 
         // Idempotent: re-provisioning the same key reuses it.
         let again = provision(repo.to_str().unwrap(), "claude_code", true, "abc12345");
-        assert_eq!(again.mode, "worktree");
+        assert_eq!(again.mode, "isolated");
         assert_eq!(again.worktree_path, info.worktree_path);
 
         // Cleanup.
@@ -301,7 +301,7 @@ mod tests {
 
         // Clean + unforked → removed (checkout AND branch).
         let a = provision(root, "claude_code", true, "gcaaaaaa");
-        assert_eq!(a.mode, "worktree");
+        assert_eq!(a.mode, "isolated");
         assert_eq!(
             gc_one(&a.worktree_path, root, a.branch.as_deref(), a.base_sha.as_deref()),
             GcOutcome::Removed

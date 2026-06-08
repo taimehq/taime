@@ -217,6 +217,15 @@ impl DaemonClient {
         Err("replacement daemon did not come up".into())
     }
 
+    /// Connect-only liveness probe: true iff a live, protocol-compatible daemon
+    /// answered the handshake. NEVER spawns (or replaces) a daemon — a pure
+    /// probe, so the frontend can tell "daemon answered" from "fallback used"
+    /// (`query()` returns its JSON fallback when no daemon is connectable,
+    /// which otherwise masks a dead daemon).
+    pub async fn ping(&self) -> bool {
+        self.connect_once().await.is_ok()
+    }
+
     /// Provision (or resolve) an isolated git worktree for an agent (Phase 3):
     /// the daemon mints the attribution key, runs `git worktree`, persists the
     /// row, and returns the worktree info (or shared-mode fallback).

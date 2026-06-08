@@ -8,15 +8,7 @@ import {
 } from "../api";
 import { useStore } from "../store";
 import { basename } from "../lib/recentProjects";
-
-/** Provider display names (the daemon's 4 CLIs). */
-const PROVIDER_LABELS: Record<string, string> = {
-  claude_code: "Claude Code",
-  codex: "Codex CLI",
-  gemini_cli: "Gemini CLI",
-  grok_cli: "Grok Build CLI",
-};
-const PROVIDER_ORDER = ["claude_code", "codex", "gemini_cli", "grok_cli"];
+import { providerTitle, PROVIDER_ORDER } from "../lib/providerLabel";
 
 /** One-tap cron presets surfaced as chips under the schedule input. */
 const CRON_PRESETS: { label: string; value: string }[] = [
@@ -187,9 +179,9 @@ export function AddScheduleDialog({
           })}
         </div>
 
-        {/* Role / profile */}
+        {/* Profile */}
         <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">
-          Role / profile
+          Profile
         </label>
         <select
           value={profile}
@@ -216,7 +208,7 @@ export function AddScheduleDialog({
           {providers.length === 0 && <option value="">No installed CLIs</option>}
           {providers.map((p) => (
             <option key={p.name} value={p.name}>
-              {PROVIDER_LABELS[p.name] ?? p.name}
+              {providerTitle(p.name)}
             </option>
           ))}
         </select>
@@ -301,7 +293,7 @@ export function AddScheduleDialog({
           <button
             onClick={submit}
             disabled={!canSubmit}
-            className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-primary-hover disabled:opacity-50"
+            className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:opacity-50"
           >
             {busy ? "Saving…" : "Create"}
           </button>

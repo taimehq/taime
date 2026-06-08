@@ -1,3 +1,21 @@
+/* Self-hosted Geist variable fonts (also preloaded in index.html). */
+@font-face {
+  font-family: "Geist";
+  src: url("./assets/fonts/Geist-VariableFont_wght.ttf")
+    format("truetype-variations");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url("./assets/fonts/GeistMono-VariableFont_wght.ttf")
+    format("truetype-variations");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -14,11 +32,61 @@ body,
 
 body {
   margin: 0;
-  background: #0a0a0a;
-  color: #ededed;
+  background: #08090c;
+  color: #c8c7c2;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   user-select: none;
+}
+
+/* Keyboard focus — single accent ring everywhere. */
+:focus-visible {
+  outline: 2px solid #5b8def;
+  outline-offset: 1px;
+}
+
+::selection {
+  background: rgba(91, 141, 239, 0.25);
+}
+
+/* macOS-style ghost scrollbars: invisible at rest, faint thumb while the
+   scroll container is hovered. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Live numbers (clocks, counters, diff stats) — no width jitter. Kept outside
+   @layer utilities so it always ships (layered customs are tree-shaken). */
+.tnum {
+  font-variant-numeric: tabular-nums;
 }
 
 /* Let the window be dragged by the title strip. */

@@ -2,7 +2,9 @@
  * Pure-logic tests for the Zustand store (src/store.ts).
  *
  * All side-effecting imports are mocked so importing the store is hermetic:
- *  - ./api and ./pty transitively import @tauri-apps/api (invoke/Channel);
+ *  - ./api, ./pty, and ./lib/terminalInput transitively import @tauri-apps/api
+ *    (invoke/Channel);
+ *  - ./backend so tests control inTauri() (the fetchAgents gate);
  *  - ./lib/recentProjects and ./lib/preferences read localStorage at module
  *    init (the store seeds workspaceDir/font size/sidebar from them).
  * ./lib/providerLabel is a pure lookup table and is left real.
@@ -12,10 +14,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 vi.mock("./api", () => ({
   api: {
     provisionWorktree: vi.fn(),
-    listSessions: vi.fn(async () => []),
-    getSession: vi.fn(),
-    deleteSession: vi.fn(async () => ({ success: true, deleted: [], errors: [] })),
-    getTerminalStatus: vi.fn(async () => null),
+    listAgents: vi.fn(async () => []),
     clearDaemonDirty: vi.fn(async () => true),
   },
 }));
@@ -24,6 +23,16 @@ vi.mock("./pty", () => ({
   daemonSpawnAgent: vi.fn(),
   daemonKill: vi.fn(async () => {}),
   daemonCloseView: vi.fn(async () => {}),
+  daemonPing: vi.fn(async () => false),
+  daemonCheckpoint: vi.fn(async () => {}),
+}));
+
+vi.mock("./backend", () => ({
+  inTauri: vi.fn(() => false),
+}));
+
+vi.mock("./lib/terminalInput", () => ({
+  sendToTerminal: vi.fn(() => false),
 }));
 
 vi.mock("./lib/recentProjects", () => ({
@@ -46,12 +55,30 @@ vi.mock("./lib/preferences", () => ({
   saveSidebarCollapsed: vi.fn(),
 }));
 
-import { useStore, type Frame, type RustPtyMeta } from "./store";
+import {
+  useStore,
+  unreadCount,
+  termModeFor,
+  type Frame,
+  type RustPtyMeta,
+} from "./store";
 import { api, type WorktreeInfo } from "./api";
-import { daemonSpawnAgent, type DaemonSessionSummary } from "./pty";
+import {
+  daemonSpawnAgent,
+  daemonPing,
+  daemonCheckpoint,
+  type DaemonSessionSummary,
+} from "./pty";
+import { inTauri } from "./backend";
+import { sendToTerminal } from "./lib/terminalInput";
 
 const provisionWorktree = vi.mocked(api.provisionWorktree);
+const listAgents = vi.mocked(api.listAgents);
 const spawnAgent = vi.mocked(daemonSpawnAgent);
+const ping = vi.mocked(daemonPing);
+const checkpoint = vi.mocked(daemonCheckpoint);
+const inTauriMock = vi.mocked(inTauri);
+const sendToTerminalMock = vi.mocked(sendToTerminal);
 
 // Full pristine snapshot taken once at import time; restored before each test
 // (replace: true wipes any keys a test added).
@@ -60,6 +87,11 @@ const initialState = useStore.getState();
 beforeEach(() => {
   useStore.setState(initialState, true);
   vi.clearAllMocks();
+  // Re-seed defaults (clearAllMocks keeps overridden return values).
+  inTauriMock.mockReturnValue(false);
+  ping.mockResolvedValue(false);
+  listAgents.mockResolvedValue([]);
+  sendToTerminalMock.mockReturnValue(false);
   // launchAgentDaemon logs the real error on failure; keep test output quiet.
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -76,10 +108,10 @@ function makeSummary(over: Partial<DaemonSessionSummary> = {}): DaemonSessionSum
     rows: 24,
     cols: 80,
     created_at_unix: 1700000000,
-    attribution_key: "term-1",
+    agent_id: "term-1",
     provider: "claude_code",
     status: null,
-    protocol_version: 9,
+    protocol_version: 10,
     task_id: "task-1",
     ...over,
   };
@@ -106,7 +138,6 @@ function makeFrame(over: Partial<Frame> = {}): Frame {
     terminalId: "term-1",
     provider: "claude_code",
     agentProfile: null,
-    sessionName: null,
     pending: false,
     transport: "daemon",
     ptySessionId: "sess-1",
@@ -116,8 +147,8 @@ function makeFrame(over: Partial<Frame> = {}): Frame {
 
 function makeWorktree(over: Partial<WorktreeInfo> = {}): WorktreeInfo {
   return {
-    terminal_id: "term-new",
-    mode: "worktree",
+    agent_id: "term-new",
+    mode: "isolated",
     worktree_path: "/proj/.taime/wt/term-new",
     project_root: "/proj",
     repo_root: "/proj",
@@ -138,7 +169,7 @@ describe("adoptDaemonSession", () => {
     const meta = useStore.getState().rustPtySessions["sess-1"];
     expect(meta).toBeDefined();
     expect(meta.ptySessionId).toBe("sess-1");
-    expect(meta.terminalId).toBe("term-1"); // from attribution_key
+    expect(meta.terminalId).toBe("term-1"); // from agent_id
     expect(meta.status).toBe("running"); // alive: true
     expect(meta.taskId).toBe("task-1"); // from task_id
     expect(meta.provider).toBe("claude_code");
@@ -152,7 +183,7 @@ describe("adoptDaemonSession", () => {
       makeSummary({
         id: "sess-2",
         alive: false,
-        attribution_key: null,
+        agent_id: null,
         task_id: null,
         provider: null,
         program: "/opt/bin/codex",
@@ -160,7 +191,7 @@ describe("adoptDaemonSession", () => {
     );
     const meta = useStore.getState().rustPtySessions["sess-2"];
     expect(meta.status).toBe("exited");
-    expect(meta.terminalId).toBe(""); // attribution_key null → ""
+    expect(meta.terminalId).toBe(""); // agent_id null → ""
     expect(meta.taskId).toBeNull();
     expect(meta.provider).toBe("codex"); // inferred from program
   });
@@ -171,7 +202,7 @@ describe("adoptDaemonSession", () => {
     const before = useStore.getState();
 
     useStore.getState().adoptDaemonSession(
-      makeSummary({ attribution_key: "term-other", task_id: "task-other" }),
+      makeSummary({ agent_id: "term-other", task_id: "task-other" }),
     );
 
     const after = useStore.getState();
@@ -384,7 +415,7 @@ describe("launchAgentDaemon", () => {
 
   it("success: adds a daemon frame + registry entry and returns true", async () => {
     useStore.setState({ workspaceDir: "/proj" });
-    provisionWorktree.mockResolvedValueOnce(makeWorktree({ terminal_id: "term-new" }));
+    provisionWorktree.mockResolvedValueOnce(makeWorktree({ agent_id: "term-new" }));
     spawnAgent.mockResolvedValueOnce("sess-new");
 
     const ok = await useStore.getState().launchAgentDaemon("claude_code", "default", "task-9");
@@ -419,7 +450,7 @@ describe("launchAgentDaemon", () => {
       ],
       activeFrameKey: null,
     });
-    provisionWorktree.mockResolvedValueOnce(makeWorktree({ terminal_id: "term-race" }));
+    provisionWorktree.mockResolvedValueOnce(makeWorktree({ agent_id: "term-race" }));
     spawnAgent.mockResolvedValueOnce("sess-race");
 
     const ok = await useStore
@@ -449,7 +480,7 @@ describe("launchAgentDaemon", () => {
       "/proj/.taime/wt/term-new", // spawned in the provisioned worktree
       24,
       80,
-      "term-new", // attribution key = provisioned terminal id
+      "term-new", // agent id = provisioned worktree row id
       null,
       true, // orchestrate
       "orchestrator",
@@ -472,44 +503,499 @@ describe("launchAgentDaemon", () => {
   });
 });
 
-// ── openTaskReview / setGraphOpen mutual exclusivity ────────────────────────
+// ── launch dialog task preset / task-selection clear ────────────────────────
 
-describe("task review / graph drawer exclusivity", () => {
-  it("openTaskReview closes the graph drawer", () => {
-    useStore.getState().setGraphOpen(true);
-    expect(useStore.getState().graphOpen).toBe(true);
+describe("setLaunchOpen task preset", () => {
+  it("stores the preset on open and clears it on close", () => {
+    useStore.getState().setLaunchOpen(true, "task-9");
+    let s = useStore.getState();
+    expect(s.launchOpen).toBe(true);
+    expect(s.launchPresetTaskId).toBe("task-9");
 
-    useStore.getState().openTaskReview("task-1");
-
-    const s = useStore.getState();
-    expect(s.taskReviewId).toBe("task-1");
-    expect(s.graphOpen).toBe(false);
+    useStore.getState().setLaunchOpen(false);
+    s = useStore.getState();
+    expect(s.launchOpen).toBe(false);
+    expect(s.launchPresetTaskId).toBeNull();
   });
 
-  it("setGraphOpen(true) nulls the open task review", () => {
-    useStore.getState().openTaskReview("task-1");
-    expect(useStore.getState().taskReviewId).toBe("task-1");
+  it("open without a preset defaults to null (Uncategorized)", () => {
+    useStore.getState().setLaunchOpen(true, "task-9");
+    useStore.getState().setLaunchOpen(false);
+    useStore.getState().setLaunchOpen(true);
+    expect(useStore.getState().launchPresetTaskId).toBeNull();
+  });
+});
 
-    useStore.getState().setGraphOpen(true);
+describe("clearSelectedTask", () => {
+  it("clears the selection and any pending deep-link tab", () => {
+    useStore.getState().selectTask("task-1", "review");
+    expect(useStore.getState().selectedTaskId).toBe("task-1");
 
+    useStore.getState().clearSelectedTask();
     const s = useStore.getState();
-    expect(s.graphOpen).toBe(true);
-    expect(s.taskReviewId).toBeNull();
+    expect(s.selectedTaskId).toBeNull();
+    expect(s.taskInitialTab).toBeNull();
+    // The section is untouched — only the selection clears.
+    expect(s.section).toBe("tasks");
+  });
+});
+
+// ── section navigation (guard-gated) ────────────────────────────────────────
+
+/** An agents-section state with one dirty, unreviewed active frame. */
+function seedUnreviewedAgent() {
+  useStore.setState({
+    section: "agents",
+    frames: [makeFrame({ key: "f1", terminalId: "term-1" })],
+    activeFrameKey: "f1",
+    dirty: { "term-1": { count: 2, paths: ["a.ts", "b.ts"] } },
+    reviewedFrames: {},
+  });
+}
+
+describe("section navigation", () => {
+  it("defaults to dashboard with empty selections", () => {
+    const s = useStore.getState();
+    expect(s.section).toBe("dashboard");
+    expect(s.selectedTaskId).toBeNull();
+    expect(s.taskInitialTab).toBeNull();
+    expect(s.selectedWorkflow).toBeNull();
+    expect(s.selectedSchedule).toBeNull();
   });
 
-  it("setGraphOpen(false) does not touch an open task review", () => {
-    useStore.getState().openTaskReview("task-1");
-
-    useStore.getState().setGraphOpen(false);
-
-    const s = useStore.getState();
-    expect(s.graphOpen).toBe(false);
-    expect(s.taskReviewId).toBe("task-1");
+  it("setSection switches freely when no unreviewed work", () => {
+    useStore.getState().setSection("tasks");
+    expect(useStore.getState().section).toBe("tasks");
+    expect(useStore.getState().pendingSwitch).toBeNull();
   });
 
-  it("closeTaskReview clears only the review id", () => {
-    useStore.getState().openTaskReview("task-1");
-    useStore.getState().closeTaskReview();
-    expect(useStore.getState().taskReviewId).toBeNull();
+  it("per-section selection persists across section switches", () => {
+    useStore.getState().selectTask("task-1");
+    useStore.getState().setSelectedWorkflow("wf-1");
+    useStore.getState().setSelectedSchedule("sch-1");
+
+    useStore.getState().setSection("settings");
+    useStore.getState().setSection("tasks");
+
+    const s = useStore.getState();
+    expect(s.selectedTaskId).toBe("task-1");
+    expect(s.selectedWorkflow).toBe("wf-1");
+    expect(s.selectedSchedule).toBe("sch-1");
+  });
+
+  it("leaving agents with unreviewed work raises the guard instead of switching", () => {
+    seedUnreviewedAgent();
+
+    useStore.getState().setSection("dashboard");
+
+    const s = useStore.getState();
+    expect(s.section).toBe("agents"); // did NOT navigate
+    expect(s.pendingSwitch).toEqual({ kind: "section", section: "dashboard" });
+  });
+
+  it("ignores further navigation while the guard is open", () => {
+    seedUnreviewedAgent();
+    useStore.getState().setSection("dashboard");
+
+    useStore.getState().setSection("settings");
+    useStore.getState().selectTask("task-9");
+
+    const s = useStore.getState();
+    expect(s.pendingSwitch).toEqual({ kind: "section", section: "dashboard" }); // not retargeted
+    expect(s.section).toBe("agents");
+    expect(s.selectedTaskId).toBeNull();
+  });
+
+  it("resolveSwitch(true) applies the section and marks the agent reviewed by agent id", () => {
+    seedUnreviewedAgent();
+    useStore.getState().setSection("dashboard");
+
+    useStore.getState().resolveSwitch(true);
+
+    const s = useStore.getState();
+    expect(s.section).toBe("dashboard");
+    expect(s.pendingSwitch).toBeNull();
+    expect(s.reviewedFrames["term-1"]).toBe(true); // keyed by agent id, not frame key
+  });
+
+  it("resolveSwitch(false) cancels and stays", () => {
+    seedUnreviewedAgent();
+    useStore.getState().setSection("dashboard");
+
+    useStore.getState().resolveSwitch(false);
+
+    const s = useStore.getState();
+    expect(s.section).toBe("agents");
+    expect(s.pendingSwitch).toBeNull();
+    expect(s.reviewedFrames["term-1"]).toBeUndefined();
+  });
+
+  it("already-reviewed work (by agent id) does not raise the guard", () => {
+    seedUnreviewedAgent();
+    useStore.setState({ reviewedFrames: { "term-1": true } });
+
+    useStore.getState().setSection("dashboard");
+
+    expect(useStore.getState().section).toBe("dashboard");
+    expect(useStore.getState().pendingSwitch).toBeNull();
+  });
+
+  it("no guard when leaving a non-agents section, even with dirty work", () => {
+    seedUnreviewedAgent();
+    useStore.setState({ section: "dashboard" }); // already away from the agent
+
+    useStore.getState().setSection("settings");
+
+    expect(useStore.getState().section).toBe("settings");
+    expect(useStore.getState().pendingSwitch).toBeNull();
+  });
+
+  it("selectTask navigates to tasks with the deep-link tab when clean", () => {
+    useStore.getState().selectTask("task-1", "review");
+
+    const s = useStore.getState();
+    expect(s.section).toBe("tasks");
+    expect(s.selectedTaskId).toBe("task-1");
+    expect(s.taskInitialTab).toBe("review");
+
+    s.clearTaskInitialTab();
+    expect(useStore.getState().taskInitialTab).toBeNull();
+  });
+
+  it("selectTask is gated leaving agents; resolveSwitch(true) completes the deep link", () => {
+    seedUnreviewedAgent();
+
+    useStore.getState().selectTask("task-1", "review");
+
+    let s = useStore.getState();
+    expect(s.section).toBe("agents");
+    expect(s.selectedTaskId).toBeNull();
+    expect(s.pendingSwitch).toEqual({ kind: "task", taskId: "task-1", tab: "review" });
+
+    useStore.getState().resolveSwitch(true);
+
+    s = useStore.getState();
+    expect(s.section).toBe("tasks");
+    expect(s.selectedTaskId).toBe("task-1");
+    expect(s.taskInitialTab).toBe("review");
+    expect(s.reviewedFrames["term-1"]).toBe(true);
+  });
+
+  it("frame switches still guard (pendingSwitch kind frame) and honor agent-id review state", () => {
+    seedUnreviewedAgent();
+    useStore.setState({
+      frames: [
+        makeFrame({ key: "f1", terminalId: "term-1" }),
+        makeFrame({ key: "f2", terminalId: "term-2", ptySessionId: "sess-2" }),
+      ],
+    });
+
+    useStore.getState().setActiveFrameGuarded("f2");
+    expect(useStore.getState().pendingSwitch).toEqual({ kind: "frame", key: "f2" });
+    expect(useStore.getState().activeFrameKey).toBe("f1");
+
+    useStore.getState().resolveSwitch(true);
+    const s = useStore.getState();
+    expect(s.activeFrameKey).toBe("f2");
+    expect(s.reviewedFrames["term-1"]).toBe(true);
+  });
+});
+
+// ── notifications ───────────────────────────────────────────────────────────
+
+describe("notifications", () => {
+  it("first fs-dirty push notifies kind review; growth does not re-notify", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().markDaemonFsDirty("sess-1", ["a.ts"]);
+
+    let s = useStore.getState();
+    expect(s.notifications).toHaveLength(1);
+    const n = s.notifications[0];
+    expect(n.kind).toBe("review");
+    expect(n.agentId).toBe("term-1");
+    expect(n.taskId).toBe("task-1");
+    expect(n.text).toContain("Claude Code");
+    expect(n.read).toBe(false);
+
+    useStore.getState().markDaemonFsDirty("sess-1", ["a.ts", "b.ts"]);
+
+    s = useStore.getState();
+    expect(s.dirty["term-1"].count).toBe(2); // set still grows
+    expect(s.notifications).toHaveLength(1); // no second item
+  });
+
+  it("status push WAITING_USER_ANSWER notifies kind blocked, once per transition", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().setDaemonSessionStatus("sess-1", "WAITING_USER_ANSWER");
+    useStore.getState().setDaemonSessionStatus("sess-1", "WAITING_USER_ANSWER");
+
+    const s = useStore.getState();
+    expect(s.notifications).toHaveLength(1);
+    expect(s.notifications[0].kind).toBe("blocked");
+    expect(s.notifications[0].agentId).toBe("term-1");
+  });
+
+  it("poll-path setTerminalStatus dedupes against the push path (same status map)", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().setDaemonSessionStatus("sess-1", "WAITING_USER_ANSWER");
+    useStore.getState().setTerminalStatus("term-1", "WAITING_USER_ANSWER");
+
+    expect(useStore.getState().notifications).toHaveLength(1);
+  });
+
+  it("setTerminalStatus ERROR notifies kind error", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().setTerminalStatus("term-1", "ERROR");
+
+    const s = useStore.getState();
+    expect(s.notifications).toHaveLength(1);
+    expect(s.notifications[0].kind).toBe("error");
+  });
+
+  it("exit notifies kind exited exactly once (idempotent with the lifecycle flip)", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().markRustPtyExited("sess-1");
+    useStore.getState().markRustPtyExited("sess-1"); // no-op
+
+    const s = useStore.getState();
+    expect(s.notifications).toHaveLength(1);
+    expect(s.notifications[0].kind).toBe("exited");
+    expect(s.notifications[0].text).toContain("exited");
+  });
+
+  it("caps at 200, evicting oldest first (FIFO)", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+    for (let i = 0; i < 205; i++) {
+      // Alternate to force a real transition (and thus a push) every call.
+      useStore
+        .getState()
+        .setTerminalStatus("term-1", i % 2 === 0 ? "WAITING_USER_ANSWER" : "ERROR");
+    }
+    const s = useStore.getState();
+    expect(s.notifications).toHaveLength(200);
+    // Oldest were evicted: the newest item is the 205th push.
+    expect(s.notifications[199].kind).toBe("blocked"); // i=204 is even → blocked
+  });
+
+  it("markRead marks one item; unknown id is an identity no-op", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+    useStore.getState().setTerminalStatus("term-1", "ERROR");
+    useStore.getState().markRustPtyExited("sess-1");
+    const [first, second] = useStore.getState().notifications;
+    expect(unreadCount(useStore.getState())).toBe(2);
+
+    useStore.getState().markRead(first.id);
+
+    let s = useStore.getState();
+    expect(s.notifications.find((n) => n.id === first.id)?.read).toBe(true);
+    expect(s.notifications.find((n) => n.id === second.id)?.read).toBe(false);
+    expect(unreadCount(s)).toBe(1);
+
+    const before = useStore.getState();
+    useStore.getState().markRead("nope");
+    useStore.getState().markRead(first.id); // already read
+    expect(useStore.getState()).toBe(before);
+  });
+
+  it("markAllRead clears the unread count; second call is an identity no-op", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+    useStore.getState().setTerminalStatus("term-1", "ERROR");
+    useStore.getState().markRustPtyExited("sess-1");
+
+    useStore.getState().markAllRead();
+
+    const after = useStore.getState();
+    expect(unreadCount(after)).toBe(0);
+    expect(after.notifications.every((n) => n.read)).toBe(true);
+
+    useStore.getState().markAllRead();
+    expect(useStore.getState()).toBe(after);
+  });
+});
+
+// ── termModes ───────────────────────────────────────────────────────────────
+
+describe("termModes", () => {
+  it("defaults to terminal for any agent", () => {
+    expect(termModeFor(useStore.getState(), "agent-x")).toBe("terminal");
+    expect(termModeFor(useStore.getState(), null)).toBe("terminal");
+  });
+
+  it("setTermMode records the per-agent mode", () => {
+    useStore.getState().setTermMode("agent-x", "console");
+
+    const s = useStore.getState();
+    expect(s.termModes["agent-x"]).toBe("console");
+    expect(termModeFor(s, "agent-x")).toBe("console");
+    expect(termModeFor(s, "agent-y")).toBe("terminal"); // others unaffected
+  });
+
+  it("setting the current mode is an identity no-op", () => {
+    useStore.getState().setTermMode("agent-x", "console");
+    const before = useStore.getState();
+
+    useStore.getState().setTermMode("agent-x", "console");
+    useStore.getState().setTermMode("agent-y", "terminal"); // already the default
+
+    expect(useStore.getState()).toBe(before);
+  });
+});
+
+// ── fetchAgents connectivity (daemon_ping is the one source) ────────────────
+
+describe("fetchAgents connectivity", () => {
+  it("outside Tauri: never probes, never claims reachability", async () => {
+    await useStore.getState().fetchAgents();
+
+    expect(useStore.getState().connected).toBe(false);
+    expect(ping).not.toHaveBeenCalled();
+    expect(listAgents).not.toHaveBeenCalled();
+  });
+
+  it("in Tauri with a live daemon: connected = ping result, roster updates", async () => {
+    inTauriMock.mockReturnValue(true);
+    ping.mockResolvedValue(true);
+    listAgents.mockResolvedValue([{ agent_id: "a1", status: "IDLE" }]);
+
+    await useStore.getState().fetchAgents();
+
+    const s = useStore.getState();
+    expect(s.connected).toBe(true);
+    expect(s.agents).toEqual([{ agent_id: "a1", status: "IDLE" }]);
+  });
+
+  it("in Tauri with a dead daemon: ping=false wins — a resolved listAgents fallback can't claim connectivity", async () => {
+    inTauriMock.mockReturnValue(true);
+    ping.mockResolvedValue(false);
+    listAgents.mockResolvedValue([]); // the daemon-dead fallback shape
+    useStore.setState({ connected: true, agents: [{ agent_id: "a1" }] });
+
+    await useStore.getState().fetchAgents();
+
+    const s = useStore.getState();
+    expect(s.connected).toBe(false);
+    expect(s.agents).toEqual([{ agent_id: "a1" }]); // last real roster kept
+    expect(listAgents).not.toHaveBeenCalled(); // fallback never consulted
+  });
+
+  it("recovers: a later successful ping flips connected back on", async () => {
+    inTauriMock.mockReturnValue(true);
+    ping.mockResolvedValue(false);
+    await useStore.getState().fetchAgents();
+    expect(useStore.getState().connected).toBe(false);
+
+    ping.mockResolvedValue(true);
+    await useStore.getState().fetchAgents();
+    expect(useStore.getState().connected).toBe(true);
+  });
+});
+
+// ── one-shot assignment delivery ────────────────────────────────────────────
+
+describe("assignment delivery", () => {
+  /** Launch term-new/sess-new with an assignment (the dialog path). */
+  async function launchWithAssignment(assignment: string | null = "Fix the flaky test") {
+    useStore.setState({ workspaceDir: "/proj" });
+    provisionWorktree.mockResolvedValueOnce(makeWorktree({ agent_id: "term-new" }));
+    spawnAgent.mockResolvedValueOnce("sess-new");
+    await useStore
+      .getState()
+      .launchAgentDaemon("claude_code", "default", null, null, assignment);
+  }
+
+  it("launch stamps pendingAssignments keyed by the minted agent id (trimmed)", async () => {
+    await launchWithAssignment("  Fix the flaky test  ");
+    expect(useStore.getState().pendingAssignments).toEqual({
+      "term-new": "Fix the flaky test",
+    });
+  });
+
+  it("launch without an assignment (or blank) stamps nothing", async () => {
+    await launchWithAssignment(null);
+    expect(useStore.getState().pendingAssignments).toEqual({});
+
+    await launchWithAssignment("   ");
+    expect(useStore.getState().pendingAssignments).toEqual({});
+  });
+
+  it("IDLE before the view attaches keeps the entry pending (writer not registered)", async () => {
+    await launchWithAssignment();
+    sendToTerminalMock.mockReturnValue(false); // no writer yet
+
+    useStore.getState().setDaemonSessionStatus("sess-new", "IDLE");
+
+    expect(sendToTerminalMock).toHaveBeenCalledWith("sess-new", "Fix the flaky test");
+    expect(useStore.getState().pendingAssignments["term-new"]).toBe(
+      "Fix the flaky test",
+    ); // retained for the next IDLE report
+  });
+
+  it("first IDLE with the view attached writes the text, clears the entry, then submits + checkpoints", async () => {
+    vi.useFakeTimers();
+    try {
+      await launchWithAssignment();
+      sendToTerminalMock.mockReturnValue(true);
+
+      useStore.getState().setDaemonSessionStatus("sess-new", "IDLE");
+
+      expect(sendToTerminalMock).toHaveBeenCalledWith("sess-new", "Fix the flaky test");
+      expect(useStore.getState().pendingAssignments).toEqual({}); // one-shot: cleared
+
+      vi.advanceTimersByTime(150); // the delayed submit write
+      expect(sendToTerminalMock).toHaveBeenLastCalledWith("sess-new", "\r");
+      expect(checkpoint).toHaveBeenCalledWith("sess-new", "submit");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("delivers at most once: a later IDLE round-trip does not re-send", async () => {
+    vi.useFakeTimers();
+    try {
+      await launchWithAssignment();
+      sendToTerminalMock.mockReturnValue(true);
+      useStore.getState().setDaemonSessionStatus("sess-new", "IDLE");
+      vi.advanceTimersByTime(150);
+      const callsAfterFirst = sendToTerminalMock.mock.calls.length;
+
+      useStore.getState().setDaemonSessionStatus("sess-new", "PROCESSING");
+      useStore.getState().setDaemonSessionStatus("sess-new", "IDLE");
+      vi.advanceTimersByTime(150);
+
+      expect(sendToTerminalMock.mock.calls.length).toBe(callsAfterFirst);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("poll-path setTerminalStatus IDLE delivers too (the reconcile-tick retry)", async () => {
+    vi.useFakeTimers();
+    try {
+      await launchWithAssignment();
+      sendToTerminalMock.mockReturnValue(true);
+
+      useStore.getState().setTerminalStatus("term-new", "IDLE");
+
+      expect(sendToTerminalMock).toHaveBeenCalledWith("sess-new", "Fix the flaky test");
+      expect(useStore.getState().pendingAssignments).toEqual({});
+      vi.advanceTimersByTime(150); // flush the submit timer inside fake time
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("adopted (pre-existing) agents never receive a delivery", () => {
+    useStore.getState().adoptDaemonSession(makeSummary());
+    sendToTerminalMock.mockReturnValue(true);
+
+    useStore.getState().setDaemonSessionStatus("sess-1", "IDLE");
+    useStore.getState().setTerminalStatus("term-1", "IDLE");
+
+    expect(sendToTerminalMock).not.toHaveBeenCalled();
   });
 });

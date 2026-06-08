@@ -9,9 +9,9 @@
 //!   "entry": "implement",
 //!   "max_iterations": 20,
 //!   "nodes": [
-//!     { "id": "implement", "role": "feature-builder", "prompt": "Implement X." },
-//!     { "id": "test", "role": "default", "prompt": "Run the tests; reply PASS or FAIL." },
-//!     { "id": "review", "role": "security-reviewer", "prompt": "Review the change." }
+//!     { "id": "implement", "profile": "feature-builder", "prompt": "Implement X." },
+//!     { "id": "test", "profile": "default", "prompt": "Run the tests; reply PASS or FAIL." },
+//!     { "id": "review", "profile": "security-reviewer", "prompt": "Review the change." }
 //!   ],
 //!   "edges": [
 //!     { "from": "implement", "to": "test", "when": "always" },
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 fn default_max_iter() -> u32 {
     20
 }
-fn default_role() -> String {
+fn default_profile() -> String {
     "default".to_string()
 }
 fn default_when() -> String {
@@ -38,8 +38,11 @@ fn default_when() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowNode {
     pub id: String,
-    #[serde(default = "default_role")]
-    pub role: String,
+    /// The Profile the step's worker launches under. Canonical JSON key
+    /// `profile`; `role` is accepted forever as a legacy alias. Serializes only
+    /// as `profile`.
+    #[serde(default = "default_profile", alias = "role")]
+    pub profile: String,
     pub prompt: String,
     #[serde(default)]
     pub output_key: Option<String>,
@@ -168,7 +171,7 @@ mod tests {
     const SAMPLE: &str = r#"{
         "name": "build-feature", "entry": "implement", "max_iterations": 10,
         "nodes": [
-            {"id":"implement","role":"feature-builder","prompt":"do it"},
+            {"id":"implement","profile":"feature-builder","prompt":"do it"},
             {"id":"test","prompt":"reply PASS or FAIL"}
         ],
         "edges": [
@@ -182,8 +185,22 @@ mod tests {
         let def = parse_workflow(SAMPLE).unwrap();
         assert_eq!(def.entry, "implement");
         assert_eq!(def.nodes.len(), 2);
-        assert_eq!(def.node("test").unwrap().role, "default"); // defaulted
+        assert_eq!(def.node("implement").unwrap().profile, "feature-builder");
+        assert_eq!(def.node("test").unwrap().profile, "default"); // defaulted
         assert_eq!(def.node("test").unwrap().output_key(), "test");
+    }
+
+    #[test]
+    fn legacy_role_key_still_parses_and_reserializes_as_profile() {
+        // `role` is accepted forever as an alias of the canonical `profile`...
+        let legacy = r#"{"name":"x","entry":"a","nodes":[{"id":"a","role":"bug-fixer","prompt":"p"}],"edges":[]}"#;
+        let def = parse_workflow(legacy).unwrap();
+        assert_eq!(def.node("a").unwrap().profile, "bug-fixer");
+
+        // ...but the serializer emits only the new spelling.
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(json.contains("\"profile\":\"bug-fixer\""));
+        assert!(!json.contains("\"role\""));
     }
 
     #[test]

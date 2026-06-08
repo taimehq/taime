@@ -55,9 +55,14 @@ pub const MAGIC: u32 = 0x7461_696d;
 ///     `TurnInfo.fs_dirty_paths` populated (Phase 6 daemon fs-watch).
 /// v9: Tasks — `ProvisionWorktree.task_id` + `SessionSummary.task_id`
 ///     (workspace-scoped Task membership; attribution stays Agent-ID anchored).
+/// v10: the Agent-ID rename wave — `attribution_key`/`terminal_key` struct
+///     fields become `agent_id` (postcard is positional, so the field renames
+///     are wire-neutral; the bump covers the query-surface renames: `sessions`
+///     → `agents`, `session_detail` deleted, worktree mode `worktree` →
+///     `isolated`, JSON keys `terminal_id`/`agent_key` → `agent_id`).
 /// Postcard is positional, so these are wire-layout changes — a stale older
 /// daemon is rejected at handshake and the app falls back rather than misparsing.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// Feature flags negotiated in the handshake (`capabilities` bitset). Reserving
 /// the bits now keeps app-update-while-old-daemon-running safe.
@@ -110,14 +115,15 @@ pub struct SpawnSpec {
     pub env: Vec<(String, String)>,
     pub rows: u16,
     pub cols: u16,
-    /// Opaque attribution key the app ties to dirty/diff/graph (the worktree
-    /// terminal id). The daemon stores + echoes it; it does not interpret it.
-    pub attribution_key: Option<String>,
+    /// The Agent ID — the stable identity the app ties to dirty/diff/graph
+    /// (minted at worktree provision). The daemon stores + echoes it; it does
+    /// not interpret it.
+    pub agent_id: Option<String>,
 }
 
 /// One MCP server entry the daemon should register for an agent at spawn (the
 /// per-provider injection of Phase 1). Mirrors CAO's `profile.mcpServers[name]`:
-/// the daemon stamps each server's `env` with `CAO_TERMINAL_ID = attribution_key`
+/// the daemon stamps each server's `env` with `CAO_TERMINAL_ID = agent_id`
 /// before injecting it per the provider's strategy (inline `--mcp-config` JSON,
 /// codex `-c mcp_servers.*` overrides, or `~/.gemini/settings.json` merge). In
 /// Phase 1 these come straight from the CAO profile ("wired to CAO's MCP for
@@ -162,7 +168,7 @@ pub struct AgentProfile {
 /// High-level "launch agent X" request (the Phase-1 generalization of the
 /// Claude-only `SpawnSpec`). The daemon's provider **registry** turns this into
 /// the concrete PTY command + MCP injection — the recipe lives daemon-side so
-/// Phase-5 headless `assign` can spawn workers without the app. `attribution_key`
+/// Phase-5 headless `assign` can spawn workers without the app. `agent_id`
 /// doubles as the `CAO_TERMINAL_ID` stamped into MCP server envs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpawnSpec {
@@ -172,7 +178,7 @@ pub struct AgentSpawnSpec {
     pub cwd: Option<String>,
     pub rows: u16,
     pub cols: u16,
-    pub attribution_key: Option<String>,
+    pub agent_id: Option<String>,
     /// Optional first prompt to seed after the agent is ready (reserved; the app
     /// drives initial input today). Stored for Phase-5 `assign`/`handoff` seeding.
     pub seed_prompt: Option<String>,
@@ -188,18 +194,18 @@ pub struct AgentSpawnSpec {
 }
 
 /// Result of provisioning (or resolving) an isolated agent worktree — the
-/// daemon-owned port of CAO's `WorktreeInfo` (Phase 3). `terminal_key` is the
-/// attribution key (CAO terminal id); the app keys dirty/diff/graph on it.
+/// daemon-owned port of CAO's `WorktreeInfo` (Phase 3). `agent_id` is the Agent
+/// ID minted at provision; the app keys dirty/diff/graph on it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorktreeInfo {
-    pub terminal_key: String,
+    pub agent_id: String,
     pub project_root: String,
     pub repo_root: Option<String>,
     pub worktree_path: String,
     pub branch: Option<String>,
     pub base_sha: Option<String>,
-    /// `"worktree"` (isolated + provable attribution) or `"shared"` (fallback for
-    /// a non-git root / git failure — heuristic attribution).
+    /// `"isolated"` (own worktree + provable attribution) or `"shared"` (fallback
+    /// for a non-git root / git failure — heuristic attribution).
     pub mode: String,
     pub error: Option<String>,
 }
@@ -224,7 +230,7 @@ pub enum ClientMsg {
     /// the `Spawned` reply. This is the Phase-1 all-CLI spawn path.
     SpawnAgent { req_id: u64, spec: AgentSpawnSpec },
     /// Provision (or resolve) an isolated git worktree for an agent (Phase 3).
-    /// The daemon mints the attribution key, runs `git worktree`, persists the
+    /// The daemon mints the Agent ID, runs `git worktree`, persists the
     /// row, and replies `Worktree`. `isolate=false` (or a non-git root) ⇒ shared.
     /// `task_id` (v9) stamps Task membership onto the worktree row — the durable
     /// anchor of the Task partition (`None` ⇒ Uncategorized).
@@ -235,7 +241,7 @@ pub enum ClientMsg {
         isolate: bool,
         task_id: Option<String>,
     },
-    /// Enqueue an inbox message for `receiver` (the attribution key of a live
+    /// Enqueue an inbox message for `receiver` (the Agent ID of a live
     /// agent) — the Phase-5 message bus (ops/app entry; the agent-facing MCP
     /// `send_message` tool feeds the same inbox in-process). The daemon delivers
     /// it into the receiver's stdin when it next goes idle. Replies
@@ -251,9 +257,9 @@ pub enum ClientMsg {
     /// (Phase 6). Read from the durable store, so it's complete even UI-closed.
     GetGraph { req_id: u64 },
     /// Generic read/compute query RPC (Phase 6 route-layer migration): `kind` ∈
-    /// terminal_diff|file_diffs|hunked_diff|apply_selection|contention|sessions|
-    /// session_detail|worktree|attribution|graph; `args` is a JSON object. The
-    /// daemon replies `QueryResult` with a JSON string in the frontend's shape.
+    /// terminal_diff|file_diffs|hunked_diff|apply_selection|contention|agents|
+    /// worktree|attribution|graph; `args` is a JSON object. The daemon replies
+    /// `QueryResult` with a JSON string in the frontend's shape.
     Query { req_id: u64, kind: String, args: String },
     /// Enumerate sessions. `req_id` correlates the `Sessions` reply.
     List { req_id: u64 },
@@ -354,7 +360,7 @@ pub struct SessionSummary {
     pub rows: u16,
     pub cols: u16,
     pub created_at_unix: u64,
-    pub attribution_key: Option<String>,
+    pub agent_id: Option<String>,
     /// Provider id (`claude_code`/…) when spawned via the registry; `None` for a
     /// low-level spawn. Lets the app label/adopt without inferring from `program`.
     pub provider: Option<String>,
@@ -621,7 +627,7 @@ mod tests {
             cwd: Some("/tmp/wt".into()),
             rows: 40,
             cols: 120,
-            attribution_key: Some("term-abc".into()),
+            agent_id: Some("term-abc".into()),
             seed_prompt: None,
             env: vec![],
             inject_orchestration: false,
@@ -635,7 +641,7 @@ mod tests {
                     assert_eq!(spec.provider, "codex");
                     assert_eq!(spec.profile.model.as_deref(), Some("gpt-5"));
                     assert_eq!(spec.profile.mcp_servers.len(), 1);
-                    assert_eq!(spec.attribution_key.as_deref(), Some("term-abc"));
+                    assert_eq!(spec.agent_id.as_deref(), Some("term-abc"));
                 }
                 other => panic!("wrong msg {other:?}"),
             },
@@ -664,13 +670,13 @@ mod tests {
         }
 
         let info = WorktreeInfo {
-            terminal_key: "abc12345".into(),
+            agent_id: "abc12345".into(),
             project_root: "/p".into(),
             repo_root: Some("/p".into()),
             worktree_path: "/wt".into(),
             branch: Some("taime/claude_code-abc12345".into()),
             base_sha: Some("deadbeef".into()),
-            mode: "worktree".into(),
+            mode: "isolated".into(),
             error: None,
         };
         let reply = ServerMsg::Worktree { req_id: 3, info: info.clone() };
