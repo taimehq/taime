@@ -20,6 +20,7 @@ import { SettingsScreen } from "./screens/SettingsScreen";
 import { LaunchAgentDialog } from "./components/LaunchAgentDialog";
 import { NewTaskDialog } from "./components/NewTaskDialog";
 import { AddScheduleDialog } from "./components/AddScheduleDialog";
+import { NewWorkflowDialog } from "./components/NewWorkflowDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { Snackbar } from "./components/Snackbar";
 import { ContextSwitchGuard } from "./components/ContextSwitchGuard";
@@ -65,6 +66,8 @@ export default function App() {
   const setNewTaskOpen = useStore((s) => s.setNewTaskOpen);
   const newScheduleOpen = useStore((s) => s.newScheduleOpen);
   const setNewScheduleOpen = useStore((s) => s.setNewScheduleOpen);
+  const newWorkflowOpen = useStore((s) => s.newWorkflowOpen);
+  const setNewWorkflowOpen = useStore((s) => s.setNewWorkflowOpen);
   const connected = useStore((s) => s.connected);
   const openDiff = useStore((s) => s.openDiff);
   const section = useStore((s) => s.section);
@@ -121,6 +124,10 @@ export default function App() {
           onClose={() => setNewScheduleOpen(false)}
           onSaved={() => {}}
         />
+      )}
+      {newWorkflowOpen && (
+        // The 5s workflow polls (sidebar + screen) surface the new row.
+        <NewWorkflowDialog onClose={() => setNewWorkflowOpen(false)} />
       )}
       <CommandPalette />
       <ContextSwitchGuard onReview={openDiff} />

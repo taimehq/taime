@@ -593,6 +593,17 @@ impl Manager {
                 r#"{"ok":true}"#.to_string()
             }
             "workflows" => self.workflows_json(),
+            "workflow_create" => {
+                // App-authored workflow (source "user"): same validate+persist path
+                // as the MCP create_workflow tool. Validation failures are a
+                // structured ok:false (never a wire error) so the dialog can show
+                // the message inline.
+                let def = a.get("definition").and_then(|v| v.as_str()).unwrap_or("");
+                match self.create_workflow(def, "user") {
+                    Ok(name) => serde_json::json!({ "ok": true, "name": name }).to_string(),
+                    Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+                }
+            }
             "workflow_run" => {
                 let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let root = a.get("project_root").and_then(|v| v.as_str()).map(String::from);
@@ -2415,6 +2426,90 @@ mod tests {
     fn seeded_example_workflows_parse_and_validate() {
         crate::workflow::parse_workflow(EXAMPLE_FEATURE_REVIEW).expect("feature-with-review valid");
         crate::workflow::parse_workflow(EXAMPLE_FIX_VERIFY).expect("fix-and-verify valid");
+    }
+
+    #[test]
+    fn workflow_create_query_persists_and_lists_immediately() {
+        let mgr = mem_manager();
+        // Unique name: create_workflow also writes ~/.taime/workflows/<name>.json,
+        // so this must not collide with (or clobber) a real workflow.
+        let name = format!("taime-test-wf-create-{}", std::process::id());
+        let def = serde_json::json!({
+            "name": name,
+            "entry": "build",
+            "nodes": [
+                { "id": "build", "profile": "feature-builder", "prompt": "Implement X." },
+                { "id": "check", "prompt": "Run tests; reply PASS or FAIL." }
+            ],
+            "edges": [
+                { "from": "build", "to": "check", "when": "always" },
+                { "from": "check", "to": "build", "when": "keyword:FAIL" }
+            ]
+        });
+        let args = serde_json::json!({ "definition": def.to_string() }).to_string();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&mgr.query("workflow_create", &args)).unwrap();
+        assert_eq!(v["ok"], true, "create failed: {v}");
+        assert_eq!(v["name"], name.as_str());
+
+        // The new workflow shows in the same `workflows` query the panel reads,
+        // immediately and source-tagged "user" (DB row, not just the file).
+        let list: serde_json::Value = serde_json::from_str(&mgr.query("workflows", "{}")).unwrap();
+        let entry = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == name.as_str())
+            .expect("created workflow listed by the workflows query");
+        assert_eq!(entry["source"], "user");
+        assert_eq!(entry["entry"], "build");
+        assert_eq!(entry["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(entry["edges"].as_array().unwrap().len(), 2);
+
+        // Cleanup: removes both the store row and the ~/.taime/workflows file.
+        mgr.delete_workflow(&name).unwrap();
+        assert!(!Manager::workflows_dir().join(format!("{name}.json")).exists());
+    }
+
+    #[test]
+    fn workflow_create_query_rejects_invalid_definitions_without_creating() {
+        let mgr = mem_manager();
+        let create = |def: &str| -> serde_json::Value {
+            let args = serde_json::json!({ "definition": def }).to_string();
+            serde_json::from_str(&mgr.query("workflow_create", &args)).unwrap()
+        };
+
+        // A dangling edge target is a structured ok:false with the validation
+        // message — never a wire error.
+        let bad_target = r#"{"name":"taime-test-bad-target","entry":"a",
+            "nodes":[{"id":"a","prompt":"p"}],
+            "edges":[{"from":"a","to":"missing","when":"always"}]}"#;
+        let v = create(bad_target);
+        assert_eq!(v["ok"], false);
+        assert!(
+            v["error"].as_str().unwrap().contains("edge to unknown node 'missing'"),
+            "unexpected error: {v}"
+        );
+
+        // So is a bad `when` condition.
+        let bad_when = r#"{"name":"taime-test-bad-when","entry":"a",
+            "nodes":[{"id":"a","prompt":"p"}],
+            "edges":[{"from":"a","to":"a","when":"nope"}]}"#;
+        let v = create(bad_when);
+        assert_eq!(v["ok"], false);
+        assert!(
+            v["error"].as_str().unwrap().contains("unknown edge condition"),
+            "unexpected error: {v}"
+        );
+
+        // Nothing was created in either store: no DB rows...
+        let list: serde_json::Value = serde_json::from_str(&mgr.query("workflows", "{}")).unwrap();
+        assert!(list.as_array().unwrap().is_empty(), "rejected workflows must not persist");
+        // ...and no ~/.taime/workflows files (validation precedes the write).
+        for f in ["taime-test-bad-target.json", "taime-test-bad-when.json"] {
+            assert!(!Manager::workflows_dir().join(f).exists());
+        }
     }
 
     #[test]
