@@ -48,6 +48,9 @@ export interface ScheduleInfo {
    *  `task_id`, "per_run" = create a task per fire (explicit opt-in). */
   task_mode: "fixed" | "per_run" | string | null;
   task_id: string | null;
+  /** The markdown body fired as the agent's prompt. Daemon-serialized as
+   *  `prompt`; absent on older daemons — read tolerantly. */
+  prompt?: string | null;
 }
 
 /** Fields the Add-schedule dialog sends to create/replace a schedule. */

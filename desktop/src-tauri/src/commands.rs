@@ -58,6 +58,14 @@ pub fn workspace_info(path: String) -> WorkspaceInfo {
 use crate::daemon::DaemonClient;
 use taime_protocol::{AgentProfile, AgentSpawnSpec, SessionSummary, WorktreeInfo};
 
+/// Connect-only daemon liveness probe: true iff a live daemon answered the
+/// handshake. Never spawns one — distinguishes "daemon answered" from
+/// "fallback used" (`daemon_query` returns its fallback when no daemon is up).
+#[tauri::command]
+pub async fn daemon_ping(daemon: State<'_, DaemonClient>) -> Result<bool, String> {
+    Ok(daemon.ping().await)
+}
+
 /// Provision (or resolve) an isolated git worktree for a daemon agent (Phase 3) —
 /// the daemon-owned replacement for CAO's `/worktrees/provision`. Returns the
 /// worktree info (snake_case fields, incl. `agent_id` = the Agent ID).

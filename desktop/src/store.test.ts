@@ -2,7 +2,9 @@
  * Pure-logic tests for the Zustand store (src/store.ts).
  *
  * All side-effecting imports are mocked so importing the store is hermetic:
- *  - ./api and ./pty transitively import @tauri-apps/api (invoke/Channel);
+ *  - ./api, ./pty, and ./lib/terminalInput transitively import @tauri-apps/api
+ *    (invoke/Channel);
+ *  - ./backend so tests control inTauri() (the fetchAgents gate);
  *  - ./lib/recentProjects and ./lib/preferences read localStorage at module
  *    init (the store seeds workspaceDir/font size/sidebar from them).
  * ./lib/providerLabel is a pure lookup table and is left real.
@@ -21,6 +23,16 @@ vi.mock("./pty", () => ({
   daemonSpawnAgent: vi.fn(),
   daemonKill: vi.fn(async () => {}),
   daemonCloseView: vi.fn(async () => {}),
+  daemonPing: vi.fn(async () => false),
+  daemonCheckpoint: vi.fn(async () => {}),
+}));
+
+vi.mock("./backend", () => ({
+  inTauri: vi.fn(() => false),
+}));
+
+vi.mock("./lib/terminalInput", () => ({
+  sendToTerminal: vi.fn(() => false),
 }));
 
 vi.mock("./lib/recentProjects", () => ({
@@ -51,10 +63,22 @@ import {
   type RustPtyMeta,
 } from "./store";
 import { api, type WorktreeInfo } from "./api";
-import { daemonSpawnAgent, type DaemonSessionSummary } from "./pty";
+import {
+  daemonSpawnAgent,
+  daemonPing,
+  daemonCheckpoint,
+  type DaemonSessionSummary,
+} from "./pty";
+import { inTauri } from "./backend";
+import { sendToTerminal } from "./lib/terminalInput";
 
 const provisionWorktree = vi.mocked(api.provisionWorktree);
+const listAgents = vi.mocked(api.listAgents);
 const spawnAgent = vi.mocked(daemonSpawnAgent);
+const ping = vi.mocked(daemonPing);
+const checkpoint = vi.mocked(daemonCheckpoint);
+const inTauriMock = vi.mocked(inTauri);
+const sendToTerminalMock = vi.mocked(sendToTerminal);
 
 // Full pristine snapshot taken once at import time; restored before each test
 // (replace: true wipes any keys a test added).
@@ -63,6 +87,11 @@ const initialState = useStore.getState();
 beforeEach(() => {
   useStore.setState(initialState, true);
   vi.clearAllMocks();
+  // Re-seed defaults (clearAllMocks keeps overridden return values).
+  inTauriMock.mockReturnValue(false);
+  ping.mockResolvedValue(false);
+  listAgents.mockResolvedValue([]);
+  sendToTerminalMock.mockReturnValue(false);
   // launchAgentDaemon logs the real error on failure; keep test output quiet.
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -814,5 +843,159 @@ describe("termModes", () => {
     useStore.getState().setTermMode("agent-y", "terminal"); // already the default
 
     expect(useStore.getState()).toBe(before);
+  });
+});
+
+// ── fetchAgents connectivity (daemon_ping is the one source) ────────────────
+
+describe("fetchAgents connectivity", () => {
+  it("outside Tauri: never probes, never claims reachability", async () => {
+    await useStore.getState().fetchAgents();
+
+    expect(useStore.getState().connected).toBe(false);
+    expect(ping).not.toHaveBeenCalled();
+    expect(listAgents).not.toHaveBeenCalled();
+  });
+
+  it("in Tauri with a live daemon: connected = ping result, roster updates", async () => {
+    inTauriMock.mockReturnValue(true);
+    ping.mockResolvedValue(true);
+    listAgents.mockResolvedValue([{ agent_id: "a1", status: "IDLE" }]);
+
+    await useStore.getState().fetchAgents();
+
+    const s = useStore.getState();
+    expect(s.connected).toBe(true);
+    expect(s.agents).toEqual([{ agent_id: "a1", status: "IDLE" }]);
+  });
+
+  it("in Tauri with a dead daemon: ping=false wins — a resolved listAgents fallback can't claim connectivity", async () => {
+    inTauriMock.mockReturnValue(true);
+    ping.mockResolvedValue(false);
+    listAgents.mockResolvedValue([]); // the daemon-dead fallback shape
+    useStore.setState({ connected: true, agents: [{ agent_id: "a1" }] });
+
+    await useStore.getState().fetchAgents();
+
+    const s = useStore.getState();
+    expect(s.connected).toBe(false);
+    expect(s.agents).toEqual([{ agent_id: "a1" }]); // last real roster kept
+    expect(listAgents).not.toHaveBeenCalled(); // fallback never consulted
+  });
+
+  it("recovers: a later successful ping flips connected back on", async () => {
+    inTauriMock.mockReturnValue(true);
+    ping.mockResolvedValue(false);
+    await useStore.getState().fetchAgents();
+    expect(useStore.getState().connected).toBe(false);
+
+    ping.mockResolvedValue(true);
+    await useStore.getState().fetchAgents();
+    expect(useStore.getState().connected).toBe(true);
+  });
+});
+
+// ── one-shot assignment delivery ────────────────────────────────────────────
+
+describe("assignment delivery", () => {
+  /** Launch term-new/sess-new with an assignment (the dialog path). */
+  async function launchWithAssignment(assignment: string | null = "Fix the flaky test") {
+    useStore.setState({ workspaceDir: "/proj" });
+    provisionWorktree.mockResolvedValueOnce(makeWorktree({ agent_id: "term-new" }));
+    spawnAgent.mockResolvedValueOnce("sess-new");
+    await useStore
+      .getState()
+      .launchAgentDaemon("claude_code", "default", null, null, assignment);
+  }
+
+  it("launch stamps pendingAssignments keyed by the minted agent id (trimmed)", async () => {
+    await launchWithAssignment("  Fix the flaky test  ");
+    expect(useStore.getState().pendingAssignments).toEqual({
+      "term-new": "Fix the flaky test",
+    });
+  });
+
+  it("launch without an assignment (or blank) stamps nothing", async () => {
+    await launchWithAssignment(null);
+    expect(useStore.getState().pendingAssignments).toEqual({});
+
+    await launchWithAssignment("   ");
+    expect(useStore.getState().pendingAssignments).toEqual({});
+  });
+
+  it("IDLE before the view attaches keeps the entry pending (writer not registered)", async () => {
+    await launchWithAssignment();
+    sendToTerminalMock.mockReturnValue(false); // no writer yet
+
+    useStore.getState().setDaemonSessionStatus("sess-new", "IDLE");
+
+    expect(sendToTerminalMock).toHaveBeenCalledWith("sess-new", "Fix the flaky test");
+    expect(useStore.getState().pendingAssignments["term-new"]).toBe(
+      "Fix the flaky test",
+    ); // retained for the next IDLE report
+  });
+
+  it("first IDLE with the view attached writes the text, clears the entry, then submits + checkpoints", async () => {
+    vi.useFakeTimers();
+    try {
+      await launchWithAssignment();
+      sendToTerminalMock.mockReturnValue(true);
+
+      useStore.getState().setDaemonSessionStatus("sess-new", "IDLE");
+
+      expect(sendToTerminalMock).toHaveBeenCalledWith("sess-new", "Fix the flaky test");
+      expect(useStore.getState().pendingAssignments).toEqual({}); // one-shot: cleared
+
+      vi.advanceTimersByTime(150); // the delayed submit write
+      expect(sendToTerminalMock).toHaveBeenLastCalledWith("sess-new", "\r");
+      expect(checkpoint).toHaveBeenCalledWith("sess-new", "submit");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("delivers at most once: a later IDLE round-trip does not re-send", async () => {
+    vi.useFakeTimers();
+    try {
+      await launchWithAssignment();
+      sendToTerminalMock.mockReturnValue(true);
+      useStore.getState().setDaemonSessionStatus("sess-new", "IDLE");
+      vi.advanceTimersByTime(150);
+      const callsAfterFirst = sendToTerminalMock.mock.calls.length;
+
+      useStore.getState().setDaemonSessionStatus("sess-new", "PROCESSING");
+      useStore.getState().setDaemonSessionStatus("sess-new", "IDLE");
+      vi.advanceTimersByTime(150);
+
+      expect(sendToTerminalMock.mock.calls.length).toBe(callsAfterFirst);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("poll-path setTerminalStatus IDLE delivers too (the reconcile-tick retry)", async () => {
+    vi.useFakeTimers();
+    try {
+      await launchWithAssignment();
+      sendToTerminalMock.mockReturnValue(true);
+
+      useStore.getState().setTerminalStatus("term-new", "IDLE");
+
+      expect(sendToTerminalMock).toHaveBeenCalledWith("sess-new", "Fix the flaky test");
+      expect(useStore.getState().pendingAssignments).toEqual({});
+      vi.advanceTimersByTime(150); // flush the submit timer inside fake time
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("adopted (pre-existing) agents never receive a delivery", () => {
+    useStore.getState().adoptDaemonSession(makeSummary());
+    sendToTerminalMock.mockReturnValue(true);
+
+    useStore.getState().setDaemonSessionStatus("sess-1", "IDLE");
+    useStore.getState().setTerminalStatus("term-1", "IDLE");
+
+    expect(sendToTerminalMock).not.toHaveBeenCalled();
   });
 });

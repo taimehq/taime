@@ -25,6 +25,9 @@ import { AUTHOR_COLORS, authorName } from "../lib/attribution";
 
 const UNATTRIBUTED = "unattributed";
 
+const FOCUS_RING =
+  "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent";
+
 function langForPath(path: string): string {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   const map: Record<string, string> = {
@@ -378,7 +381,7 @@ export function DiffView() {
           <button
             disabled={busy || selectionCount === 0}
             onClick={() => apply("merge")}
-            className="flex items-center gap-1.5 rounded-lg bg-teal-600 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 disabled:opacity-40"
+            className={`flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
           >
             <GitMerge size={14} />
             Merge {selectionCount > 0 ? `${selectionCount}` : ""}
@@ -386,7 +389,7 @@ export function DiffView() {
           <button
             disabled={busy || selectionCount === 0}
             onClick={() => apply("revert")}
-            className="flex items-center gap-1.5 rounded-lg border border-rose-500/50 px-3 py-1.5 text-sm text-rose-300 hover:bg-rose-500/10 disabled:opacity-40"
+            className={`flex items-center gap-1.5 rounded-md border border-rose-500/50 px-3 py-1.5 text-sm text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
           >
             <Undo2 size={14} />
             Revert
@@ -394,14 +397,14 @@ export function DiffView() {
           <div className="mx-1 h-5 w-px bg-ink-600" />
           <button
             onClick={onMarkReviewed}
-            className="flex items-center gap-1.5 rounded-lg bg-emerald-600/90 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110"
+            className={`flex items-center gap-1.5 rounded-md bg-emerald-600/90 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 ${FOCUS_RING}`}
           >
             <Check size={14} />
             Mark reviewed
           </button>
           <button
             onClick={closeDiff}
-            className="rounded-lg p-1.5 text-zinc-400 hover:bg-ink-600 hover:text-zinc-200"
+            className={`rounded-md p-1.5 text-zinc-400 hover:bg-ink-600 hover:text-zinc-200 ${FOCUS_RING}`}
             aria-label="Close diff"
           >
             <X size={18} />
@@ -462,7 +465,7 @@ export function DiffView() {
                 </p>
                 <button
                   onClick={onMarkReviewed}
-                  className="mt-4 flex items-center gap-1.5 rounded-lg border border-ink-500 px-3 py-1.5 text-[12px] text-zinc-300 hover:bg-ink-700 hover:text-zinc-100"
+                  className={`mt-4 flex items-center gap-1.5 rounded-md border border-ink-500 px-3 py-1.5 text-[12px] text-zinc-300 hover:bg-ink-700 hover:text-zinc-100 ${FOCUS_RING}`}
                 >
                   <Check size={13} />
                   Mark reviewed

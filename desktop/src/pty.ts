@@ -177,6 +177,19 @@ export async function daemonSendMessage(
   return invoke<number>("daemon_send_message", { sender, receiver, message });
 }
 
+/** Liveness probe: true iff a live daemon actually answered (connect-only —
+ *  NEVER spawns a daemon). The one connectivity source: `daemon_query` serves
+ *  well-typed fallbacks when the daemon is dead, so a resolved query proves
+ *  nothing — this distinguishes "daemon answered" from "fallback used". */
+export async function daemonPing(): Promise<boolean> {
+  if (!inTauri()) return false;
+  try {
+    return await invoke<boolean>("daemon_ping");
+  } catch {
+    return false;
+  }
+}
+
 export async function daemonWrite(sessionId: string, data: string): Promise<void> {
   if (!inTauri()) return;
   try {

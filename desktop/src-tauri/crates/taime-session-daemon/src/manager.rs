@@ -1467,6 +1467,9 @@ impl Manager {
                     "workspace_root": r.workspace_root,
                     "task_mode": r.task_mode,
                     "task_id": r.task_id,
+                    // The stored prompt body (the .md body for file schedules,
+                    // inline for app-created ones) — the detail surface shows it.
+                    "prompt": r.prompt,
                 })
             })
             .collect();
@@ -2360,6 +2363,38 @@ mod tests {
         assert_eq!(v["branch"], "taime/a");
         assert_eq!(v["mode"], "isolated");
         assert_eq!(v["project_root"], "/proj");
+    }
+
+    #[test]
+    fn schedules_query_includes_the_prompt_body() {
+        let mgr = mem_manager();
+        mgr.store()
+            .unwrap()
+            .upsert_schedule(&ScheduleRow {
+                name: "daily-review".into(),
+                file_path: "/tmp/daily-review.md".into(),
+                schedule: "0 9 * * *".into(),
+                agent_profile: "default".into(),
+                provider: "claude_code".into(),
+                script: None,
+                prompt: Some("Review yesterday's commits".into()),
+                last_run: None,
+                next_run: Some(1),
+                enabled: true,
+                workspace_root: Some("/proj".into()),
+                task_mode: None,
+                task_id: None,
+            })
+            .unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&mgr.query("schedules", "{}")).unwrap();
+        // The SchedulesScreen reads name/schedule/enabled and the prompt body.
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["name"], "daily-review");
+        assert_eq!(v[0]["schedule"], "0 9 * * *");
+        assert_eq!(v[0]["enabled"], true);
+        assert_eq!(v[0]["workspace_root"], "/proj");
+        assert_eq!(v[0]["prompt"], "Review yesterday's commits");
     }
 
     #[test]

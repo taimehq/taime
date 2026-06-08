@@ -54,7 +54,7 @@ export function TitleBar({ backend }: { backend: BackendState }) {
   return (
     <header
       data-tauri-drag-region
-      className="titlebar-drag relative z-30 grid h-10 shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-3 border-b border-ink-600 bg-ink-800 px-3.5"
+      className="titlebar-drag relative z-30 grid h-10 shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-3 border-b border-hairline bg-ink-800 px-3.5"
     >
       {/* Left: traffic-light reserve (collapses with the lights in fullscreen) + workspace */}
       {/* Side columns stretch to their tracks (no justify-self): a self-aligned

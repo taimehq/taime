@@ -1,4 +1,5 @@
-import type { BackendState } from "../backend";
+import { inTauri, type BackendState } from "../backend";
+import { useStore } from "../store";
 
 const DOT: Record<BackendState["status"], string> = {
   healthy: "bg-emerald-400",
@@ -19,15 +20,22 @@ const LABEL: Record<BackendState["status"], string> = {
 };
 
 export function BackendStatusPill({ state }: { state: BackendState }) {
+  const connected = useStore((s) => s.connected);
+  // In Tauri the supervisor descriptor is static ("healthy" by construction —
+  // backend.ts) and proves nothing about the daemon. `connected` is the live
+  // daemon_ping result, so the pill reports the daemon honestly. Outside Tauri
+  // App already synthesizes external/external_down from the same fact.
+  const status: BackendState["status"] =
+    inTauri() && state.status === "healthy" && !connected ? "down" : state.status;
   return (
     <div
       className="no-drag flex h-[26px] min-w-0 items-center gap-2 rounded-full border border-ink-500 bg-ink-700 px-2.5 text-[11px]"
       title={state.detail}
     >
-      <span className={`h-2 w-2 shrink-0 rounded-full ${DOT[state.status]}`} />
+      <span className={`h-2 w-2 shrink-0 rounded-full ${DOT[status]}`} />
       {/* Truncation contract: status labels never wrap — truncate at min width. */}
       <span className="min-w-0 truncate whitespace-nowrap text-zinc-200">
-        {LABEL[state.status]}
+        {LABEL[status]}
       </span>
       {state.external && (
         <span className="shrink-0 rounded bg-ink-500 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-400">

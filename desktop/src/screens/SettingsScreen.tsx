@@ -436,8 +436,9 @@ function AppearanceTab() {
 // ─── About ───────────────────────────────────────────────────────────────────
 
 function AboutTab() {
-  // `connected` is the real reachability signal: the agent-roster poll flips it
-  // on daemon response/failure (the same fact the title-bar pill reads).
+  // `connected` is the real reachability signal: the daemon_ping probe (run by
+  // the roster poll) flips it — true iff a live daemon actually answered (the
+  // same fact the title-bar pill reads); query fallbacks never count.
   const connected = useStore((s) => s.connected);
   const [version, setVersion] = useState<string | null>(null);
   useEffect(() => {
@@ -476,7 +477,7 @@ function AboutTab() {
           </span>
         </Row>
         <Row
-          label="Session daemon"
+          label="Agent daemon"
           sub="taime-session-daemon — owns every agent PTY; agents survive app restarts."
         >
           <span
