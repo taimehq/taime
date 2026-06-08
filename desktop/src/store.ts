@@ -316,6 +316,8 @@ interface Store {
   newTaskOpen: boolean;
   /** When true, the Add-schedule dialog is open (palette / schedules "+"). */
   newScheduleOpen: boolean;
+  /** When true, the New-workflow dialog is open (workflows screen / sidebar "+"). */
+  newWorkflowOpen: boolean;
   snackbar: Snackbar | null;
 
   // preferences (persisted via lib/preferences.ts)
@@ -435,6 +437,7 @@ interface Store {
   setLaunchOpen: (open: boolean, presetTaskId?: string | null) => void;
   setNewTaskOpen: (open: boolean) => void;
   setNewScheduleOpen: (open: boolean) => void;
+  setNewWorkflowOpen: (open: boolean) => void;
   setLayoutMode: (mode: LayoutMode) => void;
   toggleLayoutMode: () => void;
 
@@ -519,6 +522,7 @@ export const useStore = create<Store>((set, get) => ({
   launchPresetTaskId: null,
   newTaskOpen: false,
   newScheduleOpen: false,
+  newWorkflowOpen: false,
   snackbar: null,
 
   setConnected: (connected) => {
@@ -1102,6 +1106,7 @@ export const useStore = create<Store>((set, get) => ({
     set({ launchOpen, launchPresetTaskId: launchOpen ? (presetTaskId ?? null) : null }),
   setNewTaskOpen: (newTaskOpen) => set({ newTaskOpen }),
   setNewScheduleOpen: (newScheduleOpen) => set({ newScheduleOpen }),
+  setNewWorkflowOpen: (newWorkflowOpen) => set({ newWorkflowOpen }),
   setLayoutMode: (layoutMode) => set({ layoutMode }),
   toggleLayoutMode: () =>
     set((s) => ({ layoutMode: s.layoutMode === "grid" ? "focus" : "grid" })),

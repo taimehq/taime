@@ -424,6 +424,8 @@ function WorkflowsSidebar() {
   const [workflows, setWorkflows] = useState<WorkflowInfo[]>([]);
   const selected = useStore((s) => s.selectedWorkflow);
   const setSelectedWorkflow = useStore((s) => s.setSelectedWorkflow);
+  const setNewWorkflowOpen = useStore((s) => s.setNewWorkflowOpen);
+  const connected = useStore((s) => s.connected);
 
   useEffect(() => {
     let alive = true;
@@ -444,12 +446,22 @@ function WorkflowsSidebar() {
 
   return (
     <>
-      <SidebarHead title="Workflows" />
+      <SidebarHead title="Workflows">
+        <button
+          onClick={() => setNewWorkflowOpen(true)}
+          disabled={!connected}
+          title={connected ? "New workflow" : "Daemon unreachable"}
+          aria-label="New workflow"
+          className="rounded p-1 text-zinc-500 hover:bg-ink-600 hover:text-zinc-200 disabled:cursor-default disabled:opacity-40"
+        >
+          <Plus size={13} />
+        </button>
+      </SidebarHead>
       <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-2">
         {workflows.length === 0 ? (
           <p className="px-2 py-1 text-[11px] text-zinc-600">
-            No workflows yet — an orchestrator can author one, or drop a JSON
-            in ~/.taime/workflows.
+            No workflows yet — write one as JSON, have an agent generate it,
+            or drop a JSON in ~/.taime/workflows.
           </p>
         ) : (
           workflows.map((wf) => (

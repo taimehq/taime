@@ -352,6 +352,15 @@ export const api = {
   /** All workflows (`~/.taime/workflows/*.json` + orchestrator-generated), each
    *  with its node/edge graph and most-recent run state. */
   listWorkflows: () => daemonQuery<WorkflowInfo[]>("workflows", {}, []),
+  /** Create a workflow from a JSON definition string. The daemon validates +
+   *  persists it (source "user"); validation problems come back as
+   *  `{ok:false, error}` — never a wire error. */
+  createWorkflow: (definition: string) =>
+    daemonQuery<{ ok: boolean; name?: string; error?: string }>(
+      "workflow_create",
+      { definition },
+      { ok: false, error: "daemon unreachable" },
+    ),
   /** Start a run of a workflow now; returns the run id, or an error string.
    *  `projectRoot` (the active workspace) is where the nodes' worktrees fork
    *  from; `taskId` attaches the run (and its node agents) to a Task. */

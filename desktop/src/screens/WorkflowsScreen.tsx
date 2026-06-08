@@ -7,6 +7,7 @@ import {
   Minus,
   Network,
   Play,
+  Plus,
   Trash2,
   Workflow as WorkflowIcon,
 } from "lucide-react";
@@ -92,6 +93,9 @@ function jsonEqual(a: unknown, b: unknown): boolean {
 export function WorkflowsScreen() {
   const selectedName = useStore((s) => s.selectedWorkflow);
   const connected = useStore((s) => s.connected);
+  // The New-workflow dialog is store-owned (App mounts it) so this screen and
+  // the sidebar "+" share the same surface.
+  const setNewWorkflowOpen = useStore((s) => s.setNewWorkflowOpen);
   const [workflows, setWorkflows] = useState<WorkflowInfo[] | null>(null);
 
   useEffect(() => {
@@ -123,24 +127,59 @@ export function WorkflowsScreen() {
       {workflows === null ? (
         <CenterNote text="loading workflows…" />
       ) : workflows.length === 0 ? (
-        <CenterNote text="No workflows yet — an orchestrator can author one, or drop a JSON in ~/.taime/workflows." />
+        <CenterNote
+          text="No workflows yet — write one as JSON or have an agent generate it."
+          action={{
+            label: "New workflow",
+            onClick: () => setNewWorkflowOpen(true),
+            enabled: connected,
+          }}
+        />
       ) : !selectedName ? (
-        <CenterNote text="Select a workflow in the sidebar." />
+        <CenterNote
+          text="Select a workflow in the sidebar."
+          action={{
+            label: "New workflow",
+            onClick: () => setNewWorkflowOpen(true),
+            enabled: connected,
+          }}
+        />
       ) : !wf ? (
         <CenterNote text={`Workflow "${selectedName}" not found — removed or renamed.`} />
       ) : (
-        <WorkflowDetail wf={wf} connected={connected} />
+        <WorkflowDetail
+          wf={wf}
+          connected={connected}
+          onNew={() => setNewWorkflowOpen(true)}
+        />
       )}
     </div>
   );
 }
 
-function CenterNote({ text }: { text: string }) {
+function CenterNote({
+  text,
+  action,
+}: {
+  text: string;
+  action?: { label: string; onClick: () => void; enabled: boolean };
+}) {
   return (
     <div className="flex flex-1 items-center justify-center p-6">
       <div className="flex max-w-sm flex-col items-center gap-2 text-center">
         <WorkflowIcon size={22} className="text-zinc-700" />
         <p className="text-xs leading-relaxed text-zinc-500">{text}</p>
+        {action && (
+          <button
+            onClick={action.onClick}
+            disabled={!action.enabled}
+            title={action.enabled ? action.label : "Daemon unreachable"}
+            className="mt-1 flex items-center gap-1 rounded-md border border-ink-500 px-2.5 py-1 text-xs text-zinc-300 hover:bg-ink-600 disabled:cursor-default disabled:opacity-50"
+          >
+            <Plus size={12} />
+            {action.label}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -150,7 +189,15 @@ function CenterNote({ text }: { text: string }) {
 
 type Tab = "definition" | "runs";
 
-function WorkflowDetail({ wf, connected }: { wf: WorkflowInfo; connected: boolean }) {
+function WorkflowDetail({
+  wf,
+  connected,
+  onNew,
+}: {
+  wf: WorkflowInfo;
+  connected: boolean;
+  onNew: () => void;
+}) {
   const workspaceDir = useStore((s) => s.workspaceDir);
   const { tasks } = useTasks(workspaceDir);
   const [tab, setTab] = useState<Tab>("definition");
@@ -371,6 +418,19 @@ function WorkflowDetail({ wf, connected }: { wf: WorkflowInfo; connected: boolea
               <Trash2 size={13} />
             </button>
           )}
+
+          <span className="h-4 w-px bg-ink-600" />
+
+          {/* New workflow */}
+          <button
+            onClick={onNew}
+            disabled={!connected}
+            title={connected ? "New workflow" : "Daemon unreachable"}
+            className="flex items-center gap-1 rounded-md border border-ink-500 px-2.5 py-1 text-xs text-zinc-300 hover:bg-ink-600 disabled:cursor-default disabled:opacity-50"
+          >
+            <Plus size={12} />
+            New workflow
+          </button>
         </div>
       </div>
 
