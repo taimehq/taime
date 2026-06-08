@@ -32,6 +32,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::workspace_info,
+            commands::daemon_ping,
             commands::daemon_spawn_agent,
             commands::daemon_provision_worktree,
             commands::daemon_send_message,

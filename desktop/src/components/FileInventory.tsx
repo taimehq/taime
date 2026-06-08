@@ -1,12 +1,6 @@
 import { useStore } from "../store";
 import { FileWarning, Eye } from "lucide-react";
-
-const TARGET_NAME: Record<string, string> = {
-  claude_code: "Claude Code",
-  codex: "Codex CLI",
-  gemini_cli: "Gemini CLI",
-  grok_cli: "Grok Build CLI",
-};
+import { providerTitle } from "../lib/providerLabel";
 
 /**
  * Surfaces uncommitted, agent-driven changes per terminal. Populated by the
@@ -53,7 +47,7 @@ export function FileInventory() {
               (f) => f.terminalId && terminalIds.includes(f.terminalId),
             );
             const provider = frame
-              ? (TARGET_NAME[frame.provider] ?? frame.provider)
+              ? providerTitle(frame.provider)
               : primary.slice(0, 8);
             const who =
               terminalIds.length > 1

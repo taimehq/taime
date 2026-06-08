@@ -1,7 +1,7 @@
 import { useStore, isDaemonTransport, type Frame } from "../store";
 import { TerminalViewRustPty } from "../components/TerminalViewRustPty";
-import { StatusBadge, statusDotClass } from "../components/StatusBadge";
-import { prettySessionText } from "../lib/sessionName";
+import { StatusBadge } from "../components/StatusBadge";
+import { statusDotClass } from "../lib/agentStatus";
 import { providerTitle } from "../lib/providerLabel";
 import { Loader2, X, TerminalSquare, Power, LayoutGrid } from "lucide-react";
 
@@ -105,15 +105,11 @@ function ShellTabs({
             ? terminalStatuses[f.terminalId]
             : undefined;
         const d = f.terminalId ? dirty[f.terminalId] : undefined;
-        const role =
+        // Subtitle: the agent's profile, when it's a meaningful non-default one.
+        const profile =
           f.agentProfile && f.agentProfile !== "default"
             ? f.agentProfile.replace(/_/g, " ")
             : null;
-        const session = f.sessionName
-          ? prettySessionText(f.sessionName)
-          : null;
-        // Subtitle: who this agent is + which session it belongs to.
-        const subtitle = [role, session].filter(Boolean).join(" · ");
         return (
           <button
             key={f.key}
@@ -121,9 +117,9 @@ function ShellTabs({
               setActiveFrameGuarded(f.key);
               setLayoutMode("focus");
             }}
-            title={`${providerTitle(f.provider)}${role ? " · " + role : ""}${
-              session ? " · " + session : ""
-            }${f.model ? " · " + f.model : ""} — fullscreen`}
+            title={`${providerTitle(f.provider)}${profile ? " · " + profile : ""}${
+              f.model ? " · " + f.model : ""
+            } — fullscreen`}
             className={tabClass(layoutMode === "focus" && f.key === activeKey)}
           >
             <span className="shrink-0 text-[10px] tabular-nums text-zinc-600">
@@ -143,9 +139,9 @@ function ShellTabs({
                   </span>
                 )}
               </span>
-              {subtitle && (
+              {profile && (
                 <span className="max-w-[150px] truncate text-[10px] text-zinc-500">
-                  {subtitle}
+                  {profile}
                 </span>
               )}
             </span>
@@ -183,14 +179,11 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
 
   const active = activeFrameKey === frame.key;
   const title = providerTitle(frame.provider);
-  // Agent role (profile) — shown when it's a meaningful, non-default role.
-  const role =
+  // Agent profile — shown when it's a meaningful, non-default one.
+  const profile =
     frame.agentProfile && frame.agentProfile !== "default"
       ? frame.agentProfile.replace(/_/g, " ")
       : null;
-  const sessionLabel = frame.sessionName
-    ? prettySessionText(frame.sessionName)
-    : null;
   // Key the frame for drag-and-drop hit-testing (file/screenshot drop → path).
   const termKey = isRustPty ? frame.ptySessionId : frame.terminalId;
 
@@ -223,8 +216,8 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
           <span className="shrink-0 text-xs font-medium text-zinc-200">
             {title}
           </span>
-          {role && (
-            <span className="shrink-0 text-[11px] text-zinc-400">· {role}</span>
+          {profile && (
+            <span className="shrink-0 text-[11px] text-zinc-400">· {profile}</span>
           )}
           {frame.model && (
             <span
@@ -232,22 +225,6 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
               title="Model (from the agent's startup banner)"
             >
               {frame.model}
-            </span>
-          )}
-          {sessionLabel && (
-            <span
-              className="truncate font-mono text-[10px] text-zinc-600"
-              title={`session ${frame.sessionName}`}
-            >
-              {sessionLabel}
-            </span>
-          )}
-          {isRustPty && (
-            <span
-              className="shrink-0 rounded bg-violet-500/20 px-1.5 text-[9px] font-semibold uppercase tracking-wide text-violet-300"
-              title="Rust-owned PTY transport (dev)"
-            >
-              Rust PTY
             </span>
           )}
         </div>

@@ -20,31 +20,13 @@ import {
   type FileContributor,
 } from "../api";
 import { useStore } from "../store";
+import { providerTitle } from "../lib/providerLabel";
+import { AUTHOR_COLORS, authorName } from "../lib/attribution";
 
-const PROVIDER_NAME: Record<string, string> = {
-  claude_code: "Claude Code",
-  codex: "Codex CLI",
-  gemini_cli: "Gemini CLI",
-  grok_cli: "Grok Build CLI",
-};
-
-/** Stable color per team member, so authorship reads at a glance in the diff. */
-const AUTHOR_COLORS = [
-  { dot: "bg-sky-400", text: "text-sky-300", chip: "bg-sky-500/15 text-sky-300" },
-  { dot: "bg-violet-400", text: "text-violet-300", chip: "bg-violet-500/15 text-violet-300" },
-  { dot: "bg-emerald-400", text: "text-emerald-300", chip: "bg-emerald-500/15 text-emerald-300" },
-  { dot: "bg-amber-400", text: "text-amber-300", chip: "bg-amber-500/15 text-amber-300" },
-  { dot: "bg-rose-400", text: "text-rose-300", chip: "bg-rose-500/15 text-rose-300" },
-  { dot: "bg-cyan-400", text: "text-cyan-300", chip: "bg-cyan-500/15 text-cyan-300" },
-];
 const UNATTRIBUTED = "unattributed";
 
-function authorName(
-  c: { provider: string | null; terminal_id: string } | null | undefined,
-): string {
-  if (!c) return "unattributed";
-  return PROVIDER_NAME[c.provider ?? ""] ?? c.provider ?? c.terminal_id.slice(0, 6);
-}
+const FOCUS_RING =
+  "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent";
 
 function langForPath(path: string): string {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -78,7 +60,7 @@ export function DiffView() {
   const markReviewed = useStore((s) => s.markReviewed);
   const showSnackbar = useStore((s) => s.showSnackbar);
   const frames = useStore((s) => s.frames);
-  const pendingSwitchKey = useStore((s) => s.pendingSwitchKey);
+  const pendingSwitch = useStore((s) => s.pendingSwitch);
   const resolveSwitch = useStore((s) => s.resolveSwitch);
 
   const [files, setFiles] = useState<FileDiffEntry[]>([]);
@@ -101,8 +83,8 @@ export function DiffView() {
     setError(null);
     try {
       const [fd, hk, wt, attr] = await Promise.all([
-        api.getFileDiffs(terminalId).catch(() => ({ terminal_id: terminalId, files: [] })),
-        api.getHunks(terminalId).catch(() => ({ terminal_id: terminalId, base: null, files: [] })),
+        api.getFileDiffs(terminalId).catch(() => ({ agent_id: terminalId, files: [] })),
+        api.getHunks(terminalId).catch(() => ({ agent_id: terminalId, base: null, files: [] })),
         api.getWorktree(terminalId).catch(() => null),
         api.getAttribution(terminalId).catch(() => ({ team: [], files: {} })),
       ]);
@@ -111,7 +93,7 @@ export function DiffView() {
       setWorktree(wt);
       setAttribution(attr);
       setSelected((prev) => prev ?? fd.files[0]?.path ?? null);
-      if (wt?.mode === "shared" || wt?.mode === "worktree") {
+      if (wt?.mode === "shared" || wt?.mode === "isolated") {
         // Contention is workspace-wide: key off the worktree's project root
         // (the workspace-grouping id), not a frame label.
         const root = wt?.project_root;
@@ -158,7 +140,7 @@ export function DiffView() {
   const teamOrder = useMemo(() => {
     const team = attribution?.team ?? [];
     return [...team.filter((t) => !t.member_of), ...team.filter((t) => t.member_of)].map(
-      (t) => t.terminal_id,
+      (t) => t.agent_id,
     );
   }, [attribution]);
   const colorIndexById = useMemo(() => {
@@ -180,12 +162,12 @@ export function DiffView() {
     attribution?.files[path]?.hunks?.[String(index)] ?? null;
 
   const agentName =
-    (frame && (PROVIDER_NAME[frame.provider] ?? frame.provider)) ??
+    (frame && providerTitle(frame.provider)) ??
     worktree?.provider ??
     "agent";
 
   // Sibling agents = same Task (the membership grouping; Uncategorized agents
-  // don't cross-link). Replaces the legacy sessionName label match.
+  // don't cross-link).
   const otherAgents = frames.filter(
     (f) =>
       f.terminalId &&
@@ -225,7 +207,7 @@ export function DiffView() {
   const fileGroups = (() => {
     const byKey = new Map<string, FileDiffEntry[]>();
     for (const f of files) {
-      const key = lastAuthor(f.path)?.terminal_id ?? UNATTRIBUTED;
+      const key = lastAuthor(f.path)?.agent_id ?? UNATTRIBUTED;
       const list = byKey.get(key);
       if (list) list.push(f);
       else byKey.set(key, [f]);
@@ -295,7 +277,7 @@ export function DiffView() {
             {contended.has(f.path) && (
               <span className="shrink-0 text-[10px] font-semibold text-rose-400">contended</span>
             )}
-            <span className="shrink-0 font-mono text-[10px]">
+            <span className="shrink-0 font-mono text-[10px] tabular-nums">
               <span className="text-emerald-400">+{f.additions}</span>
               <span className="text-rose-400"> -{f.deletions}</span>
             </span>
@@ -337,9 +319,10 @@ export function DiffView() {
 
   const onMarkReviewed = () => {
     clearDirty(terminalId);
-    if (frame) markReviewed(frame.key);
+    // Review state is keyed by agent id — it outlives this frame.
+    markReviewed(terminalId);
     closeDiff();
-    if (pendingSwitchKey) resolveSwitch(true);
+    if (pendingSwitch) resolveSwitch(true);
   };
 
   const totalAdd = files.reduce((n, f) => n + f.additions, 0);
@@ -352,7 +335,7 @@ export function DiffView() {
       <div className="flex items-center justify-between gap-3 border-b border-ink-600 bg-ink-800 px-4 py-2.5">
         <div className="flex min-w-0 items-center gap-3 text-sm">
           <span className="shrink-0 font-semibold text-zinc-100">{agentName}</span>
-          {worktree?.mode === "worktree" && worktree.branch && (
+          {worktree?.mode === "isolated" && worktree.branch && (
             <span className="flex shrink-0 items-center gap-1.5 rounded-md border border-ink-600 px-2 py-0.5 font-mono text-[11px] text-teal-300">
               <GitBranch size={12} />
               {worktree.branch}
@@ -371,8 +354,8 @@ export function DiffView() {
               team · {attribution?.team.length} agents
             </span>
           )}
-          <span className="shrink-0 text-zinc-500">{files.length} files</span>
-          <span className="shrink-0 font-mono text-[11px]">
+          <span className="shrink-0 text-zinc-500 tabular-nums">{files.length} files</span>
+          <span className="shrink-0 font-mono text-[11px] tabular-nums">
             <span className="text-emerald-400">+{totalAdd}</span>{" "}
             <span className="text-rose-400">-{totalDel}</span>
           </span>
@@ -390,7 +373,7 @@ export function DiffView() {
               <option value="main">main</option>
               {otherAgents.map((a) => (
                 <option key={a.terminalId!} value={a.terminalId!}>
-                  {PROVIDER_NAME[a.provider] ?? a.provider} ({a.terminalId!.slice(0, 6)})
+                  {providerTitle(a.provider)} ({a.terminalId!.slice(0, 6)})
                 </option>
               ))}
             </select>
@@ -398,7 +381,7 @@ export function DiffView() {
           <button
             disabled={busy || selectionCount === 0}
             onClick={() => apply("merge")}
-            className="flex items-center gap-1.5 rounded-lg bg-teal-600 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 disabled:opacity-40"
+            className={`flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
           >
             <GitMerge size={14} />
             Merge {selectionCount > 0 ? `${selectionCount}` : ""}
@@ -406,7 +389,7 @@ export function DiffView() {
           <button
             disabled={busy || selectionCount === 0}
             onClick={() => apply("revert")}
-            className="flex items-center gap-1.5 rounded-lg border border-rose-500/50 px-3 py-1.5 text-sm text-rose-300 hover:bg-rose-500/10 disabled:opacity-40"
+            className={`flex items-center gap-1.5 rounded-md border border-rose-500/50 px-3 py-1.5 text-sm text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
           >
             <Undo2 size={14} />
             Revert
@@ -414,14 +397,14 @@ export function DiffView() {
           <div className="mx-1 h-5 w-px bg-ink-600" />
           <button
             onClick={onMarkReviewed}
-            className="flex items-center gap-1.5 rounded-lg bg-emerald-600/90 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110"
+            className={`flex items-center gap-1.5 rounded-md bg-emerald-600/90 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 ${FOCUS_RING}`}
           >
             <Check size={14} />
             Mark reviewed
           </button>
           <button
             onClick={closeDiff}
-            className="rounded-lg p-1.5 text-zinc-400 hover:bg-ink-600 hover:text-zinc-200"
+            className={`rounded-md p-1.5 text-zinc-400 hover:bg-ink-600 hover:text-zinc-200 ${FOCUS_RING}`}
             aria-label="Close diff"
           >
             <X size={18} />
@@ -476,13 +459,13 @@ export function DiffView() {
                 <GitMerge size={32} className="text-zinc-600" />
                 <p className="mt-3 text-sm text-zinc-300">No changes to review</p>
                 <p className="mt-1 max-w-sm text-[12px] text-zinc-400">
-                  {worktree?.mode === "worktree"
+                  {worktree?.mode === "isolated"
                     ? `This agent's worktree (${worktree.branch ?? "branch"}) has no changes vs its base yet.`
                     : "No uncommitted changes in the shared working directory."}
                 </p>
                 <button
                   onClick={onMarkReviewed}
-                  className="mt-4 flex items-center gap-1.5 rounded-lg border border-ink-500 px-3 py-1.5 text-[12px] text-zinc-300 hover:bg-ink-700 hover:text-zinc-100"
+                  className={`mt-4 flex items-center gap-1.5 rounded-md border border-ink-500 px-3 py-1.5 text-[12px] text-zinc-300 hover:bg-ink-700 hover:text-zinc-100 ${FOCUS_RING}`}
                 >
                   <Check size={13} />
                   Mark reviewed
@@ -496,7 +479,7 @@ export function DiffView() {
                 {current && !current.binary && (
                   <DiffEditor
                     key={current.path}
-                    theme="vs-dark"
+                    theme="taime-dark"
                     language={langForPath(current.path)}
                     original={current.original}
                     modified={current.modified}
@@ -505,6 +488,8 @@ export function DiffView() {
                       renderSideBySide: true,
                       minimap: { enabled: false },
                       fontSize: 12,
+                      fontFamily:
+                        "'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
                       scrollBeyondLastLine: false,
                     }}
                   />
@@ -524,7 +509,7 @@ export function DiffView() {
                 {(() => {
                   const a = current ? lastAuthor(current.path) : null;
                   if (!isTeam || !a) return null;
-                  const col = colorFor(a.terminal_id);
+                  const col = colorFor(a.agent_id);
                   return (
                     <span className={`rounded px-1.5 normal-case ${col?.chip ?? "text-zinc-400"}`}>
                       {authorName(a)} · turn {a.turn_index + 1}
@@ -539,7 +524,7 @@ export function DiffView() {
               </p>
               {currentHunks.map((h) => {
                 const ha = current ? hunkAuthor(current.path, h.index) : null;
-                const hcol = colorFor(ha?.terminal_id);
+                const hcol = colorFor(ha?.agent_id);
                 return (
                 <label
                   key={h.index}
@@ -563,7 +548,7 @@ export function DiffView() {
                   <span className="truncate font-mono text-[11px] text-zinc-400">
                     {h.header}
                   </span>
-                  <span className="ml-auto shrink-0 font-mono text-[10px]">
+                  <span className="ml-auto shrink-0 font-mono text-[10px] tabular-nums">
                     <span className="text-emerald-400">+{h.additions}</span>
                     <span className="text-rose-400"> -{h.deletions}</span>
                   </span>

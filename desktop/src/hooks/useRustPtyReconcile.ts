@@ -5,12 +5,12 @@ import { daemonList, type DaemonSessionSummary } from "../pty";
 import { providerTitle } from "../lib/providerLabel";
 
 /** Mirror daemon-reported status (Phase 4) into the shared terminalStatuses map,
- *  keyed by the attribution id the StatusBadge already reads — so a daemon
- *  agent's badge is daemon-driven, no CAO /terminals/{id} poll. */
+ *  keyed by the agent id the StatusBadge already reads — so a daemon agent's
+ *  badge is daemon-driven, no CAO /terminals/{id} poll. */
 function applyDaemonStatuses(sessions: DaemonSessionSummary[]) {
   const setStatus = useStore.getState().setTerminalStatus;
   for (const s of sessions) {
-    if (s.attribution_key && s.status) setStatus(s.attribution_key, s.status);
+    if (s.agent_id && s.status) setStatus(s.agent_id, s.status);
   }
 }
 
@@ -62,7 +62,7 @@ export function useRustPtyReconcile() {
           (s) =>
             s.alive !== false &&
             !tracked[s.id] &&
-            !(s.attribution_key && dismissed.has(s.attribution_key)),
+            !(s.agent_id && dismissed.has(s.agent_id)),
         );
         for (const s of fresh) {
           st.adoptDaemonSession(s);

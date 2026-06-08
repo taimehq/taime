@@ -12,9 +12,9 @@ export interface FindResults {
 }
 
 /**
- * Find-in-terminal state + controller wiring, shared by both terminal views
- * (CAO WebSocket and Rust PTY) so the search UX is identical and lives in one
- * place. The view creates the `SearchAddon` (it owns the xterm instance) and
+ * Find-in-terminal state + controller wiring for the terminal view (the daemon
+ * Rust PTY), kept view-agnostic so the search UX lives in one place. The view
+ * creates the `SearchAddon` (it owns the xterm instance) and
  * stores it in `searchRef`; this hook owns the open/results state, the live
  * query (in a ref so Cmd+G can repeat it), and registers the frame controller.
  */

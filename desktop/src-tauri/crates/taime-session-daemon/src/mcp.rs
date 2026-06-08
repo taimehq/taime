@@ -24,13 +24,15 @@ const MCP_PROTOCOL: &str = "2024-11-05";
 
 /// The orchestration tool schemas (JSON Schema per the MCP spec) returned by
 /// `tools/list`: the full Phase-5 surface — `list_agents`, `send_message`,
-/// `broadcast` (role-filterable), `request`/`reply` (correlated), `handoff`,
-/// `assign` (role + tools + fan/depth limits), and the `share`/`get` blackboard.
+/// `broadcast` (profile-filterable), `request`/`reply` (correlated), `handoff`,
+/// `assign` (profile + tools + fan/depth limits), and the `share`/`get`
+/// blackboard. The canonical noun is `profile`; `role` is accepted forever as a
+/// legacy alias on the tools that take one.
 pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "list_agents",
-            "description": "List the live agent sessions: id, provider, role, status, cwd.",
+            "description": "List the live agent sessions: agent_id, provider, profile, status, cwd.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
@@ -39,7 +41,7 @@ pub fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "to": { "type": "string", "description": "Receiver agent id (attribution key)." },
+                    "to": { "type": "string", "description": "Receiver agent id." },
                     "body": { "type": "string", "description": "Message body." }
                 },
                 "required": ["to", "body"],
@@ -48,12 +50,12 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "broadcast",
-            "description": "Send a message to every other live agent's inbox, optionally only those with a given role (profile name).",
+            "description": "Send a message to every other live agent's inbox, optionally only those launched under a given profile.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "body": { "type": "string", "description": "Message body." },
-                    "role": { "type": "string", "description": "Optional role filter: only agents launched under this profile name receive it." }
+                    "profile": { "type": "string", "description": "Optional profile filter: only agents launched under this profile name receive it. (`role` accepted as legacy alias.)" }
                 },
                 "required": ["body"],
                 "additionalProperties": false
@@ -100,12 +102,12 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "assign",
-            "description": "Spawn a worker sub-agent in its own worktree under an optional role (profile name) with an optional tool allow-list, seed it with a task, and get back its id. The worker reports its result to you via send_message; the daemon also notifies you when it exits. Subject to fan-out/depth limits.",
+            "description": "Spawn a worker sub-agent in its own worktree under an optional profile with an optional tool allow-list, seed it with a task, and get back its id. The worker reports its result to you via send_message; the daemon also notifies you when it exits. Subject to fan-out/depth limits.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "message": { "type": "string", "description": "The task for the worker." },
-                    "role": { "type": "string", "description": "Optional profile name to launch the worker under (default: default)." },
+                    "profile": { "type": "string", "description": "Optional profile name to launch the worker under (default: default). (`role` accepted as legacy alias.)" },
                     "tools": { "type": "array", "items": { "type": "string" }, "description": "Optional allowed-tools override for the worker." },
                     "working_directory": { "type": "string", "description": "Optional project root to fork the worker's worktree from." }
                 },
@@ -138,7 +140,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "create_workflow",
-            "description": "Define a reusable Workflow — a graph of agent steps with conditional branches and loops. Pass a JSON definition: {name, entry, max_iterations?, nodes:[{id, role, prompt, output_key?}], edges:[{from, to, when}]} where `role` is a profile name and `when` is \"always\" | \"keyword:WORD\" | \"/regex/\" (first matching edge wins; no match = terminal). Each node's worker posts its result with the `share` tool to the node's output_key; edges route on that. Returns the workflow name; run it with run_workflow.",
+            "description": "Define a reusable Workflow — a graph of agent steps with conditional branches and loops. Pass a JSON definition: {name, entry, max_iterations?, nodes:[{id, profile, prompt, output_key?}], edges:[{from, to, when}]} where `profile` is a profile name (`role` accepted as legacy alias) and `when` is \"always\" | \"keyword:WORD\" | \"/regex/\" (first matching edge wins; no match = terminal). Each node's worker posts its result with the `share` tool to the node's output_key; edges route on that. Returns the workflow name; run it with run_workflow.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "definition": { "type": "string", "description": "The workflow JSON." } },
@@ -194,11 +196,11 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
                 .list()
                 .into_iter()
                 .map(|s| {
-                    let key = s.attribution_key.clone().unwrap_or_else(|| s.id.clone());
+                    let key = s.agent_id.clone().unwrap_or_else(|| s.id.clone());
                     json!({
-                        "id": key,
+                        "agent_id": key,
                         "provider": s.provider,
-                        "role": manager.role_of(&key),
+                        "profile": manager.role_of(&key),
                         "status": s.status.map(status_str),
                         "cwd": s.cwd,
                     })
@@ -230,8 +232,13 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
             if body.is_empty() {
                 return tool_err(id, "broadcast: 'body' is required");
             }
-            let role = args.get("role").and_then(|v| v.as_str()).filter(|r| !r.is_empty());
-            let n = manager.broadcast(caller, body, role);
+            // Canonical `profile`; `role` accepted forever as the legacy alias.
+            let profile = args
+                .get("profile")
+                .or_else(|| args.get("role"))
+                .and_then(|v| v.as_str())
+                .filter(|r| !r.is_empty());
+            let n = manager.broadcast(caller, body, profile);
             tool_ok(id, json!({ "ok": true, "recipients": n }))
         }
         "request" => {
@@ -279,11 +286,16 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
                 .get("working_directory")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let role = args.get("role").and_then(|v| v.as_str()).filter(|r| !r.is_empty());
+            // Canonical `profile`; `role` accepted forever as the legacy alias.
+            let profile = args
+                .get("profile")
+                .or_else(|| args.get("role"))
+                .and_then(|v| v.as_str())
+                .filter(|r| !r.is_empty());
             let tools: Option<Vec<String>> = args.get("tools").and_then(|v| v.as_array()).map(|a| {
                 a.iter().filter_map(|t| t.as_str().map(String::from)).collect()
             });
-            match manager.assign_worker(caller, message, wd, role, tools) {
+            match manager.assign_worker(caller, message, wd, profile, tools) {
                 Ok(worker) => tool_ok(id, json!({ "ok": true, "worker_id": worker })),
                 Err(e) => tool_err(id, &format!("assign failed: {e}")),
             }
@@ -560,11 +572,18 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_accepts_a_role_filter() {
+    fn broadcast_accepts_profile_filter_and_legacy_role_alias() {
         let mgr = manager();
-        // With no live agents either form is 0 recipients (the role param plumbs
-        // through without error).
-        let resp = call(&mgr, "term-a", 40, "broadcast", json!({ "body": "hi", "role": "reviewer" }));
+        // With no live agents either form is 0 recipients (the filter plumbs
+        // through without error). Canonical spelling:
+        let resp =
+            call(&mgr, "term-a", 40, "broadcast", json!({ "body": "hi", "profile": "reviewer" }));
+        assert_eq!(resp["result"]["isError"], false);
+        assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("\"recipients\":0"));
+
+        // Legacy `role` alias is accepted forever.
+        let resp =
+            call(&mgr, "term-a", 41, "broadcast", json!({ "body": "hi", "role": "reviewer" }));
         assert_eq!(resp["result"]["isError"], false);
         assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("\"recipients\":0"));
     }

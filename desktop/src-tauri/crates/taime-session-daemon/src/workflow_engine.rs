@@ -103,7 +103,7 @@ fn drive(
         let (session_id, agent_key) = match manager.spawn_workflow_node(
             project_root,
             &node_provider,
-            &node.role,
+            &node.profile,
             &prompt,
             task_id, // node agents inherit the run's task
         ) {

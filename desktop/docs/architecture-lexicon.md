@@ -153,11 +153,11 @@ Four structural rules fall out of this:
 | `session_name` / `member_of` grouping | `task_id` membership | Proto-Task technical debt; migrate then retire |
 | Terminal (as identity) | **Agent ID** | "Terminal" survives only as the colloquial on-screen terminal view |
 | `terminalId` / Terminal ID / Attribution Key (docs) | **Agent ID** | `attribution_key` remains the implementation-layer name during migration |
-| Role (UI) | **Profile** | One UI string change; code/store/API already say profile |
-| Flow | **Schedule** | Retired everywhere except migration notes; `flows` table = heritage |
+| Role (UI) | **Profile** | One UI string change; code/store/API already say profile. Workflow-node JSON key `role` → `profile`: **done** (`role` parses forever as a serde alias; serializer + MCP schemas/outputs say `profile`) |
+| Flow | **Schedule** | Retired everywhere except migration notes; `flows` table = heritage. Prompt var `[[flow_name]]` → `[[schedule_name]]`: **done** (`[[schedule_name]]` is canonical; `[[flow_name]]` substitutes forever as a legacy alias) |
 | Routine | **Workflow** | Pre-finalization name; never shipped |
 | tmux session / window | — | Deleted with CAO |
-| Worktree `mode: "worktree"` | mode **isolated** | Fixes the mode named after its own object (`shared` unchanged) |
+| Worktree `mode: "worktree"` | mode **isolated** | Fixes the mode named after its own object (`shared` unchanged) — **done** |
 
 ---
 
