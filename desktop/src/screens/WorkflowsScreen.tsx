@@ -128,7 +128,6 @@ export function WorkflowsScreen() {
         <CenterNote text="loading workflows…" />
       ) : workflows.length === 0 ? (
         <CenterNote
-          headline="No workflows yet"
           action={{
             label: "New workflow",
             onClick: () => setNewWorkflowOpen(true),
@@ -169,14 +168,16 @@ function CenterNote({
   return (
     <div className="flex flex-1 items-center justify-center p-6">
       <div className="flex max-w-sm flex-col items-center gap-2 text-center">
-        <WorkflowIcon size={22} className="text-zinc-700" />
+        {(headline || text) && (
+          <WorkflowIcon size={22} className="text-zinc-700" />
+        )}
         {headline ? (
           <p className="text-base font-semibold tracking-tight text-zinc-200">
             {headline}
           </p>
-        ) : (
+        ) : text ? (
           <p className="text-xs leading-relaxed text-zinc-500">{text}</p>
-        )}
+        ) : null}
         {action && (
           <button
             onClick={action.onClick}

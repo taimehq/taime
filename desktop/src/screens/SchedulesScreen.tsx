@@ -126,7 +126,6 @@ export function SchedulesScreen() {
         <CenterNote text="loading schedules…" />
       ) : schedules.length === 0 ? (
         <CenterNote
-          headline="No schedules yet"
           action={{ label: "New schedule", onClick: () => setNewScheduleOpen(true), enabled: connected }}
         />
       ) : !selectedName ? (
@@ -161,14 +160,16 @@ function CenterNote({
   return (
     <div className="flex flex-1 items-center justify-center p-6">
       <div className="flex max-w-sm flex-col items-center gap-3 text-center">
-        <CalendarClock size={22} className="text-zinc-700" />
+        {(headline || text) && (
+          <CalendarClock size={22} className="text-zinc-700" />
+        )}
         {headline ? (
           <p className="text-base font-semibold tracking-tight text-zinc-200">
             {headline}
           </p>
-        ) : (
+        ) : text ? (
           <p className="text-xs leading-relaxed text-zinc-500">{text}</p>
-        )}
+        ) : null}
         {action && (
           <button
             onClick={action.onClick}
