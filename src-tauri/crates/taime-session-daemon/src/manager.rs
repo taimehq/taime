@@ -504,13 +504,27 @@ impl Manager {
     /// inter-agent edges (message/request/reply/handoff/assign events) and
     /// contention. Read from the durable store, so it reflects the full history
     /// even with the UI closed.
-    pub fn activity_graph_json(&self) -> String {
+    /// The activity graph (agents + inter-agent edges + fs contention). When
+    /// `workspace_root` is `Some`, every surface is scoped to that workspace's
+    /// team — agents not in it, edges touching an out-of-scope agent, and
+    /// contention rows that drop below two in-scope writers are all filtered out
+    /// (so the Team drawer reflects the active workspace, not every agent the
+    /// daemon has run). `None` is the legacy, daemon-wide view.
+    pub fn activity_graph_json(&self, workspace_root: Option<&str>) -> String {
         let Some(store) = &self.store else {
             return r#"{"agents":[],"edges":[],"contention":[]}"#.to_string();
         };
-        let agents: Vec<serde_json::Value> = store
-            .graph_agents()
-            .unwrap_or_default()
+        let roster = match workspace_root {
+            Some(ws) => store.graph_agents_in_workspace(ws).unwrap_or_default(),
+            None => store.graph_agents().unwrap_or_default(),
+        };
+        // The in-scope id set: edges/contention reference agents by the same
+        // COALESCE(attribution_key, pty_session_id) key the roster is keyed on.
+        let in_scope: std::collections::HashSet<String> =
+            roster.iter().map(|(id, _, _)| id.clone()).collect();
+        let scoped = workspace_root.is_some();
+        let keep = |id: &str| !scoped || in_scope.contains(id);
+        let agents: Vec<serde_json::Value> = roster
             .into_iter()
             .map(|(id, provider, status)| {
                 let (branch, mode, member_of) =
@@ -548,13 +562,20 @@ impl Manager {
             .activity_edges()
             .unwrap_or_default()
             .into_iter()
+            .filter(|(_, source, target)| keep(source) && keep(target))
             .map(|(kind, source, target)| serde_json::json!({ "kind": kind, "source": source, "target": target }))
             .collect();
         let contention: Vec<serde_json::Value> = store
             .fs_contention(200)
             .unwrap_or_default()
             .into_iter()
-            .map(|(path, terminals)| serde_json::json!({ "path": path, "terminals": terminals }))
+            .filter_map(|(path, terminals)| {
+                // Drop out-of-scope writers; a path is only contended if ≥2
+                // in-scope agents still touch it.
+                let terminals: Vec<String> = terminals.into_iter().filter(|t| keep(t)).collect();
+                (terminals.len() > 1)
+                    .then(|| serde_json::json!({ "path": path, "terminals": terminals }))
+            })
             .collect();
         serde_json::json!({ "agents": agents, "edges": edges, "contention": contention }).to_string()
     }
@@ -760,7 +781,15 @@ impl Manager {
                 }
             }
             "task_detail" => self.task_detail_json(a.get("id").and_then(|v| v.as_str()).unwrap_or("")),
-            "graph" => self.activity_graph_json(),
+            "graph" => {
+                // Empty/absent workspace_root ⇒ daemon-wide (legacy / agent-roster
+                // lookups); a real root scopes the graph to that workspace's team.
+                let ws = a
+                    .get("workspace_root")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                self.activity_graph_json(ws)
+            }
             other => serde_json::json!({ "error": format!("unknown query {other}") }).to_string(),
         }
     }
@@ -2270,7 +2299,7 @@ mod tests {
         store.record_activity_edge("e1", "assign", "a", "b", 2).unwrap();
 
         let mgr = Manager::for_test(Some(store));
-        let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json(None)).unwrap();
         assert_eq!(v["agents"].as_array().unwrap().len(), 1);
         assert_eq!(v["agents"][0]["agent_id"], "a");
         assert_eq!(v["agents"][0]["provider"], "claude_code");
@@ -2390,7 +2419,7 @@ mod tests {
             .unwrap();
         store.record_turn("t1", "a", 0, 10, 20, &["src/x.rs".into(), "src/y.rs".into()]).unwrap();
 
-        let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json(None)).unwrap();
         let agent = &v["agents"][0];
         assert_eq!(agent["agent_id"], "a");
         assert_eq!(agent["turns"].as_array().unwrap().len(), 1);
@@ -2406,13 +2435,69 @@ mod tests {
         store.record_fs_event("e2", "b", "shared.rs", "modify", 2).unwrap();
         store.record_fs_event("e3", "a", "solo.rs", "modify", 3).unwrap();
 
-        let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json(None)).unwrap();
         let cont = v["contention"].as_array().unwrap();
         assert_eq!(cont.len(), 1, "only the file touched by 2 agents is contended");
         assert_eq!(cont[0]["path"], "shared.rs");
         let terms: Vec<&str> =
             cont[0]["terminals"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
         assert!(terms.contains(&"a") && terms.contains(&"b"));
+    }
+
+    #[test]
+    fn graph_scopes_agents_edges_and_contention_to_workspace() {
+        let mgr = mem_manager();
+        let store = mgr.store().unwrap();
+        // a, b live in /ws/alpha; c lives in /ws/beta (different workspace). No
+        // worktree rows ⇒ scoping falls back to the session cwd.
+        for (pty, key, cwd) in [
+            ("pty-a", "a", "/ws/alpha"),
+            ("pty-b", "b", "/ws/alpha"),
+            ("pty-c", "c", "/ws/beta"),
+        ] {
+            store
+                .record_session(&SessionRow {
+                    pty_session_id: pty.into(),
+                    provider: Some("claude_code".into()),
+                    attribution_key: Some(key.into()),
+                    cwd: Some(cwd.into()),
+                    program: "claude".into(),
+                    created_at_unix: 1,
+                    status: "running".into(),
+                })
+                .unwrap();
+        }
+        // All three touch shared.rs; an in-scope edge a→b and a cross-scope a→c.
+        store.record_fs_event("e1", "a", "shared.rs", "modify", 1).unwrap();
+        store.record_fs_event("e2", "b", "shared.rs", "modify", 2).unwrap();
+        store.record_fs_event("e3", "c", "shared.rs", "modify", 3).unwrap();
+        mgr.request("a", "b", "in scope?").unwrap();
+        mgr.request("a", "c", "cross scope?").unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&mgr.activity_graph_json(Some("/ws/alpha"))).unwrap();
+
+        let ids: Vec<&str> =
+            v["agents"].as_array().unwrap().iter().map(|a| a["agent_id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 2, "only /ws/alpha's agents");
+        assert!(ids.contains(&"a") && ids.contains(&"b") && !ids.contains(&"c"));
+
+        // a→c crosses out of scope and is dropped; a→b survives.
+        let edges = v["edges"].as_array().unwrap();
+        assert!(
+            edges.iter().all(|e| e["target"] != "c" && e["source"] != "c"),
+            "edges touching the out-of-scope agent are filtered"
+        );
+        assert!(edges.iter().any(|e| e["source"] == "a" && e["target"] == "b"));
+
+        // shared.rs stays contended on a+b (still ≥2 in-scope writers); c's write
+        // is filtered out rather than inflating the workspace's contention.
+        let cont = v["contention"].as_array().unwrap();
+        assert_eq!(cont.len(), 1);
+        assert_eq!(cont[0]["path"], "shared.rs");
+        let terms: Vec<&str> =
+            cont[0]["terminals"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+        assert!(terms.contains(&"a") && terms.contains(&"b") && !terms.contains(&"c"));
     }
 
     #[test]
@@ -2491,7 +2576,7 @@ mod tests {
         let mgr = mem_manager();
         let iid = mgr.request("a", "b", "status?").unwrap();
         mgr.reply("b", &iid, "all green").unwrap();
-        let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&mgr.activity_graph_json(None)).unwrap();
         let kinds: Vec<&str> =
             v["edges"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
         assert!(kinds.contains(&"request"), "request edge missing: {kinds:?}");

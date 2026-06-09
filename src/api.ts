@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { daemonQuery, daemonProvisionWorktree, daemonActivityGraph } from "./pty";
+import { daemonQuery, daemonProvisionWorktree, type DaemonActivityGraph } from "./pty";
 import { inTauri } from "./backend";
 
 /**
@@ -587,11 +587,17 @@ export const api = {
     daemonQuery<{ path: string; terminals: string[] }[]>("contention", { session }, []),
 
   /** The activity graph: daemon agents + inter-agent edges, mapped to the shape
-   *  the ActivityGraph component expects. */
-  getGraph: async (session: string): Promise<ActivityGraph> => {
-    const g = await daemonActivityGraph();
+   *  the ActivityGraph component expects. Pass the active workspace root to scope
+   *  the team to that workspace; pass `""` for the daemon-wide roster (used by
+   *  agent-row lookups that just project to a single agent). */
+  getGraph: async (workspaceRoot: string): Promise<ActivityGraph> => {
+    const g = await daemonQuery<DaemonActivityGraph>(
+      "graph",
+      { workspace_root: workspaceRoot },
+      { agents: [], edges: [], contention: [] },
+    );
     return {
-      session,
+      session: workspaceRoot,
       agents: g.agents.map((a) => ({
         agent_id: a.agent_id,
         provider: a.provider,

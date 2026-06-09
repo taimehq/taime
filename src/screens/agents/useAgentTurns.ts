@@ -35,7 +35,9 @@ export function useAgentTurns(anchorId: string | null): AgentTurnsState {
     const load = async () => {
       try {
         // The graph query is agent-roster wide; project to this agent's row.
-        const g = await api.getGraph(anchorId);
+        // Pass "" (daemon-wide) — anchorId is an agent id, not a workspace root,
+        // so it must not be used to scope the roster.
+        const g = await api.getGraph("");
         if (!alive) return;
         const row = g.agents.find((a) => a.agent_id === anchorId);
         const turns = [...(row?.turns ?? [])].sort(

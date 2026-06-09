@@ -115,15 +115,29 @@ fn classify_kind(kind: &EventKind) -> &'static str {
     }
 }
 
-/// File suffixes/markers we ignore (lockfiles, logs, editor temp/swap).
-fn is_denied_file(name: &str) -> bool {
-    name.ends_with(".lock")
-        || name.ends_with(".log")
-        || name.ends_with('~')
+/// Clearly-transient files no human reviews: atomic-write temps (`*.tmp` and the
+/// `<file>.tmp.<pid>.<hash>` pattern editors/agents write), editor swap/backup
+/// files, and OS cruft. Shared by the watcher AND the diff/contention surfaces
+/// (see diff.rs) so write-churn noise never reaches the dirty / review /
+/// contention lists. Deliberately does NOT include lockfiles or logs — those can
+/// be real, reviewable project files (Cargo.lock, package-lock.json, …).
+pub fn is_transient_file(name: &str) -> bool {
+    name.ends_with(".tmp")
+        || name.contains(".tmp.") // atomic-write temp: foo.md.tmp.<pid>.<hash>
+        || name.ends_with('~') // editor backup
         || name.ends_with(".swp")
         || name.ends_with(".swx")
+        || name.ends_with(".orig")
+        || name.ends_with(".bak")
+        || name.starts_with(".#") // emacs lock
         || name == "4913" // vim atomic-write probe
         || name == ".DS_Store"
+}
+
+/// What the WATCHER ignores: transients PLUS lockfiles/logs — their churn
+/// shouldn't wake the dirty timeline (but they're fine to review in a diff).
+fn is_denied_file(name: &str) -> bool {
+    is_transient_file(name) || name.ends_with(".lock") || name.ends_with(".log")
 }
 
 /// Memo of directories known to carry a `CACHEDIR.TAG` marker.
@@ -221,6 +235,33 @@ mod tests {
         assert!(accept_path(Path::new("/proj/pnpm-lock.lock"), root, None).is_none());
         assert!(accept_path(Path::new("/proj/x.swp"), root, None).is_none());
         assert!(accept_path(Path::new("/proj/debug.log"), root, None).is_none());
+        // Atomic-write temp (editor/agent): `<file>.tmp.<pid>.<hash>` — the noise
+        // that was leaking into the dirty/review/contention surfaces.
+        assert!(
+            accept_path(Path::new("/proj/notes.md.tmp.26298.0a12ff87c3d1"), root, None).is_none()
+        );
+        assert!(accept_path(Path::new("/proj/out.tmp"), root, None).is_none());
+    }
+
+    #[test]
+    fn transient_classifies_temps_but_not_lockfiles() {
+        // Atomic-write temps + editor/OS cruft are transient (filtered everywhere).
+        assert!(is_transient_file("notes.md.tmp.26298.0a12ff87c3d1"));
+        assert!(is_transient_file("out.tmp"));
+        assert!(is_transient_file("main.rs~"));
+        assert!(is_transient_file("buffer.swp"));
+        assert!(is_transient_file("patch.orig"));
+        assert!(is_transient_file("data.bak"));
+        assert!(is_transient_file(".#main.rs"));
+        assert!(is_transient_file("4913"));
+        assert!(is_transient_file(".DS_Store"));
+        // Lockfiles/logs are NOT transient — they can be real, reviewable changes
+        // (so the diff keeps them), even though the watcher still ignores them.
+        assert!(!is_transient_file("Cargo.lock"));
+        assert!(!is_transient_file("pnpm-lock.yaml"));
+        assert!(!is_transient_file("debug.log"));
+        assert!(!is_transient_file("main.rs"));
+        assert!(is_denied_file("Cargo.lock") && is_denied_file("debug.log"));
     }
 
     #[test]

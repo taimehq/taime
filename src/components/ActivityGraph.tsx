@@ -73,6 +73,7 @@ export function ActivityGraph() {
   const openDiff = useStore((s) => s.openDiff);
   const frames = useStore((s) => s.frames);
   const terminalStatuses = useStore((s) => s.terminalStatuses);
+  const activeWorkspaceRoot = useStore((s) => s.activeWorkspaceRoot);
 
   const [graph, setGraph] = useState<Graph | null>(null);
   const [loading, setLoading] = useState(false);
@@ -81,14 +82,16 @@ export function ActivityGraph() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setGraph(await api.getGraph(""));
+      // Scope the team to the active workspace so the drawer shows this
+      // workspace's agents, not every agent the daemon has ever run.
+      setGraph(await api.getGraph(activeWorkspaceRoot ?? ""));
     } catch {
       setGraph(null);
     } finally {
       setLoading(false);
       firstLoad.current = false;
     }
-  }, []);
+  }, [activeWorkspaceRoot]);
 
   // Live: load on open + poll every 2s while open so the team appears as it forms.
   useEffect(() => {

@@ -553,6 +553,32 @@ impl Store {
         Ok(rows)
     }
 
+    /// Like [`graph_agents`], but scoped to a single workspace: an agent belongs
+    /// to `workspace_root` when its worktree was cut from it (`project_root`) or —
+    /// for a live agent running directly in the project with no isolated worktree
+    /// — when its session `cwd` is that root. Keeps the Team drawer showing only
+    /// the active workspace's team rather than every agent the daemon has ever run.
+    pub fn graph_agents_in_workspace(
+        &self,
+        workspace_root: &str,
+    ) -> rusqlite::Result<Vec<(String, Option<String>, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(s.attribution_key, s.pty_session_id) AS aid, s.provider, s.status \
+             FROM daemon_sessions s \
+             LEFT JOIN taime_worktrees w \
+               ON w.terminal_id = COALESCE(s.attribution_key, s.pty_session_id) \
+             WHERE w.project_root = ?1 OR (w.project_root IS NULL AND s.cwd = ?1) \
+             ORDER BY s.created_at_unix DESC LIMIT 40",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![workspace_root], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Inter-agent edges for the activity graph: `(kind, source, target)` from the
     /// recorded message/request/reply/handoff/assign events (Phase 6), oldest
     /// first. Bounded to the most recent window — this runs on every graph

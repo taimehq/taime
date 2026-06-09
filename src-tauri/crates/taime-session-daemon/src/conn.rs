@@ -149,7 +149,9 @@ pub async fn handle(stream: UnixStream, manager: Arc<Manager>, token: String) {
                 send(&out_tx, &ServerMsg::McpResponse { req_id, json: resp }).await;
             }
             ClientMsg::GetGraph { req_id } => {
-                let json = manager.activity_graph_json();
+                // Legacy daemon-wide graph; the workspace-scoped Team drawer goes
+                // through the `graph` query arm with a `workspace_root`.
+                let json = manager.activity_graph_json(None);
                 send(&out_tx, &ServerMsg::Graph { req_id, json }).await;
             }
             ClientMsg::Query { req_id, kind, args } => {

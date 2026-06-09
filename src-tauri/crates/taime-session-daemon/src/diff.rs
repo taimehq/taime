@@ -81,6 +81,15 @@ pub fn workspace_info(path: &str) -> Value {
 }
 
 /// The combined working-tree diff + changed-file list (CAO `get_terminal_diff`).
+/// Skip clearly-transient files (atomic-write temps, swap/backup, OS cruft) from
+/// the review/diff/contention surfaces — the same rule the fs watcher uses, so
+/// write-churn noise (e.g. `foo.md.tmp.<pid>.<hash>`) never shows up as a
+/// reviewable change.
+fn is_transient(rel_path: &str) -> bool {
+    let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    crate::fswatch::is_transient_file(name)
+}
+
 pub fn terminal_diff(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
     let path = Path::new(cwd);
     if !is_git(path) {
@@ -94,14 +103,14 @@ pub fn terminal_diff(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
     let mut files: Vec<String> = git_ok(path, &["diff", &base, "--name-only"])
         .unwrap_or_default()
         .lines()
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !is_transient(l))
         .map(String::from)
         .collect();
-    // Untracked files as synthetic added diffs.
+    // Untracked files as synthetic added diffs (skipping transient temps).
     for f in git_ok(path, &["ls-files", "--others", "--exclude-standard"])
         .unwrap_or_default()
         .lines()
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !is_transient(l))
     {
         if let Ok(o) = git_raw(path, &["diff", "--no-index", "--", "/dev/null", f]) {
             diff.push_str(&String::from_utf8_lossy(&o.stdout));
@@ -155,6 +164,9 @@ pub fn file_diffs(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
         } else {
             continue;
         };
+        if is_transient(&new_path) {
+            continue;
+        }
         let (add, del, binary) = nums.get(&new_path).copied().unwrap_or((0, 0, false));
         let original = if status == "added" {
             String::new()
@@ -173,11 +185,11 @@ pub fn file_diffs(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
             "additions": add, "deletions": del, "binary": binary || bin2
         }));
     }
-    // Untracked → added.
+    // Untracked → added (skipping transient temps).
     for f in git_ok(path, &["ls-files", "--others", "--exclude-standard"])
         .unwrap_or_default()
         .lines()
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !is_transient(l))
     {
         let (modified, binary) = read_worktree_file(path, f);
         let adds = modified.lines().count() as i64;
@@ -414,6 +426,35 @@ mod tests {
         assert!(files.iter().any(|f| f == "a.txt"));
         assert!(files.iter().any(|f| f == "b.txt"));
         assert!(v["diff"].as_str().unwrap().contains("TWO"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diffs_exclude_atomic_write_temps() {
+        let dir = repo();
+        // A real edit plus the atomic-write temp an editor/agent leaves behind.
+        std::fs::write(dir.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        std::fs::write(dir.join("a.txt.tmp.26298.0a12ff87c3d1"), "scratch\n").unwrap();
+        std::fs::write(dir.join("notes.md~"), "backup\n").unwrap();
+
+        let t = terminal_diff("t1", dir.to_str().unwrap(), Some("HEAD"));
+        let tfiles = t["files"].as_array().unwrap();
+        assert!(tfiles.iter().any(|f| f == "a.txt"), "real edit shows");
+        assert!(
+            !tfiles.iter().any(|f| f.as_str().unwrap().contains(".tmp.") || f.as_str().unwrap().ends_with('~')),
+            "transient temps filtered from terminal_diff: {tfiles:?}"
+        );
+
+        let f = file_diffs("t1", dir.to_str().unwrap(), Some("HEAD"));
+        let ffiles = f["files"].as_array().unwrap();
+        assert!(ffiles.iter().any(|f| f["path"] == "a.txt"));
+        assert!(
+            !ffiles.iter().any(|f| {
+                let p = f["path"].as_str().unwrap();
+                p.contains(".tmp.") || p.ends_with('~')
+            }),
+            "transient temps filtered from file_diffs review list"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
