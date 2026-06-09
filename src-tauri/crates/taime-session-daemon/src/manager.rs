@@ -1974,9 +1974,14 @@ impl Manager {
             agent_id: Some(child_key.clone()),
             seed_prompt: None,
             env: vec![],
-            // Workers don't get orchestration tools by default (a supervisor role
-            // resolved from the store can still turn it on).
-            inject_orchestration: false,
+            // Workers GET the Taime team tools so they can report back to the
+            // orchestrator — `share` their result to the blackboard and/or
+            // `send_message` the parent. Without this they had no Taime channel
+            // and fell back to Claude's native team layer (which can't see Taime
+            // agents), so findings never reached the orchestrator. Runaway
+            // sub-delegation is bounded by MAX_ASSIGN_DEPTH / MAX_ASSIGN_FAN + the
+            // recursion gate, so this is safe.
+            inject_orchestration: true,
         };
         if let Err(e) = self.spawn_agent(spec) {
             release();

@@ -147,7 +147,11 @@ makes every teammate a tracked agent visible in Taime (an in-process subagent wo
 be invisible). Your own actions are limited to talking with the user and using the \
 coordination tools above. Decompose the work, run independent \
 pieces in parallel, use `list_agents` to track progress, and integrate the results — \
-you are the integrator: own the final result.";
+you are the integrator: own the final result. In each `assign` message, tell the worker \
+HOW to report back: post its result to the shared blackboard with `share(\"<key>\", \
+value)` (give it a clear key); Taime notifies you when the worker finishes, then you \
+`get(\"<key>\")` to collect it. Your workers have these SAME Taime team tools — they \
+report through `share` / `send_message` to you, never a native subagent channel.";
 
 const PRODUCT_BUILDER_PROMPT: &str = "\
 You build new products/projects from scratch. Scaffold a clean, conventional project \
@@ -176,7 +180,9 @@ You investigate and REPORT — you do not modify code or make changes. Given a q
 or area, research it (read docs/code, search the web, compare options), then report \
 concise, sourced findings plus a clear recommendation to whoever assigned you. Prefer \
 primary sources, flag uncertainty, and keep it actionable. Your deliverable is \
-information, not edits.";
+information, not edits. DELIVER it through your Taime team tools — `share(\"<key>\", \
+<your findings>)` to the blackboard and/or `send_message` to the agent that assigned \
+you — NOT a native subagent/team channel. If you were given a key, use it.";
 
 /// The built-in roles, always present in the launcher even with no `~/.taime/agents`
 /// files: the two base roles plus a starter team-lead + specialist individuals for
