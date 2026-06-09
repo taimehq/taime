@@ -4,53 +4,57 @@
  * source, exactly like lib/workflowGenPrompt.ts.
  *
  * The composed string is delivered as the FOUNDING agent's assignment (its
- * first prompt), NOT its system prompt. The founding agent launches on the
- * built-in `orchestrator` profile (profiles.rs): that profile already carries a
- * delegation system prompt + the MCP orchestration tools (assign / handoff /
- * list_agents / share / create_workflow). What the orchestrator's system prompt
- * does NOT contain is the exact create_workflow JSON schema — so we fold the
- * shared SCHEMA_BLOCK in here, framed as optional, behind an explicit budget.
+ * first prompt). It launches on the built-in `orchestrator` profile
+ * (profiles.rs): a delegation system prompt + the MCP orchestration tools
+ * (assign / handoff / list_agents / share / create_workflow).
  *
- * Honesty notes (these match what the daemon can actually do):
- *  - We do NOT scaffold the folder daemon-side; the agent runs `git init` and
- *    writes files itself, so genesis stays attributed to its agent_id.
- *  - A brand-new / empty folder provisions in SHARED mode (no HEAD to fork);
- *    the early-commit directive is what later makes isolation meaningful.
- *  - The emergence budget is advisory (prompt-level), not a daemon guarantee.
+ * The founding agent is a TRUE orchestrator — it never writes code itself. It
+ * (1) runs a short discovery conversation with the user to nail down scope +
+ * tech stack, then (2) delegates the build to specialist workers (assign) and
+ * integrates their results. The actual scaffolding/coding is the workers' job
+ * (e.g. the "product-builder" profile). The create_workflow JSON schema
+ * (SCHEMA_BLOCK) is folded in, optional, for when a repeatable loop is worth
+ * saving.
+ *
+ * Delegation depends on the orchestrator's MCP tools (assign) being live — the
+ * daemon injects them for the `orchestrator` profile.
  */
 
 import { SCHEMA_BLOCK } from "./workflowGenPrompt";
 
-const ROLE = `You are the founding agent for a BRAND-NEW project in Taime. The user has described what they want to build (at the end of this message). Begin IMMEDIATELY — do not wait for further instructions and do not ask what to do next. Your very first action is to create the project structure and an initial git commit (see below), then keep going until there is a working MVP. Do the work yourself by default; only bring in specialist help if a subtask is genuinely worth parallelizing.`;
+const ROLE = `You are the founding ORCHESTRATOR for a BRAND-NEW project in Taime (the user's idea is at the end of this message). You COORDINATE a team — you do NOT write code, scaffold files, or run build commands yourself. Your job: turn the idea into a plan the user agrees with, then delegate the building to specialist worker agents and integrate their results. Start now.`;
 
-/** The scaffold contract: own the file-writes + git, and commit EARLY so the
- *  attribution/safe-context-switching thesis has something to attribute. */
-const SCAFFOLD_DIRECTIVE = `GET TO A WORKING START
-- Work in your current working directory — it is the project root.
-- Scaffold a clean, conventional structure for the right stack, implement a minimal but working version (an MVP), and add a README with run instructions.
-- Initialize version control EARLY: run \`git init\` if this isn't already a repo, make an initial commit as soon as a skeleton exists, then commit in small steps. Early commits are how Taime attributes your work and how per-agent isolation sharpens — do not wait until the end.
-- Favor simple, idiomatic choices and working software over breadth. Verify it builds/runs before calling it done.`;
+/** Phase 1: an interactive discovery conversation — the orchestrator helps the
+ *  user pin down scope + tech stack BEFORE any building happens. */
+const DISCOVERY = `STEP 1 — TALK TO THE USER FIRST (do this now; do NOT start building)
+Open a short, focused discovery conversation in this terminal to turn the idea into a concrete plan:
+- Clarify the MVP goal and scope — what it must do first vs. later.
+- Surface key constraints — platform/runtime, the accounts or APIs involved (e.g. Slack / Gmail / Granola access + auth), data, deadlines.
+- Decide the TECH STACK: propose a sensible default stack for this kind of project, justify it in a sentence, and ask the user to confirm or adjust.
+Ask only the few questions that actually change the plan — propose defaults instead of interrogating, and iterate. When the user is happy, write a short plan summary (scope + stack + first milestones) and confirm it before delegating.`;
 
-/** Keep the team small and the structure emergent — the antidote to a
- *  burst of unreviewed work all at once. */
-const EMERGENCE_BUDGET = `GROW THE TEAM ONLY AS THE WORK DEMANDS
-- Do the work yourself by default. Delegate only when a subtask is genuinely independent and worth parallelizing.
-- If you delegate, use \`assign\` with the right specialist role ("product-builder", "feature-builder", "bug-fixer", "security-reviewer"). Keep it to at most TWO workers.
-- Author a Taime workflow only if you identify a repeatable multi-step loop worth saving for later runs — at most one, and only once its shape is clear. Do not create schedules.`;
+/** Phase 2: delegate the build to specialist workers — the orchestrator never
+ *  implements; it assigns, tracks, and integrates. */
+const DELEGATE = `STEP 2 — DELEGATE THE BUILD (only after the user agrees the plan)
+You implement NOTHING yourself. Use the assign tool to spawn specialist workers (each runs in its own git worktree) and integrate what they produce:
+- "product-builder" — scaffold the project for the agreed stack and build the working MVP.
+- "feature-builder" — add features; "bug-fixer" — fix failures with a regression test; "security-reviewer" — audit.
+Give each worker a fully self-contained brief (it sees only what you send — restate the relevant plan + stack). Run independent work in parallel, use list_agents to track progress, and own the final integration plus a short status summary back to the user. If direction becomes unclear mid-build, come back to the user — never guess.`;
 
-/** The create_workflow contract, framed as optional and gated by the budget
- *  above — reuses the exact same SCHEMA_BLOCK the workflow generator uses. */
+/** The create_workflow contract, framed as optional — reuses the exact same
+ *  SCHEMA_BLOCK the workflow generator uses. */
 const WORKFLOW_OPTION = `OPTIONAL — SAVING A REPEATABLE LOOP AS A WORKFLOW
-Only if you decide (per the budget above) that a repeatable loop is worth saving, you can author ONE Taime workflow with the create_workflow tool. Otherwise ignore this section.
+If a repeatable multi-step loop emerges that's worth re-running later (e.g. build → test → fix), you MAY save ONE Taime workflow with the create_workflow tool. Otherwise ignore this section. Do not create schedules.
 
 ${SCHEMA_BLOCK}`;
 
-/** Compose the founding agent's first prompt from the user's project intent. */
+/** Compose the founding orchestrator's first prompt from the user's intent:
+ *  discover (scope + stack) → delegate to workers → integrate; never implement. */
 export function composeSeedPrompt(intent: string): string {
   return [
     ROLE,
-    SCAFFOLD_DIRECTIVE,
-    EMERGENCE_BUDGET,
+    DISCOVERY,
+    DELEGATE,
     WORKFLOW_OPTION,
     `WHAT THE USER WANTS TO BUILD:\n${intent.trim()}`,
   ].join("\n\n");

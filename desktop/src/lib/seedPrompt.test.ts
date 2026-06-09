@@ -15,21 +15,28 @@ describe("composeSeedPrompt", () => {
     expect(out.trimEnd().endsWith(intent)).toBe(true);
   });
 
-  it("carries the scaffold directive: own the files + commit early", () => {
-    expect(out).toContain("git init");
-    expect(out).toContain("current working directory");
-    expect(out.toLowerCase()).toContain("readme");
+  it("frames the founding agent as an orchestrator that never implements", () => {
+    expect(out).toContain("ORCHESTRATOR");
+    expect(out).toContain("do NOT write code");
+    expect(out).toContain("implement NOTHING");
   });
 
-  it("carries the emergence budget (small team, optional workflow, no schedules)", () => {
-    expect(out).toContain("at most TWO workers");
-    expect(out).toContain("Do not create schedules");
+  it("runs a discovery conversation first — scope + tech stack — before building", () => {
+    expect(out).toContain("TALK TO THE USER FIRST");
+    expect(out).toContain("do NOT start building");
+    expect(out).toContain("TECH STACK");
   });
 
-  it("folds in the exact create_workflow schema, framed as optional", () => {
+  it("delegates the build to specialist workers via assign", () => {
+    expect(out).toContain("assign");
+    expect(out).toContain("product-builder");
+  });
+
+  it("folds in the exact create_workflow schema (optional) and forbids schedules", () => {
     expect(out).toContain("OPTIONAL");
     // The contract is the SAME source the workflow generator uses (DRY).
     expect(out).toContain(SCHEMA_BLOCK);
+    expect(out).toContain("Do not create schedules");
   });
 
   it("trims surrounding whitespace from the intent", () => {
