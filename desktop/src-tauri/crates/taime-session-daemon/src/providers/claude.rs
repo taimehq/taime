@@ -159,7 +159,14 @@ impl Provider for ClaudeProvider {
         let tail = view.nonblank_tail(20).join("\n");
 
         // PROCESSING first (work-in-flight beats a stale completed marker).
-        if SPINNER_RE.is_match(&tail) {
+        // "esc to interrupt" is Claude's reliable in-flight marker for the whole
+        // turn. The bare spinner glyph is NOT enough on its own: Claude v2.1+'s
+        // welcome / "what's new" screens carry lines like "… · …" (middle-dot +
+        // ellipsis), which the old loose pattern matched as PROCESSING — and then
+        // the idle-gated first-prompt delivery (deliver_pending) never fired, so a
+        // fresh founding agent sat forever at "working". Require the interrupt hint
+        // OR a start-of-line animated spinner (no bare middle-dot).
+        if text.contains("esc to interrupt") || SPINNER_RE.is_match(&tail) {
             return AgentStatus::Processing;
         }
         // WAITING: the Ink selection widget — but not the auto-handled startup
@@ -244,8 +251,13 @@ fn inject_mcp(spec: &mut DaemonSessionSpec, servers: &[McpServerConfig], termina
 
 // --- Heuristic patterns (ported from claude_code.py:28-52, de-ANSI'd) ---
 use std::sync::LazyLock;
+// Animated spinner ONLY: a star/braille glyph at the START of a (whitespace-led)
+// line, followed by text + "…" (e.g. "✶ Thinking…"). Deliberately excludes the
+// bare middle-dot "·" and requires line-start anchoring, so prose lines that
+// merely contain "· … " (the welcome / "what's new" banner) don't false-match as
+// processing and block idle-gated first-prompt delivery.
 static SPINNER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[✶✢✽✻✳·][^\n]*\x{2026}").unwrap());
+    LazyLock::new(|| Regex::new(r"(?m)^[\s\x{a0}]*[✶✢✽✻✳][^\n]*\x{2026}").unwrap());
 static RESPONSE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"⏺\s").unwrap());
 static IDLE_PROMPT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[>❯][\s\x{a0}]").unwrap());
@@ -378,6 +390,22 @@ mod tests {
 
         let waiting = grid(&["Do you want to proceed?", "  1. Yes", "  2. No", "↑/↓ to navigate"]);
         assert_eq!(p.status(&GridView::new(&waiting)), AgentStatus::WaitingUserAnswer);
+
+        // REGRESSION (Claude v2.1+ welcome / "what's new"): prose lines carry
+        // "·" + "…", which must NOT read as the processing spinner — otherwise the
+        // idle-gated first prompt is never delivered and the agent sits at "working".
+        let welcome = grid(&[
+            "Welcome back Josh!",
+            "Opus 4.8 (1M context) with xh… · Claude Max · Josh Feinblum",
+            "Added a 'disableBundledRipgrep' setting · /release-notes for more…",
+            "~/projects/toai",
+            "❯ ",
+        ]);
+        assert_eq!(p.status(&GridView::new(&welcome)), AgentStatus::Idle);
+
+        // And the real in-flight marker is still detected as Processing.
+        let interrupting = grid(&["⏺ working on it", "Running tests (esc to interrupt)"]);
+        assert_eq!(p.status(&GridView::new(&interrupting)), AgentStatus::Processing);
     }
 
     #[test]
