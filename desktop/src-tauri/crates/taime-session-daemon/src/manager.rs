@@ -341,6 +341,50 @@ impl Manager {
         info
     }
 
+    /// Tear down a workspace (the "delete workspace" flow): kill every live agent
+    /// provisioned from `workspace_root`, force-remove their isolated worktree
+    /// checkouts, drop their worktree rows + review acks, and delete the
+    /// workspace's tasks. Agents/tasks in OTHER workspaces are untouched. Returns
+    /// `(agents_removed, agents_killed, tasks_deleted)`. Shells out to git
+    /// (worktree removal) — call from a blocking context.
+    pub fn delete_workspace(&self, workspace_root: &str) -> (usize, usize, usize) {
+        let Some(store) = &self.store else { return (0, 0, 0) };
+        let agents = store.worktrees_in_workspace(workspace_root).unwrap_or_default();
+        let agent_ids: Vec<String> = agents.iter().map(|w| w.terminal_id.clone()).collect();
+        // Kill live sessions for this workspace. Collect pty ids UNDER the lock,
+        // then kill — never hold the sessions lock across kill() (lock discipline).
+        let pty_ids: Vec<String> = {
+            let map = self.sessions.lock().unwrap();
+            map.iter()
+                .filter(|(_, s)| {
+                    s.attribution_key().map(|k| agent_ids.contains(&k)).unwrap_or(false)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let killed = pty_ids.len();
+        for id in &pty_ids {
+            self.kill(id);
+        }
+        // Remove isolated worktree checkouts (force) + their rows + review acks.
+        // Shared-mode rows point at the user's real project dir — never fs-delete
+        // those here (the optional folder delete is a separate, guarded step).
+        for wt in &agents {
+            if wt.mode.as_deref() == Some("isolated") {
+                crate::worktree::remove_force(
+                    &wt.worktree_path,
+                    wt.repo_root.as_deref(),
+                    wt.branch.as_deref(),
+                );
+            }
+            let _ = store.delete_worktree_row(&wt.terminal_id);
+            let _ = store.clear_reviewed(&wt.terminal_id);
+        }
+        let tasks = store.delete_tasks_for_workspace(workspace_root).unwrap_or(0);
+        self.touch();
+        (agents.len(), killed, tasks)
+    }
+
     pub fn get(&self, id: &str) -> Option<Session> {
         self.sessions.lock().unwrap().get(id).cloned()
     }
@@ -572,6 +616,19 @@ impl Manager {
                 let ids =
                     self.store.as_ref().and_then(|s| s.reviewed_agents().ok()).unwrap_or_default();
                 serde_json::json!(ids).to_string()
+            }
+            // Workspace teardown: stop the workspace's agents + delete its tasks
+            // (the "delete workspace" flow). Folder deletion is a separate,
+            // typed-confirmation step in the app (delete_directory command).
+            "workspace_delete" => {
+                let root = a.get("workspace_root").and_then(|v| v.as_str()).unwrap_or("");
+                if root.is_empty() {
+                    serde_json::json!({ "error": "workspace_root required" }).to_string()
+                } else {
+                    let (agents, killed, tasks) = self.delete_workspace(root);
+                    serde_json::json!({ "ok": true, "agents": agents, "killed": killed, "tasks": tasks })
+                        .to_string()
+                }
             }
             "attribution" => self.attribution_json(tk),
             "agents" => self.agents_json(),
@@ -2187,6 +2244,36 @@ mod tests {
     fn mem_manager() -> Manager {
         let store = crate::store::Store::open_at(std::path::Path::new(":memory:")).unwrap();
         Manager::for_test(Some(store))
+    }
+
+    #[test]
+    fn delete_workspace_tears_down_only_the_target_workspace() {
+        let mgr = mem_manager();
+        let store = mgr.store().unwrap();
+        let mk = |id: &str, root: &str| WorktreeInfo {
+            agent_id: id.into(),
+            project_root: root.into(),
+            repo_root: None,
+            worktree_path: root.into(),
+            branch: None,
+            base_sha: None,
+            mode: "shared".into(), // shared → no git/fs removal in the test
+            error: None,
+        };
+        store.upsert_worktree(&mk("a", "/ws"), "claude_code", 1).unwrap();
+        store.upsert_worktree(&mk("b", "/ws"), "claude_code", 2).unwrap();
+        store.upsert_worktree(&mk("c", "/other"), "claude_code", 3).unwrap();
+        store.create_task("t1", "/ws", "One", "", 1).unwrap();
+        store.create_task("t2", "/other", "Other", "", 2).unwrap();
+
+        // No live sessions in for_test → killed = 0; 2 agents + 1 task removed.
+        let (agents, killed, tasks) = mgr.delete_workspace("/ws");
+        assert_eq!((agents, killed, tasks), (2, 0, 1));
+
+        // The target workspace is gone; the other workspace is untouched.
+        assert_eq!(store.worktrees_in_workspace("/ws").unwrap().len(), 0);
+        assert!(store.worktree_row("c").unwrap().is_some(), "/other agent survives");
+        assert_eq!(store.list_tasks("/other", true).unwrap().len(), 1, "/other tasks survive");
     }
 
     #[test]

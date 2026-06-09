@@ -849,6 +849,49 @@ impl Store {
         .optional()
     }
 
+    // ---- Workspace teardown (the "delete workspace" flow) ----
+
+    /// Every worktree row provisioned from `workspace_root` (all agents in the
+    /// workspace, regardless of task membership) — the teardown set.
+    pub fn worktrees_in_workspace(&self, workspace_root: &str) -> rusqlite::Result<Vec<WorktreeRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORKTREE_COLS} FROM taime_worktrees WHERE project_root = ?1"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![workspace_root], map_worktree)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Delete one worktree row (its agent is being torn down with the workspace).
+    pub fn delete_worktree_row(&self, agent_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM taime_worktrees WHERE terminal_id = ?1",
+            rusqlite::params![agent_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete every task in a workspace, detaching any workflow runs that pointed
+    /// at them first. Returns the number of tasks deleted.
+    pub fn delete_tasks_for_workspace(&self, workspace_root: &str) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE taime_workflow_runs SET task_id = NULL WHERE task_id IN \
+             (SELECT id FROM taime_tasks WHERE workspace_root = ?1)",
+            rusqlite::params![workspace_root],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM taime_tasks WHERE workspace_root = ?1",
+            rusqlite::params![workspace_root],
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     // ---- Durable review acknowledgments (the flagship safe-context-switch
     // ---- guard's state, persisted so it survives a UI/daemon restart) ----
 
@@ -1754,6 +1797,42 @@ mod tests {
         // Clearing an unknown id is a harmless no-op.
         store.clear_reviewed("nobody").unwrap();
         assert_eq!(store.reviewed_agents().unwrap(), vec!["agent-b".to_string()]);
+    }
+
+    #[test]
+    fn workspace_teardown_is_scoped_to_the_workspace() {
+        let store = Store::open_at(std::path::Path::new(":memory:")).unwrap();
+        let mk = |id: &str, root: &str| WorktreeInfo {
+            agent_id: id.into(),
+            project_root: root.into(),
+            repo_root: None,
+            worktree_path: root.into(),
+            branch: None,
+            base_sha: None,
+            mode: "shared".into(),
+            error: None,
+        };
+        store.upsert_worktree(&mk("a", "/ws"), "claude_code", 1).unwrap();
+        store.upsert_worktree(&mk("b", "/ws"), "claude_code", 2).unwrap();
+        store.upsert_worktree(&mk("c", "/other"), "claude_code", 3).unwrap();
+        store.create_task("t1", "/ws", "One", "", 1).unwrap();
+        store.create_task("t2", "/ws", "Two", "", 2).unwrap();
+        store.create_task("t3", "/other", "Other", "", 3).unwrap();
+
+        // Listing is workspace-scoped.
+        let ws = store.worktrees_in_workspace("/ws").unwrap();
+        assert_eq!(ws.len(), 2);
+        assert!(ws.iter().all(|w| w.project_root.as_deref() == Some("/ws")));
+
+        // Deleting rows + tasks affects ONLY the target workspace.
+        store.delete_worktree_row("a").unwrap();
+        store.delete_worktree_row("b").unwrap();
+        assert_eq!(store.worktrees_in_workspace("/ws").unwrap().len(), 0);
+        assert!(store.worktree_row("c").unwrap().is_some(), "/other agent survives");
+
+        assert_eq!(store.delete_tasks_for_workspace("/ws").unwrap(), 2);
+        assert_eq!(store.list_tasks("/ws", true).unwrap().len(), 0);
+        assert_eq!(store.list_tasks("/other", true).unwrap().len(), 1, "/other tasks survive");
     }
 
     fn row(id: &str) -> SessionRow {
