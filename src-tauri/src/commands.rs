@@ -141,6 +141,22 @@ pub async fn daemon_ping(daemon: State<'_, DaemonClient>) -> Result<bool, String
     Ok(daemon.ping().await)
 }
 
+/// Whether a background poll saw an incompatible/unresponsive daemon (review M2).
+/// The UI shows a "restart backend (stops agents)" prompt instead of the poll
+/// silently replacing it.
+#[tauri::command]
+pub async fn daemon_incompatible(daemon: State<'_, DaemonClient>) -> Result<bool, String> {
+    Ok(daemon.incompatible_seen())
+}
+
+/// User-consented backend replacement (review M2): the explicit action behind the
+/// incompatible-daemon prompt. Stops the old daemon's agents and spawns the
+/// current binary.
+#[tauri::command]
+pub async fn daemon_restart(daemon: State<'_, DaemonClient>) -> Result<(), String> {
+    daemon.force_restart().await
+}
+
 /// Provision (or resolve) an isolated git worktree for a daemon agent (Phase 3) —
 /// the daemon-owned replacement for CAO's `/worktrees/provision`. Returns the
 /// worktree info (snake_case fields, incl. `agent_id` = the Agent ID).

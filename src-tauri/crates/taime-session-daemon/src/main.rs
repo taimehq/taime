@@ -16,6 +16,7 @@ mod manager;
 mod mcp;
 mod profiles;
 mod providers;
+mod reap;
 mod schedules;
 mod workflow;
 mod workflow_engine;
@@ -210,6 +211,12 @@ async fn main() -> anyhow::Result<()> {
     manager.load_schedules_on_start();
     manager.seed_example_workflows();
     manager.load_workflow_files();
+    // Boot reconciliation (review H1/H2): kill orphan agent process groups left
+    // by a previous daemon that died without reaping them, and replay any provider
+    // -cleanup ledger rows (injected gemini/grok MCP config) it never tore down.
+    // We hold the liveness lock, so nothing live is touched.
+    reap::sweep_orphan_agents();
+    manager.reconcile_cleanups_on_boot();
     // Startup maintenance, off the accept path: GC clean dead worktrees (the
     // pre-fix leak left checkouts behind forever) + prune aged history rows.
     {
@@ -221,7 +228,10 @@ async fn main() -> anyhow::Result<()> {
     }
     eprintln!("[taime-daemon] listening on {:?}", paths.socket);
 
-    // Signal handler: unlink socket + token, kill children, exit.
+    // Signal handler: terminate every agent's process GROUP + run their provider
+    // cleanup SYNCHRONOUSLY (review H1/H2 — `kill_all` now SIGTERMs the group,
+    // grace, SIGKILLs stragglers, then reaps + tears down injected config before
+    // we exit), unlink socket/token/lock, then exit.
     {
         let paths_sig = Paths {
             dir: paths.dir.clone(),
@@ -259,10 +269,28 @@ async fn main() -> anyhow::Result<()> {
             let mut n: u64 = 0;
             loop {
                 ticker.tick().await;
-                if mgr.gc_tick(QUIET_WINDOW, IDLE_GRACE) {
-                    eprintln!("[taime-daemon] idle with no sessions; shutting down");
-                    cleanup(&paths_gc);
-                    std::process::exit(0);
+                // The maintenance body (dead-session reap, the live reaper, quiet-
+                // window attribution, idle-gated delivery — which does SQLite + a
+                // blocking PTY write — and the idle-shutdown decision) runs on a
+                // blocking thread, SINGLE-FLIGHT (review M6): if a previous tick is
+                // still running (e.g. blocked on a wedged child's stdin), skip this
+                // one rather than piling up blocked jobs every 250 ms.
+                if mgr.try_begin_gc() {
+                    let m = mgr.clone();
+                    let p = Paths {
+                        dir: paths_gc.dir.clone(),
+                        socket: paths_gc.socket.clone(),
+                        token: paths_gc.token.clone(),
+                        lock: paths_gc.lock.clone(),
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        if m.gc_tick(QUIET_WINDOW, IDLE_GRACE) {
+                            eprintln!("[taime-daemon] idle with no sessions; shutting down");
+                            cleanup(&p);
+                            std::process::exit(0);
+                        }
+                        m.end_gc();
+                    });
                 }
                 // Schedules: check due cron schedules every ~30s, OFF the hot tick
                 // (sqlite + an optional shell gate) so a slow gate never stalls the

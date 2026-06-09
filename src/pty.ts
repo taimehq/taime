@@ -194,6 +194,25 @@ export async function daemonPing(): Promise<boolean> {
   }
 }
 
+/** Whether a background poll saw an incompatible/unresponsive daemon (review M2).
+ *  When true, the UI offers a consent-gated restart rather than the poll silently
+ *  replacing the daemon (which would kill every live agent). */
+export async function daemonIncompatible(): Promise<boolean> {
+  if (!inTauri()) return false;
+  try {
+    return await invoke<boolean>("daemon_incompatible");
+  } catch {
+    return false;
+  }
+}
+
+/** User-consented backend restart (review M2) — stops the old daemon's agents and
+ *  spawns the current binary. Behind an explicit confirm in the UI. */
+export async function daemonRestart(): Promise<void> {
+  if (!inTauri()) return;
+  await invoke("daemon_restart");
+}
+
 export async function daemonWrite(sessionId: string, data: string): Promise<void> {
   if (!inTauri()) return;
   try {
@@ -300,7 +319,14 @@ export async function daemonAttach(
       else if (m.type === "status" && onStatus && m.status) onStatus(m.status);
       // Phase 6 push: daemon's per-session watcher saw paths change → mark dirty.
       else if (m.type === "fs_dirty" && onFsDirty && m.paths) onFsDirty(m.paths);
-      else if (m.type === "error") console.warn("[taime] daemon error", msg);
+      // Review M5: the daemon connection dropped (crash / codec error) WITHOUT a
+      // clean process exit. Surface it instead of leaving a silently-frozen
+      // terminal — end the view (the reconcile poll re-syncs; the agent may still
+      // be alive in the daemon and reopenable). Distinct from a process `exit`.
+      else if (m.type === "disconnected") {
+        console.warn("[taime] daemon connection lost for session", sessionId);
+        onExit(null);
+      } else if (m.type === "error") console.warn("[taime] daemon error", msg);
     }
   };
   try {

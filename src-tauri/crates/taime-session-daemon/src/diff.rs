@@ -386,10 +386,28 @@ pub fn apply_selection(
         }
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr).to_string();
-            json!({ "applied": false, "target_dir": target_dir, "files": applied_files, "conflicts": [], "error": err })
+            // `git apply --3way` on a real conflict writes `<<<<<<<`/`>>>>>>>`
+            // markers into the working tree and exits non-zero (review L6).
+            // Distinguish that from a hard apply failure by scanning the targeted
+            // files for markers — a conflict is "applied, needs resolution", not a
+            // silent no-op the old `conflicts:[]` implied.
+            let conflicts: Vec<String> = applied_files
+                .iter()
+                .filter(|f| {
+                    std::fs::read_to_string(Path::new(target_dir).join(f))
+                        .map(|c| c.contains("<<<<<<<") && c.contains(">>>>>>>"))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if conflicts.is_empty() {
+                json!({ "applied": false, "conflicted": false, "target_dir": target_dir, "files": applied_files, "conflicts": [], "error": err })
+            } else {
+                json!({ "applied": true, "conflicted": true, "target_dir": target_dir, "files": applied_files, "conflicts": conflicts, "error": err })
+            }
         }
         Err(e) => {
-            json!({ "applied": false, "target_dir": target_dir, "files": [], "conflicts": [], "error": e.to_string() })
+            json!({ "applied": false, "conflicted": false, "target_dir": target_dir, "files": [], "conflicts": [], "error": e.to_string() })
         }
     }
 }

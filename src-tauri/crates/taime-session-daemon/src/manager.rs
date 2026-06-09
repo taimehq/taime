@@ -5,7 +5,7 @@
 //! keeps it alive.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,6 +51,14 @@ pub struct Manager {
     /// worker at a time), but RUNS would otherwise be unbounded — each is a
     /// thread + a stream of spawned agents outside the assign fan/depth guards.
     active_workflow_runs: AtomicU64,
+    /// Single-flight guard for the maintenance tick (review M6): `gc_tick` now
+    /// runs on a `spawn_blocking` thread, so if one tick wedges (e.g. a blocking
+    /// PTY write to a stalled child) the 250 ms loop must NOT pile up more blocked
+    /// jobs — a tick that finds this already set skips itself.
+    gc_running: AtomicBool,
+    /// Single-flight guard for the cron check (review H3): two overlapping
+    /// `check_schedules` runs must not both fire the same due schedule.
+    schedules_checking: AtomicBool,
 }
 
 // LOCK DISCIPLINE: never hold two Manager mutexes at once. The canonical
@@ -69,6 +77,11 @@ struct AssignNode {
 /// and max direct children per parent — runaway-fanout backstops for `assign`.
 const MAX_ASSIGN_DEPTH: u32 = 4;
 const MAX_ASSIGN_FAN: usize = 8;
+
+/// Grace between a `kill()`'s group SIGTERM and the gc reaper's escalation to a
+/// group SIGKILL (review H1). Generous — a well-behaved CLI exits on SIGTERM in
+/// well under this; the escalation is the backstop for one that ignores it.
+const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Example workflow seeded on first run: implement → test → (PASS: review, FAIL:
 /// loop back to implement). Demonstrates a conditional branch + a loop.
@@ -115,6 +128,15 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Clears an `AtomicBool` single-flight latch on scope exit (even on early return
+/// or panic). Used to guard the gc tick + cron check against re-entry.
+struct FlagGuard<'a>(&'a AtomicBool);
+impl Drop for FlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// The last path component (a workspace's display name), falling back to the
 /// whole string for a rootless/relative path.
 fn basename(path: &str) -> String {
@@ -126,16 +148,54 @@ fn basename(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+/// Hard cap on a schedule gate's wall-clock runtime (review H4). A hanging gate
+/// (waits on stdin, network, a wedged subprocess) must not leak a thread + child
+/// every ~30 s cron tick; a timeout is treated as gate-fail (skip the fire).
+const GATE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Run a schedule's optional shell gate: `sh -c <script>` → exit 0 means proceed.
-/// Runs inside the schedule check's `spawn_blocking`, so a slow gate never stalls
-/// the 250 ms tick.
+/// Runs inside the schedule check's `spawn_blocking`. `stdin` is `/dev/null` so a
+/// gate that reads stdin returns EOF instead of blocking forever, and the run is
+/// bounded by [`GATE_TIMEOUT`] — a timeout kills the gate and fails closed
+/// (review H4). stdout/stderr are discarded (no captured-pipe deadlock).
 fn run_script_gate(script: &str) -> bool {
-    std::process::Command::new("/bin/sh")
+    run_script_gate_with_timeout(script, GATE_TIMEOUT)
+}
+
+/// Inner gate runner with an injectable timeout (so tests can exercise the
+/// timeout path without waiting [`GATE_TIMEOUT`]).
+fn run_script_gate_with_timeout(script: &str, timeout: Duration) -> bool {
+    use std::process::{Command, Stdio};
+    let mut child = match Command::new("/bin/sh")
         .arg("-c")
         .arg(script)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!(
+                        "[taime-daemon] schedule gate exceeded {}s — treating as fail",
+                        timeout.as_secs()
+                    );
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 /// The FIXED, injection-safe `[[var]]` allowlist for a schedule prompt.
@@ -227,6 +287,8 @@ impl Manager {
             weak_self: std::sync::OnceLock::new(),
             worktrees_gced: Mutex::new(std::collections::HashSet::new()),
             active_workflow_runs: AtomicU64::new(0),
+            gc_running: AtomicBool::new(false),
+            schedules_checking: AtomicBool::new(false),
         }
     }
 
@@ -288,6 +350,17 @@ impl Manager {
         let adapter = self.registry.adapter(&spec.provider);
         let id = format!("pty-{:x}", self.session_counter.fetch_add(1, Ordering::SeqCst));
         let program = prepared.spec.prog.clone();
+        // Persist the provider-cleanup ledger (review H2) NOW — `registry.build`
+        // already wrote the injected config (gemini settings.json / grok
+        // config.toml / policy files), so a crash before or during this spawn must
+        // still be reconcilable on boot. The session drops this row when it
+        // finalizes (session.rs `finalize_exit`); whatever survives a daemon
+        // crash is replayed by `reconcile_cleanups_on_boot`.
+        if !prepared.cleanup.actions.is_empty() {
+            if let (Ok(json), Some(store)) = (serde_json::to_string(&prepared.cleanup), &self.store) {
+                let _ = store.record_cleanup(&id, &json, now_unix());
+            }
+        }
         let session = Session::spawn_prepared(id.clone(), prepared, adapter, self.store.clone())?;
         self.sessions.lock().unwrap().insert(id.clone(), session);
         if let (Some(token), Some(key)) = (issued_token, &spec.agent_id) {
@@ -729,6 +802,13 @@ impl Manager {
             }
             "workflow_run_status" => {
                 self.workflow_run_status_json(a.get("run_id").and_then(|v| v.as_str()).unwrap_or(""))
+            }
+            "workflow_cancel" => {
+                let run_id = a.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
+                match self.cancel_workflow_run(run_id) {
+                    Ok(cancelled) => serde_json::json!({ "ok": true, "cancelled": cancelled }).to_string(),
+                    Err(e) => serde_json::json!({ "error": e }).to_string(),
+                }
             }
             "workflow_delete" => {
                 let _ = self.delete_workflow(a.get("name").and_then(|v| v.as_str()).unwrap_or(""));
@@ -1493,16 +1573,22 @@ impl Manager {
         }
     }
 
-    /// Fire one schedule: run its optional shell gate (non-zero exit = skip), then
-    /// spawn the agent with the var-substituted prompt. Always advances last/next.
+    /// Fire one schedule: CLAIM it (advance last/next FIRST), then run its optional
+    /// shell gate (non-zero exit = skip) and spawn the agent with the
+    /// var-substituted prompt.
     fn fire_schedule(&self, row: &ScheduleRow) {
         let now = now_unix();
         let next = schedules::next_run_unix(&row.schedule);
+        // CLAIM up front (review H3): advance next_run BEFORE the gate + spawn so
+        // an overlapping ~30s tick — or a slow gate — can't see this row as still
+        // due and double-fire it. A failed/slow fire waits for the next cron
+        // instant instead of re-firing every tick (the daemon already does not
+        // backfill instants missed while it was down, so skipping one is in band).
+        if let Some(store) = &self.store {
+            let _ = store.set_schedule_run(&row.name, now, next);
+        }
         if let Some(script) = row.script.as_deref().filter(|s| !s.trim().is_empty()) {
             if !run_script_gate(script) {
-                if let Some(store) = &self.store {
-                    let _ = store.set_schedule_run(&row.name, now, next);
-                }
                 return;
             }
         }
@@ -1525,13 +1611,20 @@ impl Manager {
                 }
             }
         }
-        if let Some(store) = &self.store {
-            let _ = store.set_schedule_run(&row.name, now, next);
-        }
     }
 
     /// The cron tick (called every ~30s off the hot loop): fire all due schedules.
+    /// Single-flight (review H3): if a previous check is still running (e.g. a slow
+    /// gate), skip this one so two overlapping ticks can't fire the same row.
     pub fn check_schedules(&self) {
+        if self
+            .schedules_checking
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let _guard = FlagGuard(&self.schedules_checking);
         let Some(store) = &self.store else { return };
         for row in store.due_schedules(now_unix()).unwrap_or_default() {
             self.fire_schedule(&row);
@@ -1708,6 +1801,16 @@ impl Manager {
             let _ = std::fs::remove_file(&path);
         }
         store.delete_workflow(name).map_err(|e| e.to_string())
+    }
+
+    /// Cancel an in-flight workflow run (review M8): flip its status to
+    /// `cancelled`. The engine's `wait_for_output` bail observes it within a poll
+    /// tick (≤2s), ends the run, and kills the in-flight node worker — so a wedged
+    /// run (a node whose worker never `share`s) no longer burns up to 20 min/node
+    /// and a concurrency slot uncancellably.
+    pub fn cancel_workflow_run(&self, run_id: &str) -> Result<bool, String> {
+        let store = self.store.as_ref().ok_or("persistence disabled")?;
+        store.cancel_run(run_id, now_unix()).map_err(|e| e.to_string())
     }
 
     /// Spawn one workflow-node worker: a worktree off `project_root` (if any), the
@@ -2063,30 +2166,55 @@ impl Manager {
         sums
     }
 
+    /// Kill one session. SIGTERMs the agent's whole process group (review H1) and
+    /// leaves it in the live map: the gc reaper escalates to SIGKILL after a
+    /// grace if it ignores SIGTERM, then reaps it (running provider cleanup +
+    /// recording the exit + dropping its MCP token + the parent fan-in) on a
+    /// later tick — the single reap path, instead of a second one here that would
+    /// miss a SIGTERM-ignoring CLI.
     pub fn kill(&self, id: &str) {
-        let session = self.sessions.lock().unwrap().remove(id);
+        let session = self.sessions.lock().unwrap().get(id).cloned();
         if let Some(s) = session {
-            let akey = s.attribution_key();
             s.kill();
-            // Removed from the live map, so gc_tick won't see it die — record the
-            // exit + drop its MCP token here.
-            if let Some(store) = &self.store {
-                let _ = store.set_session_status(id, "exited");
-            }
-            if let Some(akey) = akey {
-                self.tokens.lock().unwrap().retain(|_, v| v != &akey);
-                self.roles.lock().unwrap().remove(&akey);
-                self.assignments.lock().unwrap().remove(&akey);
-            }
         }
         self.touch();
     }
 
+    /// Shutdown teardown (review H1/H2): terminate every agent's process GROUP,
+    /// give one shared grace, SIGKILL stragglers, then reap + run provider cleanup
+    /// SYNCHRONOUSLY — the signal handler `process::exit`s next, so the reader
+    /// threads and the gc reaper will never get to it. Without this, injected
+    /// gemini/grok MCP config (dead `taime` server entries, policy files) leaks
+    /// into the user's real `~/.gemini`/`~/.grok` on every shutdown.
     pub fn kill_all(&self) {
         let sessions: Vec<Session> = self.sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
-        for s in sessions {
-            s.kill();
+        if sessions.is_empty() {
+            return;
         }
+        // 1. SIGTERM every group.
+        for s in &sessions {
+            s.shutdown_terminate();
+        }
+        // 2. One shared grace for graceful exit.
+        std::thread::sleep(Duration::from_millis(400));
+        // 3. SIGKILL any straggler group, then reap + run cleanup inline.
+        for s in &sessions {
+            s.shutdown_finalize();
+        }
+    }
+
+    /// Begin the maintenance tick iff no tick is already running (review M6):
+    /// returns true if the caller now owns the single-flight latch. The owner must
+    /// call [`Manager::end_gc`] when done (unless it `process::exit`s).
+    pub fn try_begin_gc(&self) -> bool {
+        self.gc_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Release the maintenance-tick single-flight latch.
+    pub fn end_gc(&self) {
+        self.gc_running.store(false, Ordering::SeqCst);
     }
 
     /// Garbage-collect dead agents' isolated worktrees (startup + every ~10min,
@@ -2142,6 +2270,36 @@ impl Manager {
             eprintln!(
                 "[taime-daemon] worktree gc: removed {removed} clean checkout(s), \
                  kept {kept} with work"
+            );
+        }
+    }
+
+    /// Replay + clear any provider-cleanup ledger rows left by a PRIOR daemon that
+    /// died (SIGKILL/crash/OOM) before its own teardown ran (review H2 — the
+    /// load-bearing half, since an abrupt death bypasses both the reader EOF path
+    /// and the signal handler's synchronous cleanup). Idempotent: the actions are
+    /// removals. Runs once at startup, before serving. A freshly-spawned session
+    /// won't have a row yet, so only orphans are touched.
+    pub fn reconcile_cleanups_on_boot(&self) {
+        let Some(store) = &self.store else { return };
+        let rows = match store.all_cleanups() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let mut actions = 0usize;
+        for (session_id, json) in rows {
+            if let Ok(cleanup) = serde_json::from_str::<crate::providers::Cleanup>(&json) {
+                cleanup.run();
+                actions += cleanup.actions.len();
+            }
+            let _ = store.delete_cleanup(&session_id);
+        }
+        if actions > 0 {
+            eprintln!(
+                "[taime-daemon] boot reconcile: replayed {actions} orphaned provider-cleanup action(s)"
             );
         }
     }
@@ -2205,10 +2363,17 @@ impl Manager {
                 }
             }
         }
-        // Quiet-window attribution boundaries + status-change pushes for live
-        // sessions.
+        // Live-session maintenance. The reaper (review H1/M15) runs FIRST: reap a
+        // session whose child exited while its reader was parked on backpressure
+        // (or before the reader observed EOF), and escalate an unanswered kill()
+        // to a group SIGKILL after the grace. A session reaped here is removed
+        // from the map on the next tick's dead-sweep above.
         let live: Vec<Session> = self.sessions.lock().unwrap().values().cloned().collect();
         for s in &live {
+            if s.reap_if_exited() {
+                continue;
+            }
+            s.escalate_kill_if_due(KILL_GRACE);
             s.quiet_check(quiet_threshold);
             s.push_status_if_changed();
         }
@@ -2245,6 +2410,8 @@ impl Manager {
             weak_self: std::sync::OnceLock::new(),
             worktrees_gced: Mutex::new(std::collections::HashSet::new()),
             active_workflow_runs: AtomicU64::new(0),
+            gc_running: AtomicBool::new(false),
+            schedules_checking: AtomicBool::new(false),
         }
     }
 
@@ -2266,6 +2433,25 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review H4 regression: the schedule gate must honor exit status AND fail
+    /// closed (kill the child) on timeout, without waiting the full sleep.
+    #[test]
+    fn gate_honors_exit_status() {
+        assert!(run_script_gate_with_timeout("exit 0", Duration::from_secs(5)));
+        assert!(!run_script_gate_with_timeout("exit 1", Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn gate_times_out_and_fails_closed() {
+        let start = Instant::now();
+        let passed = run_script_gate_with_timeout("sleep 30", Duration::from_millis(300));
+        assert!(!passed, "a hanging gate must fail closed");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must abandon at the timeout, not wait the full sleep"
+        );
+    }
 
     #[test]
     fn delivery_payload_is_clearly_delimited() {

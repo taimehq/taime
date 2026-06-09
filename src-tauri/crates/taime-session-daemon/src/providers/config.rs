@@ -10,9 +10,33 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 
 use serde::Deserialize;
+
+/// Write `contents` to `path` atomically (review H2 hardening): write a sibling
+/// temp, fsync it, then rename over the target. A daemon crash mid-write can then
+/// never leave the user's real `~/.gemini/settings.json` / `~/.grok/config.toml`
+/// truncated — the rename either fully lands or doesn't happen. The temp lives in
+/// the same dir (rename is atomic only within a filesystem) and uses the
+/// `.tmp.<pid>` suffix the watcher/diff already treat as transient.
+fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("settings");
+    let tmp = path.with_file_name(format!(".{name}.tmp.{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
 
 /// Per-provider overridable data.
 #[derive(Debug, Clone, Deserialize)]
@@ -197,7 +221,7 @@ pub fn merge_json_mcp_servers(
         mcp_obj.insert(name.clone(), value.clone());
     }
     let pretty = serde_json::to_string_pretty(&root)?;
-    std::fs::write(path, pretty)
+    atomic_write(path, pretty.as_bytes())
 }
 
 /// Remove named keys from `mcpServers` in a JSON settings file; drop the
@@ -227,7 +251,7 @@ pub fn remove_json_mcp_servers(path: &Path, names: &[String]) -> io::Result<()> 
         }
     }
     let pretty = serde_json::to_string_pretty(&root)?;
-    std::fs::write(path, pretty)
+    atomic_write(path, pretty.as_bytes())
 }
 
 /// Merge `[mcp_servers.<name>]` sections into a TOML config file (grok
@@ -272,7 +296,7 @@ pub fn merge_toml_mcp_servers(
         t.insert("env", toml_edit::value(env));
         mcp.insert(&s.name, Item::Table(t));
     }
-    std::fs::write(path, doc.to_string())
+    atomic_write(path, doc.to_string().as_bytes())
 }
 
 /// Remove named `[mcp_servers.<name>]` sections from a TOML config file; drop
@@ -300,7 +324,7 @@ pub fn remove_toml_mcp_servers(path: &Path, names: &[String]) -> io::Result<()> 
     if now_empty {
         doc.remove("mcp_servers");
     }
-    std::fs::write(path, doc.to_string())
+    atomic_write(path, doc.to_string().as_bytes())
 }
 
 #[cfg(test)]

@@ -128,19 +128,26 @@ impl Provider for CodexProvider {
         if APPROVE_RE.is_match(&text) {
             return AgentStatus::WaitingUserAnswer;
         }
-        if ERROR_RE.is_match(&text) {
-            return AgentStatus::Error;
-        }
-        if PROGRESS_RE.is_match(&text) {
+        // PROCESSING only if the in-flight marker is in the TAIL (review L4): a
+        // stale "(Ns • esc to interrupt)" line that has scrolled up must not pin
+        // Processing and block idle-gated delivery.
+        let tail = view.nonblank_tail(8).join("\n");
+        if PROGRESS_RE.is_match(&tail) {
             return AgentStatus::Processing;
         }
-        let tail = view.nonblank_tail(5).join("\n");
-        let has_idle = IDLE_PROMPT_RE.is_match(&tail);
+        let idle_tail = view.nonblank_tail(5).join("\n");
+        let has_idle = IDLE_PROMPT_RE.is_match(&idle_tail);
         if has_idle {
             if ASSISTANT_RE.is_match(&text) {
                 return AgentStatus::Completed;
             }
             return AgentStatus::Idle;
+        }
+        // ERROR scoped to the chrome-filtered tail and checked AFTER idle/complete
+        // (review L5): an agent that QUOTES "Error:" / a Traceback in its output
+        // must not flip a finished turn to ERROR.
+        if ERROR_RE.is_match(&tail) {
+            return AgentStatus::Error;
         }
         AgentStatus::Processing
     }

@@ -192,7 +192,17 @@ impl Provider for GeminiProvider {
             }
             return AgentStatus::Idle;
         }
-        if ERROR_RE.is_match(&text) {
+        // ERROR scoped to the tail (review L5): already guarded behind !has_idle,
+        // but matching the whole grid would still flip on an agent quoting an
+        // error up in scrollback. The chrome-light tail is the live screen.
+        let error_tail = tail
+            .iter()
+            .rev()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if ERROR_RE.is_match(&error_tail) {
             return AgentStatus::Error;
         }
         AgentStatus::Processing

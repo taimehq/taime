@@ -130,14 +130,18 @@ impl Provider for GrokProvider {
         if WAITING_RE.is_match(&prompt_area) {
             return AgentStatus::WaitingUserAnswer;
         }
-        if ERROR_RE.is_match(&text) {
-            return AgentStatus::Error;
-        }
         if PROCESSING_RE.is_match(&text) || PLAN_RE.is_match(&text) {
             return AgentStatus::Processing;
         }
         if TURN_COMPLETE_RE.is_match(&text) {
             return AgentStatus::Completed;
+        }
+        // ERROR scoped to the chrome-filtered prompt area and checked AFTER
+        // completed (review L5): an agent quoting "Error:" / a Traceback (or, with
+        // the dropped bare "failed to" alternative, normal prose like "failed to
+        // compile") must not beat the legitimate Completed/Idle state.
+        if ERROR_RE.is_match(&prompt_area) {
+            return AgentStatus::Error;
         }
         if has_footer {
             return AgentStatus::Idle;
@@ -233,7 +237,9 @@ static WAITING_RE: LazyLock<Regex> = LazyLock::new(|| {
 static CHROME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"always-approve|Grok Build|Shift\+Tab:|Ctrl\+\.").unwrap());
 static ERROR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:^|\n)\s*(?:Error:|ERROR:|panic:|rate limit|quota exceeded|authentication failed|failed to)")
+    // `failed to` dropped (review L5) — too loose: matched normal prose like
+    // "failed to compile". Kept: explicit error/panic/quota/auth markers.
+    Regex::new(r"(?i)(?:^|\n)\s*(?:Error:|ERROR:|panic:|rate limit|quota exceeded|authentication failed)")
         .unwrap()
 });
 static EXTRACT_CHROME_RE: LazyLock<Regex> = LazyLock::new(|| {

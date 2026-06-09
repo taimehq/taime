@@ -26,6 +26,20 @@ use crate::emulator;
 pub fn serialize(term: &Terminal) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(4096);
 
+    // Self-sufficient reset prelude (review L2/L3): the daemon OWNS the repaint
+    // invariant — it must not depend on a client-emitted reset (the frontend
+    // emits none; reattach works today only because it mounts a FRESH xterm).
+    // Force a known baseline so reattach converges from ANY xterm state and
+    // survives a future scrollback-preserving optimization that reuses an xterm.
+    // (DECSTR already restores most of these; the explicit modes are belt-and-
+    // suspenders and no-ops on a fresh terminal, so the common case is unchanged.)
+    out.extend_from_slice(b"\x1b[?1049l"); // exit alt screen → main
+    out.extend_from_slice(b"\x1b[!p"); // DECSTR soft reset
+    out.extend_from_slice(b"\x1b[?7h"); // autowrap on (default)
+    out.extend_from_slice(b"\x1b[?1l"); // DECCKM off (normal cursor keys)
+    out.extend_from_slice(b"\x1b[r"); // reset scroll region to full screen
+    out.extend_from_slice(b"\x1b(B"); // G0 = US-ASCII charset
+
     // If the grid is on the alternate screen (TUI apps like claude), re-enter it
     // so a later alt-screen *exit* by the agent correctly restores xterm's main
     // screen. The prelude reset us to the main screen; this sets the real target.
@@ -146,14 +160,21 @@ mod tests {
         let s = repaint_string(b"hello world", 24, 80);
         assert!(s.contains("hello world"), "repaint should carry the text: {s:?}");
         assert!(s.contains("\x1b[2J"), "repaint should clear the screen");
-        assert!(s.starts_with("\x1b[0m\x1b[2J\x1b[H") || s.starts_with("\x1b[?1049h"));
+        // Self-sufficient reset prelude leads (review L2/L3): exit alt + DECSTR.
+        assert!(s.starts_with("\x1b[?1049l\x1b[!p"), "reset prelude should lead: {s:?}");
+        assert!(s.contains("\x1b[0m\x1b[2J\x1b[H"), "should still reset+clear+home");
     }
 
     #[test]
     fn repaint_reenters_alt_screen_when_active() {
         // Enter alt screen, draw — repaint must re-enter alt so xterm matches.
         let s = repaint_string(b"\x1b[?1049hTUI", 24, 80);
-        assert!(s.starts_with("\x1b[?1049h"), "must re-enter alt screen: {s:?}");
+        // The prelude exits alt first (\x1b[?1049l) for a known baseline, THEN
+        // re-enters it because the grid is alt-active.
+        assert!(s.contains("\x1b[?1049h"), "must re-enter alt screen: {s:?}");
+        let exit = s.find("\x1b[?1049l").unwrap();
+        let reenter = s.find("\x1b[?1049h").unwrap();
+        assert!(exit < reenter, "exit-alt baseline precedes re-enter: {s:?}");
         assert!(s.contains("TUI"));
     }
 

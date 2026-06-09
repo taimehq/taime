@@ -22,6 +22,22 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 use taime_protocol::WorktreeInfo;
 
+/// Current schema level, stamped into `PRAGMA user_version` after migrate (review
+/// L13). Bump when the schema changes so a future gating migration can branch.
+const SCHEMA_VERSION: i64 = 11;
+
+/// Run an additive `ALTER TABLE … ADD COLUMN`, ignoring ONLY the "duplicate
+/// column" error (the column already exists — idempotent re-run) and PROPAGATING
+/// every other error (review L13): a transient lock, disk-full, or corruption
+/// must fail `migrate` loudly rather than silently half-apply.
+fn add_column(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// The CAO tables to import, each with its explicit column list (robust against
 /// schema-order drift between CAO's SQLAlchemy DDL and our `CREATE TABLE`).
 const IMPORT_TABLES: &[(&str, &str)] = &[
@@ -165,18 +181,31 @@ impl Store {
             rusqlite::Error::InvalidParameterName(format!("create data dir: {e}"))
         })?;
         let conn = Connection::open(dir.join("taime.sqlite"))?;
-        // WAL for concurrent readers + a single writer; durable across crashes.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Self::tune(&conn)?;
         let store = Store { conn: Mutex::new(conn) };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Connection PRAGMAs shared by every open path. WAL gives concurrent readers
+    /// with a single writer; `busy_timeout` (review L12) lets a brief overlap —
+    /// e.g. a separate `--import-cao` invocation racing the live daemon, or two
+    /// `spawn_blocking` maintenance threads — wait instead of returning an instant
+    /// SQLITE_BUSY that silently drops a best-effort write. `synchronous=NORMAL`
+    /// is the durable+fast setting under WAL.
+    fn tune(conn: &Connection) -> rusqlite::Result<()> {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(())
     }
 
     /// Open at an explicit path (tests).
     #[cfg(test)]
     pub fn open_at(path: &std::path::Path) -> rusqlite::Result<Store> {
         let conn = Connection::open(path)?;
+        Self::tune(&conn)?;
         let store = Store { conn: Mutex::new(conn) };
         store.migrate()?;
         Ok(store)
@@ -185,20 +214,22 @@ impl Store {
     fn migrate(&self) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SCHEMA)?;
-        // Additive column migrations (ALTER … ADD COLUMN is not IF-NOT-EXISTS, so
-        // ignore the "duplicate column" error to stay idempotent across versions).
+        // Additive column migrations. ALTER … ADD COLUMN is not IF-NOT-EXISTS, so
+        // `add_column` ignores ONLY the "duplicate column" error (idempotency)
+        // and PROPAGATES anything else — a transient lock / disk-full / corruption
+        // must fail migrate loudly, not silently half-apply (review L13).
         // `prompt` backs Schedules created in-app (the .md body, stored inline).
-        let _ = conn.execute("ALTER TABLE flows ADD COLUMN prompt TEXT", []);
+        add_column(&conn, "ALTER TABLE flows ADD COLUMN prompt TEXT")?;
         // Tasks (v9): membership is a nullable task_id on the durable records —
         // the worktree row (agents) and the workflow run. NULL ⇒ Uncategorized.
-        let _ = conn.execute("ALTER TABLE taime_worktrees ADD COLUMN task_id TEXT", []);
-        let _ = conn.execute("ALTER TABLE taime_workflow_runs ADD COLUMN task_id TEXT", []);
+        add_column(&conn, "ALTER TABLE taime_worktrees ADD COLUMN task_id TEXT")?;
+        add_column(&conn, "ALTER TABLE taime_workflow_runs ADD COLUMN task_id TEXT")?;
         // Schedules gain a workspace target (prerequisite for task-scoped fires)
         // and an explicit task behavior: task_mode ∈ NULL/'' (uncategorized) |
         // 'fixed' (attach to task_id) | 'per_run' (create a task per fire).
-        let _ = conn.execute("ALTER TABLE flows ADD COLUMN workspace_root TEXT", []);
-        let _ = conn.execute("ALTER TABLE flows ADD COLUMN task_mode TEXT", []);
-        let _ = conn.execute("ALTER TABLE flows ADD COLUMN task_id TEXT", []);
+        add_column(&conn, "ALTER TABLE flows ADD COLUMN workspace_root TEXT")?;
+        add_column(&conn, "ALTER TABLE flows ADD COLUMN task_mode TEXT")?;
+        add_column(&conn, "ALTER TABLE flows ADD COLUMN task_id TEXT")?;
         // This index references the ALTER-added column, so it must run AFTER the
         // ALTERs (a pre-existing DB's SCHEMA batch ran before task_id existed).
         conn.execute(
@@ -222,6 +253,10 @@ impl Store {
             "UPDATE daemon_sessions SET status = 'exited' WHERE status = 'running'",
             [],
         )?;
+        // Stamp the schema version (review L13). Not yet a gating ladder — the
+        // CREATE-IF-NOT-EXISTS + add_column scheme is still authoritative — but it
+        // records the level so a future migration can branch on it.
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -255,6 +290,42 @@ impl Store {
             rusqlite::params![pty_session_id, status],
         )?;
         Ok(())
+    }
+
+    /// Persist a session's provider-cleanup actions (review H2). `actions_json` is
+    /// the serialized `Vec<CleanupAction>`; no-op for spawns with nothing to undo.
+    pub fn record_cleanup(
+        &self,
+        session_id: &str,
+        actions_json: &str,
+        now_unix: u64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO taime_cleanups (session_id, actions_json, created_at_unix) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(session_id) DO UPDATE SET actions_json = excluded.actions_json",
+            rusqlite::params![session_id, actions_json, now_unix as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a session's cleanup-ledger row once its teardown has run.
+    pub fn delete_cleanup(&self, session_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM taime_cleanups WHERE session_id = ?1", [session_id])?;
+        Ok(())
+    }
+
+    /// Every persisted cleanup ledger row `(session_id, actions_json)`. On boot,
+    /// any survivor is an orphan from a daemon that died before its teardown ran.
+    pub fn all_cleanups(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT session_id, actions_json FROM taime_cleanups")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Persist (or update) a provisioned worktree row, keyed by the Agent ID
@@ -422,9 +493,10 @@ impl Store {
         Ok(())
     }
 
-    /// Record one attributed filesystem change (`kind = "fs"`) for an agent's
-    /// terminal — the durable per-file activity timeline (Phase 6, daemon-owned
-    /// so it accrues even with the app closed).
+    /// Record one attributed filesystem change (`kind = "fs"`). Superseded in
+    /// production by the batched [`Store::record_fs_events`] (review L8); retained
+    /// for the attribution unit tests that seed single rows.
+    #[cfg(test)]
     pub fn record_fs_event(
         &self,
         id: &str,
@@ -440,6 +512,35 @@ impl Store {
             rusqlite::params![id, ts_unix.to_string(), terminal_id, path, change_kind],
         )?;
         Ok(())
+    }
+
+    /// Batch-record an fs-change burst for one terminal in a SINGLE transaction
+    /// (review L8) — `rows` is `(event_id, path, change_kind)`, all stamped `ts`.
+    /// One fsync'd commit for the whole debounced batch instead of N autocommits
+    /// (a codemod touching many files otherwise contends per-file with the gc
+    /// tick on the single write connection).
+    pub fn record_fs_events(
+        &self,
+        terminal_id: &str,
+        ts_unix: u64,
+        rows: &[(String, String, String)],
+    ) -> rusqlite::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO taime_activity_events (id, ts, kind, terminal_id, path, change_kind) \
+                 VALUES (?1, ?2, 'fs', ?3, ?4, ?5)",
+            )?;
+            let ts = ts_unix.to_string();
+            for (id, path, kind) in rows {
+                stmt.execute(rusqlite::params![id, ts, terminal_id, path, kind])?;
+            }
+        }
+        tx.commit()
     }
 
     /// Per-path last-touch timestamp for one terminal — `(path, max_ts)`. Used to
@@ -653,9 +754,28 @@ impl Store {
             "DELETE FROM taime_interactions WHERE created_at < ?1",
             rusqlite::params![d30 as i64],
         )?;
-        // Pending messages are never pruned — only consumed/failed ones age out.
+        // Dead-letter very-old pending messages (review M3): a message still
+        // pending after a week has no recoverable receiver (a live agent drains
+        // its inbox within seconds of going idle), so it would otherwise be
+        // re-scanned by `receivers_with_pending` every 250 ms forever. Expire it
+        // first, THEN the delivered/failed/expired sweep below ages it out.
+        let d7 = now_unix.saturating_sub(7 * 86_400);
+        n += conn.execute(
+            "UPDATE inbox SET status = 'expired' \
+             WHERE status = 'pending' AND CAST(created_at AS INTEGER) < ?1",
+            rusqlite::params![d7 as i64],
+        )?;
+        // Consumed/failed/expired inbox rows age out at 30d (pending rows survive
+        // until delivered or dead-lettered above).
         n += conn.execute(
             "DELETE FROM inbox WHERE status != 'pending' AND CAST(created_at AS INTEGER) < ?1",
+            rusqlite::params![d30 as i64],
+        )?;
+        // Blackboard retention (review L19): workflow runs write keys
+        // `{run_id}::{output_key}`, so distinct keys grow unbounded over a
+        // long-lived daemon's life. Age out entries older than 30d.
+        n += conn.execute(
+            "DELETE FROM taime_blackboard WHERE updated_at < ?1",
             rusqlite::params![d30 as i64],
         )?;
         Ok(n)
@@ -1243,11 +1363,30 @@ impl Store {
         error: Option<&str>,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Only finish a run that is still `running` (review M8): a `cancel_run`
+        // may have already flipped it to `cancelled`, and the engine thread
+        // unwinding afterwards must not clobber that terminal state back to
+        // `failed`/`completed`.
         conn.execute(
-            "UPDATE taime_workflow_runs SET status = ?2, ended_at = ?3, error = ?4 WHERE id = ?1",
+            "UPDATE taime_workflow_runs SET status = ?2, ended_at = ?3, error = ?4 \
+             WHERE id = ?1 AND status = 'running'",
             rusqlite::params![id, status, ended_at as i64, error],
         )?;
         Ok(())
+    }
+
+    /// Cancel a still-running workflow run (review M8): flips status to
+    /// `cancelled` so the engine's `wait_for_output` bail (`status != "running"`)
+    /// fires within a poll tick, ending the run and freeing its worker. Returns
+    /// whether a running run was actually transitioned.
+    pub fn cancel_run(&self, id: &str, ended_at: u64) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE taime_workflow_runs SET status = 'cancelled', ended_at = ?2 \
+             WHERE id = ?1 AND status = 'running'",
+            rusqlite::params![id, ended_at as i64],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn get_run(&self, id: &str) -> rusqlite::Result<Option<WorkflowRunRow>> {
@@ -1546,6 +1685,17 @@ CREATE TABLE IF NOT EXISTS daemon_sessions (
 CREATE TABLE IF NOT EXISTS taime_meta (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+-- Durable provider-cleanup ledger (review H2). Each orchestration/provider spawn
+-- that injects externally-visible config (gemini settings.json mcpServers, grok
+-- config.toml [mcp_servers.*], policy files, per-terminal workspace dirs) records
+-- its teardown actions here at spawn. The session deletes its row once cleanup
+-- runs; whatever survives a SIGKILL/crash of the DAEMON is replayed on next boot,
+-- so we never leak a dead-token `taime` MCP server into the user's real config.
+CREATE TABLE IF NOT EXISTS taime_cleanups (
+    session_id TEXT PRIMARY KEY,
+    actions_json TEXT NOT NULL,
+    created_at_unix INTEGER NOT NULL
 );
 -- Phase-5 shared blackboard: a small global key/value scratchpad agents post to
 -- (`share`) and read (`get`). Last writer wins; `author` is the stamping caller.

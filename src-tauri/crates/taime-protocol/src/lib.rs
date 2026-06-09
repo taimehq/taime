@@ -98,8 +98,17 @@ pub const T_DATA: u8 = 0x02;
 /// `start_offset >= seq_n`.
 pub const T_REPAINT: u8 = 0x03;
 
-/// Suggested `max_frame_length` for control/data; repaint can be larger.
+/// Hard `max_frame_length` for EVERY frame type on the shared connection —
+/// control, data, AND repaint (both ends call `.max_frame_length(MAX_FRAME_LEN)`,
+/// so an oversized repaint would error the stream, not pass; review L23). A
+/// repaint is bounded by the viewport (rows × cols × a few bytes/cell), which the
+/// `Attach`/`Resize` clamps below keep far under this cap.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// Clamp on a requested terminal viewport dimension (review L23): rows/cols are
+/// `u16`, but a pathological 65535×65535 would make the per-cell repaint approach
+/// the frame cap. No real terminal is anywhere near this; clamp defensively.
+pub const MAX_TERM_DIM: u16 = 1000;
 
 // ---------------------------------------------------------------------------
 // Control messages.

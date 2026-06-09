@@ -31,7 +31,7 @@ use bytes::Bytes;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use taime_protocol::{
     encode_data, encode_repaint, encode_server, AgentStatus, ServerMsg, SessionSummary, SpawnSpec,
-    TurnInfo,
+    TurnInfo, MAX_TERM_DIM,
 };
 use tokio::sync::mpsc;
 
@@ -90,6 +90,9 @@ struct SessionState {
     /// Accumulated dirty paths since the last review/clear — the full set pushed
     /// to the app on `FsDirty` (the badge/inventory).
     fs_all_dirty: BTreeSet<String>,
+    /// When a graceful `kill()` sent SIGTERM to the group, so the gc tick can
+    /// escalate to SIGKILL after a grace if the agent ignores it (review H1).
+    kill_sigterm_at: Option<Instant>,
 }
 
 struct SessionInner {
@@ -109,6 +112,13 @@ struct SessionInner {
     paste_enter_count: u8,
     /// Spawn-time MCP injection to undo when the process exits (best-effort).
     cleanup: Cleanup,
+    /// Process-group id of the agent (== leader pid; the child setsid()'d). Used
+    /// by `kill`/`kill_all`/the gc reaper to signal the whole group (review H1).
+    pid: Option<u32>,
+    /// Single-shot guard so exit finalization (reap + cleanup + `Exited`) runs
+    /// exactly once whether the reader hits EOF or the gc reaper sees the exit
+    /// first (review M14/M15).
+    finalized: AtomicBool,
     created_at_unix: u64,
     /// Durable store handle (Phase 6) — the session records its own fs-change
     /// activity here so attribution accrues even with the app closed.
@@ -202,11 +212,22 @@ impl Session {
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
+        // Stamp every agent child with its session id (review H1/H2 backstop).
+        // Env is inherited across `setsid`, so grandchildren carry it too; a
+        // boot-time process-table sweep uses it to find + kill orphan groups a
+        // crashed daemon left behind. Applied last so nothing overrides it.
+        cmd.env("TAIME_SESSION_ID", &id);
 
         let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("spawn '{}' failed: {e}", spec.prog))?;
+        // portable-pty's pre_exec calls `setsid()`, so the child leads its own
+        // session + process group (pgid == pid). Capture the pid now so kill can
+        // signal the whole GROUP — every helper the CLI forks (node workers,
+        // ripgrep, git, language servers, MCP shims) — not just the leader pid,
+        // which is all `Child::kill` reaches and would orphan the rest (review H1).
+        let pid = child.process_id();
         drop(pair.slave); // EOF propagates to the reader on child exit
 
         let reader = pair
@@ -232,6 +253,8 @@ impl Session {
             adapter,
             paste_enter_count: spec.paste_enter_count,
             cleanup,
+            pid,
+            finalized: AtomicBool::new(false),
             created_at_unix,
             store,
             watcher: Mutex::new(None),
@@ -249,6 +272,7 @@ impl Session {
                 last_status: None,
                 fs_turn_dirty: BTreeSet::new(),
                 fs_all_dirty: BTreeSet::new(),
+                kill_sigterm_at: None,
             }),
             resume: Condvar::new(),
             writer: Mutex::new(writer),
@@ -279,7 +303,7 @@ impl Session {
         if rows != 0 && cols != 0 {
             let _ = self.resize(rows, cols);
         }
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = lock_state(&self.inner);
         let seq_n = st.out_offset;
         let (rows, cols) = (st.rows, st.cols);
         let alt = st.term.is_alt_screen_active();
@@ -316,7 +340,7 @@ impl Session {
 
     /// Detach a specific connection (close_view): keep the agent running.
     pub fn detach(&self, conn_id: u64) {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = lock_state(&self.inner);
         if st.attached.as_ref().map(|c| c.conn_id) == Some(conn_id) {
             st.attached = None;
         }
@@ -327,7 +351,7 @@ impl Session {
     /// Backpressure ack from `conn_id`: record the processed offset and wake the
     /// reader if in-flight drained below the low watermark.
     pub fn ack(&self, conn_id: u64, offset: u64) {
-        let mut guard = self.inner.state.lock().unwrap();
+        let mut guard = lock_state(&self.inner);
         let st = &mut *guard; // reborrow so disjoint fields can be touched together
         let mut unpause = false;
         if let Some(c) = st.attached.as_mut() {
@@ -353,13 +377,18 @@ impl Session {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {
+        // Clamp the viewport (review L23): rows/cols are u16, but a pathological
+        // request would make the per-cell repaint approach the frame cap. Every
+        // attach/resize flows through here, so one clamp covers all paths.
+        let rows = rows.min(MAX_TERM_DIM);
+        let cols = cols.min(MAX_TERM_DIM);
         self.inner
             .master
             .lock()
             .unwrap()
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| format!("resize failed: {e}"))?;
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = lock_state(&self.inner);
         emulator::resize(&mut st.term, rows, cols);
         st.rows = rows;
         st.cols = cols;
@@ -374,7 +403,7 @@ impl Session {
 
     /// App-driven attribution boundary (strongest signal).
     pub fn checkpoint(&self) {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = lock_state(&self.inner);
         let off = st.out_offset;
         if let Some(mut turn) = st.attr.checkpoint(off) {
             st.turn_dirty = false;
@@ -393,7 +422,7 @@ impl Session {
     /// Quiet-window check (called by the manager tick). Closes the current turn
     /// if output went idle past `threshold`.
     pub fn quiet_check(&self, threshold: std::time::Duration) {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = lock_state(&self.inner);
         if !st.turn_dirty || st.last_output.elapsed() < threshold {
             return;
         }
@@ -412,17 +441,63 @@ impl Session {
         }
     }
 
+    /// Graceful kill: SIGTERM the whole process group (review H1 — reaches every
+    /// helper the CLI forked, not just the leader pid a single-pid `Child::kill`
+    /// would orphan), arm the gc reaper's SIGKILL escalation, and wake a parked
+    /// reader so it observes EOF. Non-blocking. The session stays in the manager
+    /// map until the gc reaper confirms the exit, so a CLI that ignores SIGTERM is
+    /// still force-killed after a grace and then removed.
     pub fn kill(&self) {
-        // Signal the child; DON'T clear `attached` or reap here. We wake a parked
-        // reader (backpressure) so it observes EOF, emits `Exited` to the attached
-        // client, and reaps the child on its own EOF path — otherwise an explicit
-        // kill while the reader is parked would never deliver `Exited`. The reader
-        // never blocks in `send` (the outbound channel is unbounded), so once
-        // unparked it always reaches the EOF cleanup.
-        let _ = self.inner.child.lock().unwrap().kill();
-        let mut st = self.inner.state.lock().unwrap();
+        signal_group(&self.inner, libc::SIGTERM);
+        let mut st = lock_state(&self.inner);
+        st.kill_sigterm_at.get_or_insert_with(Instant::now);
         st.paused = false;
+        drop(st);
         self.inner.resume.notify_all();
+    }
+
+    /// gc reaper: escalate an unanswered `kill()` to a group SIGKILL once SIGTERM
+    /// has gone `grace` unacknowledged (review H1).
+    pub fn escalate_kill_if_due(&self, grace: std::time::Duration) {
+        let due = {
+            let st = lock_state(&self.inner);
+            st.kill_sigterm_at.map(|t| t.elapsed() >= grace).unwrap_or(false)
+        };
+        if due && self.is_alive() {
+            signal_group(&self.inner, libc::SIGKILL);
+        }
+    }
+
+    /// gc reaper (review M15): if the child has exited, finalize once and return
+    /// true. Reaps a session whose reader is parked on backpressure (and so can't
+    /// observe EOF) or whose natural exit the reader hasn't reached yet. Finalize
+    /// sets `dead` before waking the reader, so the woken reader converges to its
+    /// own EOF path (a guarded no-op finalize).
+    pub fn reap_if_exited(&self) -> bool {
+        let exited = matches!(lock_child(&self.inner).try_wait(), Ok(Some(_)));
+        if exited {
+            finalize_exit(&self.inner);
+            self.inner.resume.notify_all();
+        }
+        exited
+    }
+
+    /// Shutdown step 1: SIGTERM the whole group (review H1/H2). The signal handler
+    /// `process::exit`s and can't wait for the gc reaper, so it does its own
+    /// terminate → grace → SIGKILL + finalize across all sessions; this is the
+    /// terminate.
+    pub fn shutdown_terminate(&self) {
+        signal_group(&self.inner, libc::SIGTERM);
+    }
+
+    /// Shutdown step 2: SIGKILL any straggler, then reap + run provider cleanup
+    /// synchronously so injected MCP config never leaks past an abrupt exit
+    /// (review H2). Idempotent (the `finalized` guard).
+    pub fn shutdown_finalize(&self) {
+        if self.is_alive() {
+            signal_group(&self.inner, libc::SIGKILL);
+        }
+        finalize_exit(&self.inner);
     }
 
     pub fn is_alive(&self) -> bool {
@@ -436,6 +511,15 @@ impl Session {
         if !self.is_alive() {
             return None;
         }
+        // Review M9: before ANY output, the grid is empty because the CLI hasn't
+        // drawn its banner yet (Node/Ink cold start can exceed the 250 ms tick),
+        // NOT because it crashed. Report "unknown" (None) until real bytes arrive
+        // so a fresh agent never flashes a spurious ERROR badge. Once output has
+        // been seen (out_offset > 0), an empty grid genuinely means a dead/cleared
+        // screen and the adapter's empty→ERROR mapping applies.
+        if st.out_offset == 0 {
+            return None;
+        }
         self.inner.adapter.as_ref().map(|a| {
             let lines = emulator::snapshot_visible_text(&st.term);
             a.status(&GridView::new(&lines))
@@ -446,7 +530,7 @@ impl Session {
     /// changes (Phase 4 push). Called on the manager tick — cheap (one regex pass
     /// over the grid) and only emits on a transition.
     pub fn push_status_if_changed(&self) {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = lock_state(&self.inner);
         let status = self.infer_status(&st);
         if status == st.last_status {
             return;
@@ -468,7 +552,7 @@ impl Session {
             return;
         }
         let (grew, snapshot, out) = {
-            let mut st = self.inner.state.lock().unwrap();
+            let mut st = lock_state(&self.inner);
             let mut grew = false;
             for c in &changes {
                 st.fs_turn_dirty.insert(c.path.clone());
@@ -481,12 +565,16 @@ impl Session {
             let out = if grew { st.attached.as_ref().map(|c| c.out.clone()) } else { None };
             (grew, paths, out)
         };
-        // Durable per-file attribution (best-effort), outside the state lock.
+        // Durable per-file attribution (best-effort), outside the state lock. One
+        // transaction for the whole debounced batch (review L8) instead of N
+        // autocommits contending with the gc tick on the single write connection.
         if let (Some(store), Some(key)) = (&self.inner.store, &self.inner.attribution_key) {
             let ts = now_unix_secs();
-            for c in &changes {
-                let _ = store.record_fs_event(&gen_event_id(), key, &c.path, c.kind, ts);
-            }
+            let rows: Vec<(String, String, String)> = changes
+                .iter()
+                .map(|c| (gen_event_id(), c.path.clone(), c.kind.to_string()))
+                .collect();
+            let _ = store.record_fs_events(key, ts, &rows);
         }
         // Push the full dirty set to the app (Phase 6 fs-dirty push).
         if grew {
@@ -501,14 +589,14 @@ impl Session {
     /// Snapshot of the cumulative fs-dirty set (Task rollups / detail surface).
     /// Read-only — never mutates the badge or in-flight turn sets.
     pub fn fs_dirty_paths(&self) -> Vec<String> {
-        let st = self.inner.state.lock().unwrap();
+        let st = lock_state(&self.inner);
         st.fs_all_dirty.iter().cloned().collect()
     }
 
     /// Clear the accumulated dirty set (the user reviewed the diff). Resets both
     /// the badge set and the in-flight turn set so future pushes start fresh.
     pub fn clear_fs_dirty(&self) {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = lock_state(&self.inner);
         st.fs_all_dirty.clear();
         st.fs_turn_dirty.clear();
     }
@@ -517,7 +605,7 @@ impl Session {
     /// COMPLETED (the idle-gated delivery property — never mid-turn; matches
     /// CAO's `check_and_send_pending_messages`).
     pub fn is_ready_for_delivery(&self) -> bool {
-        let st = self.inner.state.lock().unwrap();
+        let st = lock_state(&self.inner);
         matches!(self.infer_status(&st), Some(AgentStatus::Idle | AgentStatus::Completed))
     }
 
@@ -538,7 +626,7 @@ impl Session {
     }
 
     pub fn summary(&self) -> SessionSummary {
-        let st = self.inner.state.lock().unwrap();
+        let st = lock_state(&self.inner);
         // A dead session reports no live status so the app's exit handling
         // (daemon_list `alive=false`) drives the badge.
         let status = self.infer_status(&st);
@@ -621,6 +709,65 @@ fn now_unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Lock the session `state` tolerating poison (review M14). The reader thread is
+/// the sole reaper; if a control path panics under this lock (e.g. the emulator
+/// on hostile escape-heavy output), a bare `.unwrap()` on the next lock would
+/// panic the reader too — the child would never be reaped (zombie), `dead` would
+/// stay false, and per-session GC + idle-shutdown would break. Recovering the
+/// guard keeps the reaper alive; a single corrupted frame is the worst case.
+fn lock_state(inner: &SessionInner) -> std::sync::MutexGuard<'_, SessionState> {
+    inner.state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Lock the `child` handle tolerating poison (same rationale as [`lock_state`] —
+/// the reaper must never be blocked by a poisoned lock).
+fn lock_child(inner: &SessionInner) -> std::sync::MutexGuard<'_, Box<dyn Child + Send + Sync>> {
+    inner.child.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Send `sig` to the agent's whole process group (review H1). `pgid == leader
+/// pid` because the child `setsid()`'d at spawn, so this reaches every helper the
+/// CLI forked into the group — the processes a single-pid `Child::kill` orphans.
+#[cfg(unix)]
+fn signal_group(inner: &SessionInner, sig: libc::c_int) {
+    if let Some(pid) = inner.pid {
+        if pid > 1 {
+            // SAFETY: killpg(2) with a pid we own (same uid); errors (group gone)
+            // are ignored — best-effort teardown.
+            unsafe {
+                let _ = libc::killpg(pid as libc::pid_t, sig);
+            }
+        }
+    }
+}
+#[cfg(not(unix))]
+fn signal_group(_inner: &SessionInner, _sig: i32) {}
+
+/// Exit finalization, single-shot via the `finalized` guard (review M14/M15):
+/// reap the leader (collects the zombie; `wait()` returns the cached status if the
+/// gc reaper's `try_wait` already collected it), mark dead, run the durable
+/// provider cleanup + drop its ledger row, then push `Exited` to any attached
+/// client. Safe to call from the reader's EOF path, the gc reaper, and shutdown.
+fn finalize_exit(inner: &SessionInner) {
+    if inner.finalized.swap(true, Ordering::SeqCst) {
+        return; // already finalized
+    }
+    let code = lock_child(inner).wait().ok().map(|s| s.exit_code() as i32);
+    inner.dead.store(true, Ordering::SeqCst);
+    // Undo spawn-time MCP injection (temp config / settings.json / workspace) and
+    // drop the durable cleanup-ledger row now that teardown has actually run.
+    inner.cleanup.run();
+    if let Some(store) = &inner.store {
+        let _ = store.delete_cleanup(&inner.id);
+    }
+    let st = lock_state(inner);
+    if let Some(c) = st.attached.as_ref() {
+        if let Ok(frame) = encode_server(&ServerMsg::Exited { code }) {
+            let _ = c.out.send(frame);
+        }
+    }
+}
+
 /// A random hex id for an fs activity-event row.
 fn gen_event_id() -> String {
     format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>())
@@ -632,10 +779,16 @@ fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
         let mut buf = [0u8; 8192];
         loop {
             // Park while paused for backpressure (releases the lock while waiting).
+            // The gc reaper sets `dead` + `notify_all` if the child exits while
+            // we're parked (review M15), so break out on death to converge to the
+            // EOF reap below instead of waiting forever on a dead agent.
             {
-                let mut st = inner.state.lock().unwrap();
+                let mut st = lock_state(&inner);
                 while st.paused {
-                    st = inner.resume.wait(st).unwrap();
+                    st = inner.resume.wait(st).unwrap_or_else(|e| e.into_inner());
+                    if inner.dead.load(Ordering::SeqCst) {
+                        break;
+                    }
                 }
             }
             let n = match reader.read(&mut buf) {
@@ -648,7 +801,7 @@ fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
             // turn boundaries from THIS chunk) — all under the lock via the
             // unbounded sender, so ordering is strict relative to out-of-band
             // checkpoint/quiet TurnBoundary frames and the send never blocks.
-            let mut guard = inner.state.lock().unwrap();
+            let mut guard = lock_state(&inner);
             let st = &mut *guard; // reborrow for disjoint-field access
             st.term.advance_bytes(chunk);
             let start = st.out_offset;
@@ -702,23 +855,9 @@ fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
             }
         }
 
-        // EOF: reap, mark dead, notify the attached client.
-        let code = inner
-            .child
-            .lock()
-            .unwrap()
-            .wait()
-            .ok()
-            .map(|s| s.exit_code() as i32);
-        inner.dead.store(true, Ordering::SeqCst);
-        // Undo spawn-time MCP injection (temp config / settings.json / workspace).
-        inner.cleanup.run();
-        let st = inner.state.lock().unwrap();
-        if let Some(c) = st.attached.as_ref() {
-            if let Ok(frame) = encode_server(&ServerMsg::Exited { code }) {
-                let _ = c.out.send(frame);
-            }
-        }
+        // EOF: reap + cleanup + notify, single-shot (the gc reaper may have
+        // beaten us to it — review M14/M15).
+        finalize_exit(&inner);
     });
 }
 
@@ -726,7 +865,7 @@ fn spawn_reader(inner: Arc<SessionInner>, mut reader: Box<dyn Read + Send>) {
 impl Session {
     /// The accumulated badge dirty set (test inspection).
     pub fn fs_all_dirty_snapshot(&self) -> Vec<String> {
-        self.inner.state.lock().unwrap().fs_all_dirty.iter().cloned().collect()
+        lock_state(&self.inner).fs_all_dirty.iter().cloned().collect()
     }
 }
 
@@ -779,5 +918,77 @@ mod tests {
 
         assert!(recorded, "watcher should record the new file to the store");
         assert!(dirty.iter().any(|p| p == "hello.txt"), "dirty set: {dirty:?}");
+    }
+
+    /// Regression for review H1: `kill()` must terminate the agent's whole process
+    /// GROUP, not just the leader pid. We spawn `sh` that backgrounds a long
+    /// `sleep` under `nohup` (so the helper IGNORES SIGHUP — modelling a CLI
+    /// helper that survives the controlling-tty hangup), records its pid, then
+    /// `wait`s. After `kill()` the helper must be gone: the old leader-only kill
+    /// (SIGHUP to the leader pid → tty SIGHUP cascade, which `nohup` shrugs off)
+    /// would orphan it; only a group SIGTERM (the fix) reaches it.
+    #[cfg(unix)]
+    #[test]
+    fn kill_terminates_the_whole_process_group_not_just_the_leader() {
+        fn alive(pid: i32) -> bool {
+            // kill(pid, 0): 0 => exists, ESRCH => gone. (A reaped zombie is gone.)
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+
+        let dir = std::env::temp_dir().join(format!("taime-killpg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("helper.pid");
+
+        // Background a long-lived helper into the session's process group, publish
+        // its pid, then keep the leader alive by waiting on it.
+        let script = format!(
+            "nohup sleep 120 >/dev/null 2>&1 & printf %s \"$!\" > '{}'; wait",
+            pidfile.display()
+        );
+        let spec = SpawnSpec {
+            prog: "sh".into(),
+            args: vec!["-c".into(), script],
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            env: vec![],
+            rows: 24,
+            cols: 80,
+            agent_id: Some("term-killpg".into()),
+        };
+        let session = Session::spawn("pty-killpg".into(), &spec, None).unwrap();
+
+        // Wait for the helper pid to be published.
+        let mut helper_pid = None;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    helper_pid = Some(p);
+                    break;
+                }
+            }
+        }
+        let helper_pid = helper_pid.expect("helper published its pid");
+        assert!(alive(helper_pid), "helper should be running before kill");
+
+        // SIGTERM the whole group; `sleep` dies on SIGTERM immediately.
+        session.kill();
+
+        let mut gone = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(50));
+            if !alive(helper_pid) {
+                gone = true;
+                break;
+            }
+        }
+        // Belt-and-suspenders cleanup if the assert is about to fail.
+        if !gone {
+            unsafe {
+                libc::kill(helper_pid, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "helper (pid {helper_pid}) survived kill() — process group was not signaled");
     }
 }

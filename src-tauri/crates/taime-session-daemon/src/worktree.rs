@@ -227,6 +227,12 @@ pub fn provision(
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
                 .unwrap_or_default();
+            // The `-b` attempt can leave a partially-created branch behind (review
+            // L14). It's uniquely ours (agent_id is fresh per provision), so
+            // best-effort delete it before falling back to shared — otherwise it
+            // leaks forever (worktree GC skips shared rows and only -D's a branch
+            // it still has a row for).
+            let _ = run_git(repo, &["branch", "-D", &branch]);
             return shared(project_root, agent_id, Some(format!("git worktree add failed: {err}")));
         }
     }

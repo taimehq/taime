@@ -156,7 +156,16 @@ pub fn edge_matches(when: &str, output: &str) -> bool {
         return true;
     }
     if let Some(word) = w.strip_prefix("keyword:") {
-        return output.to_lowercase().contains(word.trim().to_lowercase().as_str());
+        let word = word.trim();
+        if word.is_empty() {
+            return false;
+        }
+        // Word-boundary, case-insensitive (review L15): a substring `contains`
+        // mis-fired — "PASS" inside "compass", "FAIL" inside "failure" — which can
+        // silently misroute a test/decision gate. The injected prompt asks the
+        // worker to emit the bare keyword, so a whole-word match is the contract.
+        let pat = format!(r"(?i)\b{}\b", regex::escape(word));
+        return regex::Regex::new(&pat).map(|r| r.is_match(output)).unwrap_or(false);
     }
     if let Some(re) = w.strip_prefix('/').and_then(|x| x.strip_suffix('/')) {
         return regex::Regex::new(re).map(|r| r.is_match(output)).unwrap_or(false);

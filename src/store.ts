@@ -27,6 +27,8 @@ import {
   daemonKill,
   daemonCloseView,
   daemonPing,
+  daemonIncompatible,
+  daemonRestart,
   daemonCheckpoint,
   daemonSendMessage,
   type TurnEvent,
@@ -240,6 +242,9 @@ interface Store {
   // backend-derived
   agents: AgentSummary[];
   connected: boolean;
+  /** A poll saw an incompatible/unresponsive daemon (review M2): the UI offers a
+   *  consent-gated restart instead of silently replacing it (which kills agents). */
+  daemonIncompatible: boolean;
   terminalStatuses: Record<string, string>;
 
   // navigation (the rail + per-section selection; selections persist across
@@ -386,6 +391,8 @@ interface Store {
   setIsolationEnabled: (enabled: boolean) => void;
   /** Refresh the daemon agent roster — also the connectivity probe. */
   fetchAgents: () => Promise<void>;
+  /** User-consented backend restart for the incompatible-daemon prompt (M2). */
+  restartDaemon: () => Promise<void>;
 
   // grid actions
   launchAgent: (
@@ -513,6 +520,7 @@ const bootRecents = loadRecentProjects();
 export const useStore = create<Store>((set, get) => ({
   agents: [],
   connected: false,
+  daemonIncompatible: false,
   terminalStatuses: {},
 
   section: "dashboard",
@@ -715,18 +723,36 @@ export const useStore = create<Store>((set, get) => ({
     // daemon_ping (connect-only; never spawns) is the one connectivity source.
     const connected = await daemonPing();
     if (!connected) {
-      if (get().connected) set({ connected: false });
+      // Distinguish "no daemon" from "incompatible daemon still running with live
+      // agents" (review M2): the latter offers a consent-gated restart rather than
+      // a silent agent-killing replacement.
+      const incompatible = await daemonIncompatible();
+      const prev = get();
+      if (prev.connected || prev.daemonIncompatible !== incompatible) {
+        set({ connected: false, daemonIncompatible: incompatible });
+      }
       // Keep the last real roster — never overwrite it with the fallback.
       return;
     }
     try {
       const agents = await api.listAgents();
       const prev = get();
-      if (!prev.connected || !jsonEqual(prev.agents, agents)) {
-        set({ agents, connected: true });
+      if (!prev.connected || prev.daemonIncompatible || !jsonEqual(prev.agents, agents)) {
+        set({ agents, connected: true, daemonIncompatible: false });
       }
     } catch {
       if (get().connected) set({ connected: false });
+    }
+  },
+
+  restartDaemon: async () => {
+    try {
+      await daemonRestart();
+      set({ daemonIncompatible: false });
+      await get().fetchAgents();
+      get().showSnackbar({ type: "success", message: "Backend restarted" });
+    } catch (e) {
+      get().showSnackbar({ type: "error", message: `Backend restart failed: ${e}` });
     }
   },
 

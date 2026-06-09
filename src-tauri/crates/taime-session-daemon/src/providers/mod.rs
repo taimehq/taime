@@ -24,6 +24,7 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use taime_protocol::{AgentProfile, AgentSpawnSpec, AgentStatus};
 
 mod claude;
@@ -61,7 +62,7 @@ pub struct DaemonSessionSpec {
 /// A spawn-time side effect to undo when the session exits. Data-driven (not
 /// closures) so it is `Send` + unit-testable. (Variants intentionally share the
 /// `Remove*` prefix — they are all teardown removals.)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)]
 pub enum CleanupAction {
     /// Delete a file written at spawn (gemini's per-terminal Policy Engine
@@ -78,7 +79,7 @@ pub enum CleanupAction {
 }
 
 /// The accumulated undo for a spawn. Run once, best-effort, on session exit.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cleanup {
     pub actions: Vec<CleanupAction>,
 }

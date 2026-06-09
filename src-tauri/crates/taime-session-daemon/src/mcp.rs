@@ -22,6 +22,16 @@ use crate::manager::Manager;
 /// MCP protocol revision we advertise at `initialize`.
 const MCP_PROTOCOL: &str = "2024-11-05";
 
+/// Protocol versions we'll echo back in `initialize` if the client requests one
+/// (review L20). Anything else falls back to [`MCP_PROTOCOL`].
+const SUPPORTED_MCP_PROTOCOLS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+
+/// Max size of a free-text tool field (body/value/message/summary) — review L18.
+/// Each is injected into a PTY and/or persisted; 64 KiB is far above any real
+/// orchestration message, so anything larger is rejected rather than bloating
+/// daemon memory / the store.
+const MAX_TOOL_BODY: usize = 64 * 1024;
+
 /// The orchestration tool schemas (JSON Schema per the MCP spec) returned by
 /// `tools/list`: the full Phase-5 surface — `list_agents`, `send_message`,
 /// `broadcast` (profile-filterable), `request`/`reply` (correlated), `handoff`,
@@ -167,14 +177,25 @@ pub fn handle(manager: &Manager, caller: &str, req: &Value) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     match method {
-        "initialize" => result(
-            id,
-            json!({
-                "protocolVersion": MCP_PROTOCOL,
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "taime-orchestrator", "version": env!("CARGO_PKG_VERSION") }
-            }),
-        ),
+        "initialize" => {
+            // Echo the client's requested protocolVersion if we support it (review
+            // L20), else advertise our default — forward-compatible with a CLI that
+            // strictly validates the echoed version.
+            let negotiated = req
+                .get("params")
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str())
+                .filter(|v| SUPPORTED_MCP_PROTOCOLS.contains(v))
+                .unwrap_or(MCP_PROTOCOL);
+            result(
+                id,
+                json!({
+                    "protocolVersion": negotiated,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "taime-orchestrator", "version": env!("CARGO_PKG_VERSION") }
+                }),
+            )
+        }
         "tools/list" => result(id, json!({ "tools": tool_definitions() })),
         "tools/call" => handle_tool_call(manager, caller, id, req.get("params")),
         // Notifications carry no id and expect no response.
@@ -190,6 +211,15 @@ fn handle_tool_call(manager: &Manager, caller: &str, id: Value, params: Option<&
     };
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    // Cap free-text tool fields (review L18): each is injected into a PTY and/or
+    // persisted, so an unbounded one lets a single call bloat the daemon.
+    for field in ["body", "value", "message", "summary"] {
+        if let Some(s) = args.get(field).and_then(|v| v.as_str()) {
+            if s.len() > MAX_TOOL_BODY {
+                return tool_err(id, &format!("{field} exceeds the {MAX_TOOL_BODY}-byte cap"));
+            }
+        }
+    }
     match name {
         "list_agents" => {
             let agents: Vec<Value> = manager

@@ -21,6 +21,34 @@ const LABEL: Record<BackendState["status"], string> = {
 
 export function BackendStatusPill({ state }: { state: BackendState }) {
   const connected = useStore((s) => s.connected);
+  const daemonIncompatible = useStore((s) => s.daemonIncompatible);
+  const restartDaemon = useStore((s) => s.restartDaemon);
+
+  // Review M2: a poll found an incompatible/unresponsive daemon and DID NOT
+  // replace it (that would kill live agents). Offer an explicit, consent-gated
+  // restart instead of silently degrading.
+  if (inTauri() && daemonIncompatible) {
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          if (
+            window.confirm(
+              "The backend is incompatible (likely an app upgrade). Restart it? This stops any running agents.",
+            )
+          ) {
+            void restartDaemon();
+          }
+        }}
+        title="An incompatible daemon is running. Restart it (stops running agents)."
+        className="no-drag flex h-[26px] min-w-0 items-center gap-2 rounded-full border border-red-500/60 bg-red-950/40 px-2.5 text-[11px] text-red-200 hover:bg-red-900/50"
+      >
+        <span className="h-2 w-2 shrink-0 rounded-full bg-red-500" />
+        <span className="min-w-0 truncate whitespace-nowrap">Backend incompatible — Restart</span>
+      </button>
+    );
+  }
+
   // In Tauri the supervisor descriptor is static ("healthy" by construction —
   // backend.ts) and proves nothing about the daemon. `connected` is the live
   // daemon_ping result, so the pill reports the daemon honestly. Outside Tauri

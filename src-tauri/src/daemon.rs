@@ -34,10 +34,24 @@ fn framed(stream: UnixStream) -> Conn {
         .new_framed(stream)
 }
 
+/// Bound every IPC read against the (restartable, possibly-wedged) daemon so a
+/// connectable-but-silent peer can't hang a UI action forever (review H5). The
+/// handshake gets a short deadline; RPC replies a longer one (a big-repo `git
+/// diff` runs daemon-side under `query`); connecting itself is bounded too.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Whether a handshake error is the daemon rejecting our `Hello` (magic/version/
 /// token mismatch) — the signal that a stale, pre-upgrade daemon is running.
 fn is_protocol_reject(err: &str) -> bool {
     err.contains("handshake rejected")
+}
+
+/// Whether an error is a connect/read timeout — a daemon that accepted the socket
+/// but never answered (wedged, or a same-user process squatting the path).
+fn is_unresponsive(err: &str) -> bool {
+    err.contains("timed out")
 }
 
 /// Per-attached-session handle: the outbound control channel + the offset
@@ -60,6 +74,10 @@ pub struct DaemonClient {
     /// Serializes stale-daemon replacement so two ops hitting the protocol-mismatch
     /// path at once don't each spawn a replacement.
     restart_lock: Mutex<()>,
+    /// Set when a read-only poll saw an incompatible/unresponsive daemon (review
+    /// M2). The poll no longer auto-restarts (that would kill live agents), so the
+    /// UI reads this to offer an explicit, consent-gated "restart backend" action.
+    incompatible: AtomicBool,
 }
 
 impl DaemonClient {
@@ -71,7 +89,24 @@ impl DaemonClient {
             req_counter: AtomicU64::new(1),
             attaches: Mutex::new(HashMap::new()),
             restart_lock: Mutex::new(()),
+            incompatible: AtomicBool::new(false),
         }
+    }
+
+    /// Whether a poll has seen an incompatible/unresponsive daemon since the last
+    /// healthy contact (review M2) — the UI shows a confirm-to-restart prompt.
+    pub fn incompatible_seen(&self) -> bool {
+        self.incompatible.load(Ordering::SeqCst)
+    }
+
+    /// User-consented replacement of an incompatible daemon (review M2). Unlike the
+    /// poll path, this DOES restart (the user accepted that live agents stop).
+    pub async fn force_restart(&self) -> Result<(), String> {
+        let r = self.restart_daemon().await;
+        if r.is_ok() {
+            self.incompatible.store(false, Ordering::SeqCst);
+        }
+        r
     }
 
     fn next_req(&self) -> u64 {
@@ -116,17 +151,20 @@ impl DaemonClient {
             attach_token: token,
         };
         send(&mut conn, &hello).await?;
-        match read_server(&mut conn).await? {
+        match read_server_within(&mut conn, HANDSHAKE_TIMEOUT).await? {
             ServerMsg::HelloOk { .. } => Ok(conn),
             ServerMsg::HelloRejected { reason } => Err(format!("handshake rejected: {reason}")),
             other => Err(format!("unexpected handshake reply: {other:?}")),
         }
     }
 
-    /// Connect to the (already-running) daemon and handshake. No spawn.
+    /// Connect to the (already-running) daemon and handshake. No spawn. The
+    /// connect is bounded (review H5) so a peer that accepts but never proceeds
+    /// can't hang the caller before the handshake deadline even applies.
     async fn connect_once(&self) -> Result<Conn, String> {
-        let stream = UnixStream::connect(&self.socket)
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.socket))
             .await
+            .map_err(|_| "connect timed out".to_string())?
             .map_err(|e| format!("connect: {e}"))?;
         self.handshake(framed(stream)).await
     }
@@ -139,8 +177,11 @@ impl DaemonClient {
     async fn connect_handshake(&self) -> Result<Conn, String> {
         self.ensure_running().await?;
         match self.connect_once().await {
-            Err(e) if is_protocol_reject(&e) => {
-                eprintln!("[taime] daemon protocol mismatch ({e}); replacing stale daemon");
+            // A MUTATING op (spawn/attach/kill) carries implied consent to heal a
+            // stale or wedged daemon: replace on a protocol reject OR an
+            // unresponsive peer (review H5), then retry once.
+            Err(e) if is_protocol_reject(&e) || is_unresponsive(&e) => {
+                eprintln!("[taime] daemon unusable ({e}); replacing it for this action");
                 self.restart_daemon().await?;
                 self.connect_once().await
             }
@@ -157,14 +198,24 @@ impl DaemonClient {
             return Ok(None); // no daemon — caller uses its fallback
         }
         match self.connect_once().await {
-            Ok(c) => Ok(Some(c)),
-            Err(e) if is_protocol_reject(&e) => {
-                eprintln!("[taime] daemon protocol mismatch ({e}); replacing stale daemon");
-                // If we can't replace it (no binary), fall back rather than error.
-                match self.restart_daemon().await {
-                    Ok(()) => self.connect_once().await.map(Some),
-                    Err(_) => Ok(None),
-                }
+            Ok(c) => {
+                self.incompatible.store(false, Ordering::SeqCst); // healthy contact
+                Ok(Some(c))
+            }
+            // Review M2: a read-only poll (list/query/graph, fired on a timer with
+            // NO user gesture) must NOT replace the daemon — `restart_daemon`
+            // SIGTERMs it, and its handler `kill_all`s every live agent. On a
+            // protocol bump while an old daemon still drives agents, that would be
+            // a silent massacre. Fall back to "no usable daemon" (the same empty
+            // result as daemon-absent) and FLAG it so the UI can offer a
+            // consent-gated restart; the next MUTATING op also heals it.
+            Err(e) if is_protocol_reject(&e) || is_unresponsive(&e) => {
+                self.incompatible.store(true, Ordering::SeqCst);
+                eprintln!(
+                    "[taime] incompatible/unresponsive daemon on a poll; NOT auto-replacing \
+                     (live agents preserved) — a launch/attach will replace it: {e}"
+                );
+                Ok(None)
             }
             Err(e) => Err(e),
         }
@@ -327,6 +378,9 @@ impl DaemonClient {
         send(&mut conn, &ClientMsg::List { req_id }).await?;
         match read_server(&mut conn).await? {
             ServerMsg::Sessions { sessions, .. } => Ok(sessions),
+            // Surface a daemon Error as the clean message (review L22), like every
+            // other RPC — not a Debug dump of the whole frame.
+            ServerMsg::Error { message } => Err(message),
             other => Err(format!("unexpected list reply: {other:?}")),
         }
     }
@@ -361,9 +415,20 @@ impl DaemonClient {
         let repaint_len = Arc::new(AtomicU64::new(0));
         let ready = Arc::new(AtomicBool::new(false));
 
+        // Read the FIRST reply synchronously (review M13/H5): AttachOk → proceed;
+        // Error (e.g. the session was reaped between a list and the click) → fail
+        // fast so the command surfaces it and we never spawn a pump or leak a
+        // handle for a terminal that would otherwise sit blank "open" forever.
+        match read_server_within(&mut conn, RPC_TIMEOUT).await? {
+            ServerMsg::AttachOk { seq_n: s, .. } => seq_n.store(s, Ordering::SeqCst),
+            ServerMsg::Error { message } => return Err(message),
+            other => return Err(format!("unexpected attach reply: {other:?}")),
+        }
+
         let (seq2, rl2, ready2) = (seq_n.clone(), repaint_len.clone(), ready.clone());
         tauri::async_runtime::spawn(async move {
             let (mut sink, mut stream) = conn.split();
+            let mut clean_exit = false;
             loop {
                 tokio::select! {
                     out = input_rx.recv() => {
@@ -395,7 +460,11 @@ impl DaemonClient {
                             }
                             Ok(Frame::Control(body)) => {
                                 if let Ok(msg) = decode_server(&body) {
+                                    let is_exit = matches!(msg, ServerMsg::Exited { .. });
                                     if !forward_control(&channel, &seq2, msg) {
+                                        if is_exit {
+                                            clean_exit = true;
+                                        }
                                         break; // Exited / channel gone
                                     }
                                 }
@@ -404,6 +473,15 @@ impl DaemonClient {
                         }
                     }
                 }
+            }
+            // The pump ended. A clean process exit already sent {type:"exit"}; any
+            // other break means the daemon connection dropped (crash / codec
+            // error), so surface it instead of leaving a silently-frozen terminal
+            // (review M5). A failed send just means the webview is already gone.
+            if !clean_exit {
+                let _ = channel.send(InvokeResponseBody::Json(
+                    serde_json::json!({ "type": "disconnected" }).to_string(),
+                ));
             }
         });
 
@@ -507,12 +585,20 @@ async fn send(conn: &mut Conn, msg: &ClientMsg) -> Result<(), String> {
 }
 
 async fn read_server(conn: &mut Conn) -> Result<ServerMsg, String> {
+    read_server_within(conn, RPC_TIMEOUT).await
+}
+
+/// Read the next control message, failing if none arrives within `dur` (review
+/// H5). The deadline is per-read, re-armed each loop, so it bounds a silent peer
+/// without truncating a stream of legitimately-spaced frames.
+async fn read_server_within(conn: &mut Conn, dur: Duration) -> Result<ServerMsg, String> {
     loop {
-        let payload = conn
-            .next()
-            .await
-            .ok_or_else(|| "connection closed".to_string())?
-            .map_err(|e| format!("read: {e}"))?;
+        let payload = match tokio::time::timeout(dur, conn.next()).await {
+            Ok(Some(Ok(p))) => p,
+            Ok(Some(Err(e))) => return Err(format!("read: {e}")),
+            Ok(None) => return Err("connection closed".to_string()),
+            Err(_) => return Err("daemon read timed out".to_string()),
+        };
         if let Ok(Frame::Control(body)) = parse_frame(payload) {
             return decode_server(&body).map_err(|e| format!("decode: {e}"));
         }

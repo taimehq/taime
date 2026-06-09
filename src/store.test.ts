@@ -26,6 +26,8 @@ vi.mock("./pty", () => ({
   daemonKill: vi.fn(async () => {}),
   daemonCloseView: vi.fn(async () => {}),
   daemonPing: vi.fn(async () => false),
+  daemonIncompatible: vi.fn(async () => false),
+  daemonRestart: vi.fn(async () => {}),
   daemonCheckpoint: vi.fn(async () => {}),
   daemonSendMessage: vi.fn(async () => 1),
 }));
