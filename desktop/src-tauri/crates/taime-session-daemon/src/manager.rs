@@ -976,6 +976,9 @@ impl Manager {
             .unwrap_or_default()
             .iter()
             .map(|w| {
+                // Role/profile from the in-memory roles map (separate lock scope,
+                // released before we touch the sessions lock below).
+                let role = self.roles.lock().unwrap().get(&w.terminal_id).cloned();
                 let live = self.session_by_attribution(&w.terminal_id);
                 let (status, alive, dirty) = live
                     .map(|s| {
@@ -993,6 +996,7 @@ impl Manager {
                     "alive": alive,
                     "dirty_count": dirty.len(),
                     "dirty_paths": dirty,
+                    "role": role,
                 })
             })
             .collect();

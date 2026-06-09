@@ -213,6 +213,15 @@ impl Store {
             "UPDATE taime_worktrees SET mode = 'isolated' WHERE mode = 'worktree'",
             [],
         )?;
+        // A freshly-started daemon owns NO live sessions yet, and it can't
+        // re-attach to a previous daemon's PTY children (the master fd died with
+        // it). So any `running` rows are stale orphans from a prior process: mark
+        // them exited at startup so the UI shows them as ended + reviewable, not
+        // phantom "running". New spawns set `running` AFTER this sweep.
+        conn.execute(
+            "UPDATE daemon_sessions SET status = 'exited' WHERE status = 'running'",
+            [],
+        )?;
         Ok(())
     }
 

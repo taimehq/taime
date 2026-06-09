@@ -97,6 +97,9 @@ export interface TaskAgent {
   alive: boolean;
   dirty_count: number;
   dirty_paths: string[];
+  /** Role/profile (orchestrator / product-builder / researcher / …), daemon
+   *  -reported from the roles map. null ⇒ unknown (e.g. after a daemon restart). */
+  role: string | null;
 }
 
 export interface TaskDetail {

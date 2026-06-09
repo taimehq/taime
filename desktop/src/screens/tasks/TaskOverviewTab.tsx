@@ -4,6 +4,7 @@ import { api, type TaskDetail, type TaskStatus } from "../../api";
 import { useStore } from "../../store";
 import { providerTitle } from "../../lib/providerLabel";
 import { agentLabel } from "../../lib/agentLabel";
+import { profileMeta, displayRole } from "../../lib/profiles";
 import { StatusBadge } from "../../components/StatusBadge";
 import { fmtUnix, memberWireStatus, middleTruncate, openAgent } from "./lib";
 
@@ -101,10 +102,14 @@ export function TaskOverviewTab({
     }
   };
 
-  /** Best-effort profile label: frames know the profile for agents launched
-   *  this app run; the worktree row doesn't carry it (daemon gap). */
-  const profileFor = (agentId: string): string =>
-    frames.find((f) => f.terminalId === agentId)?.agentProfile ?? "—";
+  /** Role/profile label: daemon-reported role first (covers assigned workers),
+   *  falling back to the launch frame's profile, else "—". */
+  const roleLabel = (a: { role?: string | null; agent_id: string }): string => {
+    const role = displayRole(
+      a.role ?? frames.find((f) => f.terminalId === a.agent_id)?.agentProfile,
+    );
+    return role ? profileMeta(role).label : "—";
+  };
 
   return (
     <div className="h-full space-y-5 overflow-y-auto p-4">
@@ -232,10 +237,10 @@ export function TaskOverviewTab({
                   )}
                 </span>
                 <span
-                  title={profileFor(a.agent_id)}
+                  title={roleLabel(a)}
                   className="truncate whitespace-nowrap text-[11px] text-zinc-400"
                 >
-                  {profileFor(a.agent_id)}
+                  {roleLabel(a)}
                 </span>
                 <span className="truncate whitespace-nowrap text-[11px] text-zinc-400">
                   {providerTitle(a.provider ?? "")}
