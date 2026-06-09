@@ -849,6 +849,38 @@ impl Store {
         .optional()
     }
 
+    // ---- Durable review acknowledgments (the flagship safe-context-switch
+    // ---- guard's state, persisted so it survives a UI/daemon restart) ----
+
+    /// Mark an agent's current changes acknowledged (idempotent upsert).
+    pub fn mark_reviewed(&self, agent_id: &str, now_unix: u64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO taime_reviews (agent_id, reviewed_at) VALUES (?1, ?2) \
+             ON CONFLICT(agent_id) DO UPDATE SET reviewed_at = excluded.reviewed_at",
+            rusqlite::params![agent_id, now_unix as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Drop an agent's review ack — a fresh review cycle (its dirty set was
+    /// reset), so the next change re-raises the guard.
+    pub fn clear_reviewed(&self, agent_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM taime_reviews WHERE agent_id = ?1", rusqlite::params![agent_id])?;
+        Ok(())
+    }
+
+    /// Every agent id with a standing review ack — hydrates the UI guard on boot
+    /// so acknowledgments aren't lost across a restart.
+    pub fn reviewed_agents(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT agent_id FROM taime_reviews")?;
+        let rows =
+            stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// All recorded sessions, newest first (history / detached-panel backfill).
     #[allow(dead_code)] // consumed by the Phase-6 history/route layer.
     pub fn list_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {
@@ -1505,6 +1537,17 @@ CREATE TABLE IF NOT EXISTS taime_tasks (
     archived_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_root ON taime_tasks(workspace_root, status);
+
+-- Durable review acknowledgments — the flagship safe-context-switch guard's
+-- state. Records which agents' current changes the user has acknowledged, so the
+-- "I already reviewed this" fact survives a UI/daemon restart (it was
+-- frontend-only `reviewedFrames` before, dying with the UI — the worst case for
+-- a long-running / generative session). Keyed by Agent ID; an ack is dropped
+-- when the agent's dirty set is reset (a fresh review cycle, via clear_dirty).
+CREATE TABLE IF NOT EXISTS taime_reviews (
+    agent_id TEXT PRIMARY KEY,
+    reviewed_at INTEGER NOT NULL
+);
 "#;
 
 #[cfg(test)]
@@ -1691,6 +1734,26 @@ mod tests {
         // Unknown ids are reported, not silently absorbed.
         assert!(!store.update_task("task-x", None, None, Some("open"), 1).unwrap());
         assert!(!store.set_worktree_task("nobody", Some("task-2")).unwrap());
+    }
+
+    #[test]
+    fn reviews_persist_idempotently_and_clear() {
+        let store = Store::open_at(std::path::Path::new(":memory:")).unwrap();
+        assert!(store.reviewed_agents().unwrap().is_empty());
+
+        store.mark_reviewed("agent-a", 100).unwrap();
+        store.mark_reviewed("agent-a", 200).unwrap(); // upsert, not a duplicate
+        store.mark_reviewed("agent-b", 150).unwrap();
+        let mut ids = store.reviewed_agents().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["agent-a".to_string(), "agent-b".to_string()]);
+
+        // A fresh review cycle drops the ack so new changes re-raise the guard.
+        store.clear_reviewed("agent-a").unwrap();
+        assert_eq!(store.reviewed_agents().unwrap(), vec!["agent-b".to_string()]);
+        // Clearing an unknown id is a harmless no-op.
+        store.clear_reviewed("nobody").unwrap();
+        assert_eq!(store.reviewed_agents().unwrap(), vec!["agent-b".to_string()]);
     }
 
     fn row(id: &str) -> SessionRow {

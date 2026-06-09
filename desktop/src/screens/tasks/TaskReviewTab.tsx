@@ -3,6 +3,7 @@ import { GitMerge, ListOrdered, RefreshCw } from "lucide-react";
 import { api, type TaskAgent, type TaskDetail } from "../../api";
 import { useStore } from "../../store";
 import { providerTitle } from "../../lib/providerLabel";
+import { agentLabel } from "../../lib/agentLabel";
 import { AgentDiffSection } from "./AgentDiffSection";
 import { loadAgentDiffBundle, type AgentDiffBundle } from "./lib";
 
@@ -243,7 +244,7 @@ function MergeQueueRow({
         title={member.agent_id}
         className="min-w-0 flex-1 truncate whitespace-nowrap font-mono text-[10px] text-zinc-600"
       >
-        {member.agent_id}
+        {agentLabel(member.agent_id)}
       </span>
       <span className="tnum shrink-0 font-mono text-[10px]">
         <span className="text-emerald-400">+{add}</span>{" "}

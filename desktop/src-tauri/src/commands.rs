@@ -45,6 +45,81 @@ pub fn workspace_info(path: String) -> WorkspaceInfo {
     }
 }
 
+/// Create (and optionally `git init`) a brand-new project folder for the "Start
+/// something new" flow, then return its [`WorkspaceInfo`]. App-side (a direct fs
+/// call, like `workspace_info`) so the dialog can *generate* a workspace from a
+/// typed / not-yet-existing path without a daemon round-trip. Idempotent:
+/// `create_dir_all` on an existing dir is fine, and `git init` is skipped when
+/// the path is already inside a repo.
+///
+/// Callers default `git_init` to false: the founding agent runs its own
+/// `git init` + first commit so genesis stays attributed to its turn (the
+/// flagship thesis) — this command just guarantees the folder exists.
+#[tauri::command]
+pub fn workspace_init(path: String, git_init: bool) -> Result<WorkspaceInfo, String> {
+    init_workspace_dir(std::path::Path::new(&path), git_init).map_err(|e| e.to_string())?;
+    Ok(workspace_info(path))
+}
+
+fn init_workspace_dir(p: &std::path::Path, git_init: bool) -> std::io::Result<()> {
+    std::fs::create_dir_all(p)?;
+    if git_init {
+        // Don't re-init a path already inside a repo (idempotent / never clobbers).
+        let inside =
+            git_probe(p, &["rev-parse", "--is-inside-work-tree"]).as_deref() == Some("true");
+        if !inside {
+            let _ = std::process::Command::new("git").current_dir(p).args(["init"]).output();
+        }
+    }
+    Ok(())
+}
+
+/// Permanently delete a directory and all its contents — the "delete workspace
+/// (also remove from disk)" flow. DESTRUCTIVE + irreversible. The UI gates this
+/// behind an explicit checkbox AND a typed folder-name confirmation; these
+/// backend guards are belt-and-suspenders so a bug can never wipe the filesystem
+/// root, the home directory (or an ancestor of it), or a shallow top-level dir,
+/// regardless of what the caller sends.
+#[tauri::command]
+pub fn delete_directory(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    // Resolve symlinks / `..` so the guards apply to the REAL target.
+    let canon = std::fs::canonicalize(p).map_err(|e| format!("resolve path: {e}"))?;
+    guard_deletable(&canon)?;
+    std::fs::remove_dir_all(&canon).map_err(|e| format!("delete failed: {e}"))
+}
+
+/// Refuse to delete catastrophic paths no matter what the UI sent.
+fn guard_deletable(canon: &std::path::Path) -> Result<(), String> {
+    if canon.parent().is_none() {
+        return Err("refusing to delete the filesystem root".into());
+    }
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        if let Ok(home_c) = std::fs::canonicalize(&home) {
+            if canon == home_c {
+                return Err("refusing to delete the home directory".into());
+            }
+            // `canon` is an ancestor of home (e.g. "/Users", "/") → never.
+            if home_c.starts_with(canon) {
+                return Err("refusing to delete a parent of the home directory".into());
+            }
+        }
+    }
+    // Require some depth so a top-level dir ("/Users", "/tmp"'s parent, …) can
+    // never be removed even if the home checks are unavailable.
+    let depth = canon
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count();
+    if depth < 2 {
+        return Err("refusing to delete a top-level directory".into());
+    }
+    Ok(())
+}
+
 
 // ---------------------------------------------------------------------------
 // Claude terminal transport: the detached `taime-session-daemon` (the ONE Rust
@@ -325,4 +400,67 @@ pub fn set_clipboard_image_from_path(path: String) -> Result<(), String> {
 #[tauri::command]
 pub fn set_clipboard_image_from_path(_path: String) -> Result<(), String> {
     Err("clipboard image set is only implemented on macOS".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_init_creates_dir_and_optional_git() {
+        let base = std::env::temp_dir().join(format!("taime-wsinit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let proj = base.join("nested").join("new-project");
+
+        // git_init=false: just the directory (the agent does its own git init).
+        init_workspace_dir(&proj, false).unwrap();
+        assert!(proj.is_dir(), "nested dir created");
+        assert!(!proj.join(".git").exists(), "no repo when git_init=false");
+
+        // Idempotent + git_init=true initializes a repo.
+        init_workspace_dir(&proj, true).unwrap();
+        assert!(proj.join(".git").exists(), "git init created a repo");
+
+        // Re-running with git_init=true is a no-op (already inside a repo).
+        init_workspace_dir(&proj, true).unwrap();
+        assert!(proj.join(".git").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_directory_removes_a_nested_temp_dir() {
+        // The ONLY real deletion in these tests is a temp dir we just created —
+        // never a real system path. (Dangerous paths are checked via the pure
+        // `guard_deletable` below, which never touches the filesystem, so a
+        // guard regression can't make `cargo test` wipe the dev's machine.)
+        let base = std::env::temp_dir().join(format!("taime-del-{}", std::process::id()));
+        let proj = base.join("proj");
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::write(proj.join("f.txt"), "x").unwrap();
+
+        assert!(delete_directory(proj.to_string_lossy().to_string()).is_ok());
+        assert!(!proj.exists());
+
+        // A non-directory / missing path is an error, not a delete.
+        assert!(delete_directory(base.join("nope").to_string_lossy().to_string()).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_refuses_root_home_and_shallow_paths() {
+        use std::path::Path;
+        // PURE guard checks — no `remove_dir_all` is ever invoked here, so this
+        // test is incapable of deleting anything even if a guard were wrong.
+        assert!(guard_deletable(Path::new("/")).is_err(), "filesystem root");
+        assert!(guard_deletable(Path::new("/Users")).is_err(), "shallow top-level dir");
+        if let Some(home) = std::env::var_os("HOME") {
+            if let Ok(home_c) = std::fs::canonicalize(home) {
+                assert!(guard_deletable(&home_c).is_err(), "home directory");
+            }
+        }
+        // A normal deep project path passes the guard.
+        assert!(guard_deletable(Path::new("/Users/someone/projects/app")).is_ok());
+    }
 }

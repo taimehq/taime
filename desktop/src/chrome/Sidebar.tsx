@@ -14,6 +14,7 @@ import { useStore, type RustPtyMeta } from "../store";
 import { api, type ScheduleInfo, type TaskInfo, type WorkflowInfo } from "../api";
 import { statusDotClass, uiStatus } from "../lib/agentStatus";
 import { providerTitle } from "../lib/providerLabel";
+import { agentLabel } from "../lib/agentLabel";
 import { useTasks } from "../hooks/useTasks";
 
 /**
@@ -393,7 +394,7 @@ function AgentRow({ meta }: { meta: RustPtyMeta }) {
         {providerTitle(meta.provider)}
       </span>
       <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-zinc-600">
-        {meta.terminalId}
+        {agentLabel(meta.terminalId)}
       </span>
       {dirtyCount > 0 && (
         <span className="tnum shrink-0 rounded bg-amber/20 px-1 text-[10px] font-medium text-amber">

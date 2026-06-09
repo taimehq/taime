@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { inTauri } from "../backend";
 import { useStore } from "../store";
+import { api } from "../api";
 import { daemonList, type DaemonSessionSummary } from "../pty";
 import { providerTitle } from "../lib/providerLabel";
 
@@ -38,6 +39,10 @@ export function useRustPtyReconcile() {
       const adopt = useStore.getState().adoptDaemonSession;
       for (const s of sessions) adopt(s);
       applyDaemonStatuses(sessions);
+      // Hydrate durable review acks so "I already reviewed this" survives a
+      // UI/daemon restart (the guard state was frontend-only before).
+      const reviewed = await api.reviewedAgents();
+      if (alive && reviewed.length) useStore.getState().hydrateReviewed(reviewed);
       bootDone = true;
     })();
 

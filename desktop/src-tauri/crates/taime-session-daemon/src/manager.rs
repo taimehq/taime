@@ -551,7 +551,27 @@ impl Manager {
                 if let Some(s) = self.session_by_attribution(tk) {
                     s.clear_fs_dirty();
                 }
+                // A reset dirty set begins a fresh review cycle — drop any standing
+                // review ack so subsequent changes re-raise the guard (durable
+                // review state; the in-memory flag used to just linger).
+                if let Some(store) = &self.store {
+                    let _ = store.clear_reviewed(tk);
+                }
                 "true".to_string()
+            }
+            // Durable review acks (the flagship safe-context-switch guard). The app
+            // records an ack when the user proceeds past the guard / marks reviewed,
+            // and hydrates `reviewed` on boot so the ack survives a restart.
+            "mark_reviewed" => {
+                if let Some(store) = &self.store {
+                    let _ = store.mark_reviewed(tk, now_unix());
+                }
+                "true".to_string()
+            }
+            "reviewed" => {
+                let ids =
+                    self.store.as_ref().and_then(|s| s.reviewed_agents().ok()).unwrap_or_default();
+                serde_json::json!(ids).to_string()
             }
             "attribution" => self.attribution_json(tk),
             "agents" => self.agents_json(),

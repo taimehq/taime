@@ -36,6 +36,18 @@ body {
   color: #c8c7c2;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  /* Content is selectable so users can copy text (descriptions, agent labels,
+     ids, paths, diffs). Chrome opts out below — the title-bar drag region must
+     not start a text selection while the window is being moved. */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Title-bar / window-drag regions: never selectable (dragging moves the window,
+   it shouldn't select the breadcrumb text). */
+[data-tauri-drag-region],
+.titlebar-drag {
+  -webkit-user-select: none;
   user-select: none;
 }
 
