@@ -1,10 +1,10 @@
-# Taime — desktop app (developer guide)
+# Taime — developer guide
 
-The Tauri v2 product package. The app is a thin client; the real engine is the
+The Tauri v2 product. The app is a thin client; the real engine is the
 detached `taime-session-daemon`, which the app spawns and talks to over a
 per-user Unix socket. Concepts and vocabulary (Workspace, Task, Agent, Agent
 ID, Worktree, Runtime, Workflow/Run, Schedule) are defined in
-[`docs/architecture-lexicon.md`](docs/architecture-lexicon.md) — reconcile
+[`architecture-lexicon.md`](architecture-lexicon.md) — reconcile
 against that file, not against other docs.
 
 ## Prerequisites
@@ -34,7 +34,7 @@ pnpm tauri build
 
 `beforeBuildCommand` runs `scripts/stage-daemon.sh`, which builds the release
 daemon and stages it into `src-tauri/binaries/` so the bundle ships it under
-`Contents/Resources/binaries/`. Details: [`docs/packaging.md`](docs/packaging.md).
+`Contents/Resources/binaries/`.
 
 ## The daemon
 

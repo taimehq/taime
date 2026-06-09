@@ -5,7 +5,7 @@
 # sibling target/debug binary directly (built by beforeDevCommand) and does NOT
 # need this.
 set -euo pipefail
-here="$(cd "$(dirname "$0")/.." && pwd)"   # desktop/
+here="$(cd "$(dirname "$0")/.." && pwd)"   # repo root
 cargo build --release --manifest-path "$here/src-tauri/Cargo.toml" -p taime-session-daemon
 mkdir -p "$here/src-tauri/binaries"
 cp -f "$here/src-tauri/target/release/taime-session-daemon" \
