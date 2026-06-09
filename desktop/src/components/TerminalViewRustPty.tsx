@@ -155,6 +155,24 @@ export function TerminalViewRustPty({
     // Cross-platform copy/paste (shared across transports).
     const cleanupClipboard = wireClipboard(term, el);
 
+    // Mouse-wheel scrollback even while the app (Claude's TUI) has mouse
+    // reporting ON. With mouse tracking enabled, xterm forwards the wheel to the
+    // app, so the transcript won't scroll — the #1 "I can't scroll" complaint.
+    // Force a local scrollback scroll in the NORMAL buffer (the alt-screen has no
+    // scrollback, so defer to the app there). Capture phase + stopPropagation so
+    // we win over xterm's forward-to-app handling.
+    const wheelOpts = { capture: true, passive: false } as const;
+    const onWheel = (e: WheelEvent) => {
+      if (term.modes.mouseTrackingMode === "none") return; // xterm scrolls natively
+      if (term.buffer.active.type !== "normal") return; // alt-screen: app owns it
+      const perLine = e.deltaMode === 1 ? 1 : 16; // line vs. pixel deltas
+      const lines = e.deltaY / perLine;
+      term.scrollLines(Math.trunc(lines) || (e.deltaY > 0 ? 1 : -1));
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    el.addEventListener("wheel", onWheel, wheelOpts);
+
     // Sniff the running model from the agent's startup banner (best-effort).
     const sniffModel = makeModelSniffer((m) =>
       useStore.getState().setFrameModel(frameKey, m),
@@ -238,6 +256,7 @@ export function TerminalViewRustPty({
       cancelAnimationFrame(rafId);
       clearTimeout(resizeTimer);
       resizeObserver?.disconnect();
+      el.removeEventListener("wheel", onWheel, wheelOpts);
       cleanupClipboard();
       unregisterInput();
       // Drop the channel ref (its onmessage stops); detach keeps the agent alive.

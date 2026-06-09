@@ -4,6 +4,7 @@ import {
   Bug,
   Code2,
   Network,
+  Search,
   Shield,
   type LucideIcon,
 } from "lucide-react";
@@ -43,6 +44,11 @@ export const PROFILE_META: Record<string, ProfileMeta> = {
     icon: Box,
     label: "Product builder",
     desc: "Scaffolds full features",
+  },
+  researcher: {
+    icon: Search,
+    label: "Researcher",
+    desc: "Investigates + reports (read-only)",
   },
   default: {
     icon: Bot,
@@ -98,6 +104,11 @@ export const BUILTIN_PROFILES: AgentProfileInfo[] = [
   {
     name: "security-reviewer",
     description: "Reviews code for security vulnerabilities.",
+    source: "builtin",
+  },
+  {
+    name: "researcher",
+    description: "Investigates a question and reports findings (read-only).",
     source: "builtin",
   },
 ];

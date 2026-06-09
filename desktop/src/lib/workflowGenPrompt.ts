@@ -46,7 +46,7 @@ LOOPS
 A loop is a back-edge to an earlier node, bounded by max_iterations (default 20). Set max_iterations explicitly whenever you add a back-edge.
 
 PROFILES
-orchestrator, feature-builder, bug-fixer, security-reviewer, product-builder, default (plus any custom ~/.taime/agents/*.toml profile).
+orchestrator, feature-builder, bug-fixer, security-reviewer, product-builder, researcher, default (plus any custom ~/.taime/agents/*.toml profile).
 
 PROVIDERS
 claude_code, codex, gemini_cli, grok_cli. Omit a node's provider to use the run default.

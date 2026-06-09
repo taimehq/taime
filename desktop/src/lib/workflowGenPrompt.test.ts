@@ -31,7 +31,7 @@ describe("composePrompt — shared contract block", () => {
     expect(p).toContain("default 20");
     // Profiles + providers, verbatim from the contract.
     expect(p).toContain(
-      "orchestrator, feature-builder, bug-fixer, security-reviewer, product-builder, default",
+      "orchestrator, feature-builder, bug-fixer, security-reviewer, product-builder, researcher, default",
     );
     expect(p).toContain("claude_code, codex, gemini_cli, grok_cli");
     // Standing rules.

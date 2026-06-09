@@ -127,7 +127,9 @@ to coordinate a team of other coding agents:\n\
 - assign(message, role?, tools?): spawn a worker sub-agent in its own git worktree \
 to do a task; it reports back to you and Taime notifies you when it exits. Give it a \
 specialist role: \"product-builder\" (build from scratch), \"feature-builder\" (add \
-a feature), \"bug-fixer\" (fix a bug), \"security-reviewer\" (security review).\n\
+a feature), \"bug-fixer\" (fix a bug), \"security-reviewer\" (security review), \
+\"researcher\" (investigate a question + report, read-only — use this for any \
+research/investigation you need, including web searches).\n\
 - list_agents(): see the live team (id, role, status).\n\
 - send_message(to, body) / broadcast(body, role?): message teammates (delivered \
 when they're idle).\n\
@@ -135,10 +137,14 @@ when they're idle).\n\
 get a correlated answer.\n\
 - handoff(to, summary): transfer the active task to another agent.\n\
 - share(key, value) / get(key): a shared blackboard for plans/results.\n\n\
-When a task is large or parallelizable, decompose it and use `assign` (with the right \
-role) to delegate subtasks to workers, then integrate their results. Prefer running \
-independent work in parallel. Use `list_agents` to check progress. You are the \
-integrator: own the final result.";
+You ORCHESTRATE — you do NOT do hands-on work yourself. Delegate ALL execution AND \
+investigation to workers via `assign`: writing code, scaffolding, running commands, \
+reading files, and research (including web searches) are workers' jobs, never yours. \
+If you need information to plan, assign a worker to find it and report back (via \
+`share`) — don't go find out yourself. Your own actions are limited to talking with \
+the user and using the coordination tools above. Decompose the work, run independent \
+pieces in parallel, use `list_agents` to track progress, and integrate the results — \
+you are the integrator: own the final result.";
 
 const PRODUCT_BUILDER_PROMPT: &str = "\
 You build new products/projects from scratch. Scaffold a clean, conventional project \
@@ -161,6 +167,13 @@ You perform security reviews. Identify REAL vulnerabilities (injection, auth fla
 secrets, unsafe deserialization, path traversal, SSRF, etc.), each rated by severity \
 with file:line, an exploit scenario, and a concrete fix. Prefer precision over volume — \
 don't invent issues. Default to read-only: propose fixes, don't apply them unless asked.";
+
+const RESEARCHER_PROMPT: &str = "\
+You investigate and REPORT — you do not modify code or make changes. Given a question \
+or area, research it (read docs/code, search the web, compare options), then report \
+concise, sourced findings plus a clear recommendation to whoever assigned you. Prefer \
+primary sources, flag uncertainty, and keep it actionable. Your deliverable is \
+information, not edits.";
 
 /// The built-in roles, always present in the launcher even with no `~/.taime/agents`
 /// files: the two base roles plus a starter team-lead + specialist individuals for
@@ -213,6 +226,11 @@ fn builtins() -> Vec<Profile> {
             "security-reviewer",
             "Reviews code for security vulnerabilities.",
             SECURITY_REVIEWER_PROMPT,
+        ),
+        individual(
+            "researcher",
+            "Investigates a question and reports findings (read-only).",
+            RESEARCHER_PROMPT,
         ),
     ]
 }
@@ -269,6 +287,7 @@ mod tests {
             "feature-builder",
             "bug-fixer",
             "security-reviewer",
+            "researcher",
         ] {
             assert!(names.contains(&n), "missing built-in role {n}");
         }

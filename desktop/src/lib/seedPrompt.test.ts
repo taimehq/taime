@@ -17,8 +17,14 @@ describe("composeSeedPrompt", () => {
 
   it("frames the founding agent as an orchestrator that never implements", () => {
     expect(out).toContain("ORCHESTRATOR");
-    expect(out).toContain("do NOT write code");
+    expect(out).toContain("never write code");
     expect(out).toContain("implement NOTHING");
+  });
+
+  it("forbids the orchestrator from researching/executing — delegate ALL of it", () => {
+    expect(out).toContain("WHAT YOU DO NOT DO YOURSELF");
+    expect(out).toContain("no web searches");
+    expect(out).toContain("never investigate or research yourself");
   });
 
   it("runs a discovery conversation first — scope + tech stack — before building", () => {

@@ -377,7 +377,7 @@ export function NewWorkflowDialog({ onClose }: { onClose: () => void }) {
             />
             <SchemaRow
               term="· profile"
-              def="orchestrator · feature-builder · bug-fixer · security-reviewer · product-builder · default · any ~/.taime/agents profile"
+              def="orchestrator · feature-builder · bug-fixer · security-reviewer · product-builder · researcher · default · any ~/.taime/agents profile"
             />
             <SchemaRow
               term="· prompt"
