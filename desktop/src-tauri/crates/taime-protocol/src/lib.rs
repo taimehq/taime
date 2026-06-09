@@ -372,6 +372,12 @@ pub struct SessionSummary {
     /// Task membership (v9) — filled from the agent's worktree row at list time
     /// so reassignment shows on the next tick. `None` ⇒ Uncategorized.
     pub task_id: Option<String>,
+    /// The agent's ROLE / profile name (`orchestrator` / `product-builder` /
+    /// `researcher` / …), filled by [`Manager::list`] from the roles map — so even
+    /// an adopted or assigned worker reports the role it was spawned with. The UI
+    /// surfaces this prominently (it matters more than provider/model). `None`
+    /// for an agent whose role the live daemon no longer knows (pre-restart).
+    pub role: Option<String>,
 }
 
 /// An agent's inferred lifecycle state — CAO's `TerminalStatus`, native to the

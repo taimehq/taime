@@ -119,6 +119,7 @@ function makeSummary(over: Partial<DaemonSessionSummary> = {}): DaemonSessionSum
     status: null,
     protocol_version: 10,
     task_id: "task-1",
+    role: "default",
     ...over,
   };
 }
@@ -133,6 +134,7 @@ function makeMeta(over: Partial<RustPtyMeta> = {}): RustPtyMeta {
     startedAt: 1700000000000,
     status: "running",
     taskId: "task-1",
+    role: "default",
     transport: "daemon",
     ...over,
   };

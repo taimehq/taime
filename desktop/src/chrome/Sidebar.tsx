@@ -15,6 +15,7 @@ import { api, type ScheduleInfo, type TaskInfo, type WorkflowInfo } from "../api
 import { statusDotClass, uiStatus } from "../lib/agentStatus";
 import { providerTitle } from "../lib/providerLabel";
 import { agentLabel } from "../lib/agentLabel";
+import { profileMeta, displayRole } from "../lib/profiles";
 import { useTasks } from "../hooks/useTasks";
 
 /**
@@ -369,6 +370,10 @@ function AgentRow({ meta }: { meta: RustPtyMeta }) {
   const dirtyCount = useStore((s) => s.dirty[meta.terminalId]?.count ?? 0);
 
   const exited = meta.status === "exited";
+  // Lead with the ROLE (orchestrator / product-builder / researcher / …);
+  // provider lives in the tooltip, the friendly label stays as the mono subtitle.
+  const role = displayRole(meta.role);
+  const rmeta = role ? profileMeta(role) : null;
   const open = () => {
     const s = useStore.getState();
     s.setSection("agents");
@@ -380,7 +385,7 @@ function AgentRow({ meta }: { meta: RustPtyMeta }) {
     <button
       onClick={open}
       disabled={exited && !frame}
-      title={`${providerTitle(meta.provider)} · ${meta.terminalId}${
+      title={`${rmeta ? rmeta.label + " · " : ""}${providerTitle(meta.provider)} · ${meta.terminalId}${
         meta.branch ? ` · ${meta.branch}` : ""
       }`}
       className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-ink-600/60 disabled:cursor-default disabled:opacity-50 ${
@@ -391,7 +396,7 @@ function AgentRow({ meta }: { meta: RustPtyMeta }) {
         className={`h-2 w-2 shrink-0 rounded-full ${statusDotClass(raw)}`}
       />
       <span className="min-w-0 truncate text-xs text-zinc-200">
-        {providerTitle(meta.provider)}
+        {rmeta ? rmeta.label : providerTitle(meta.provider)}
       </span>
       <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-zinc-600">
         {agentLabel(meta.terminalId)}

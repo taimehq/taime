@@ -10,6 +10,8 @@ import { TerminalViewRustPty } from "../../components/TerminalViewRustPty";
 import { StatusBadge } from "../../components/StatusBadge";
 import { statusDotClass } from "../../lib/agentStatus";
 import { providerTitle } from "../../lib/providerLabel";
+import { profileMeta, displayRole } from "../../lib/profiles";
+import { agentLabel } from "../../lib/agentLabel";
 import { useTasks } from "../../hooks/useTasks";
 import { useAgentTurns } from "./useAgentTurns";
 import { ConsolePanel } from "./ConsolePanel";
@@ -107,9 +109,11 @@ export function AgentDetail({ frame }: { frame: Frame }) {
   const exited = meta?.status === "exited";
   const taskId = frame.taskId ?? meta?.taskId ?? null;
   const task = taskId ? tasks.find((t) => t.id === taskId) : undefined;
-  const profile = frame.agentProfile
-    ? frame.agentProfile.replace(/_/g, " ")
-    : null;
+  // Lead with the ROLE (resolved from the launch profile or the daemon's role
+  // for an adopted/assigned worker); provider + model are secondary.
+  const role = displayRole(frame.agentProfile ?? meta?.role);
+  const rmeta = role ? profileMeta(role) : null;
+  const RoleIcon = rmeta?.icon;
   const worktreePath = wt?.worktree_path ?? meta?.cwd ?? null;
   const worktreeMode = wt?.mode ?? null;
   const branch = wt?.branch ?? meta?.branch ?? null;
@@ -140,11 +144,15 @@ export function AgentDetail({ frame }: { frame: Frame }) {
         {/* ── Identity header ─────────────────────────────────────────── */}
         <header className="flex shrink-0 flex-col gap-1 border-b border-ink-600 bg-ink-800 px-3 py-2">
           <div className="flex items-center gap-2.5">
+            {RoleIcon && <RoleIcon size={14} className="shrink-0 text-accent" />}
+            <span className="shrink-0 text-[13px] font-semibold text-zinc-100">
+              {rmeta ? rmeta.label : providerTitle(frame.provider)}
+            </span>
             <span
-              className="min-w-0 truncate whitespace-nowrap font-mono text-[13px] font-semibold text-zinc-100"
+              className="min-w-0 truncate whitespace-nowrap font-mono text-[11px] text-zinc-500"
               title={anchorId}
             >
-              {anchorId}
+              {agentLabel(anchorId)}
             </span>
             <StatusBadge status={frame.pending ? "PENDING" : rawStatus} />
             {frame.model && (
@@ -213,11 +221,11 @@ export function AgentDetail({ frame }: { frame: Frame }) {
             ) : (
               <span className="shrink-0 text-zinc-600">Task: Uncategorized</span>
             )}
-            {profile && (
+            {rmeta && (
               <>
                 <span className="shrink-0 text-zinc-700">·</span>
-                <span className="shrink-0 text-zinc-400" title="Agent profile">
-                  Profile: {profile}
+                <span className="shrink-0 text-zinc-400" title="Agent role / profile">
+                  Role: {rmeta.label}
                 </span>
               </>
             )}

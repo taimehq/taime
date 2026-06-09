@@ -558,6 +558,8 @@ impl Session {
             // Membership lives on the worktree row, not the live session —
             // Manager::list() fills this from the store (the single fill site).
             task_id: None,
+            // Role/profile likewise filled by Manager::list() from the roles map.
+            role: None,
         }
     }
 }

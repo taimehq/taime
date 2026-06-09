@@ -161,6 +161,10 @@ export interface RustPtyMeta {
   /** Task membership (null ⇒ Uncategorized). Daemon-reported from the worktree
    *  row; the reconcile tick keeps it fresh after reassignment. */
   taskId?: string | null;
+  /** The agent's ROLE / profile (`orchestrator` / `product-builder` / … ). Set
+   *  from the launch profile, or the daemon's roles map for an adopted/assigned
+   *  worker. The UI surfaces this prominently (over provider/model). */
+  role?: string | null;
   /** The owning transport — always the daemon now (kept for forward-compat). */
   transport?: "daemon";
 }
@@ -851,6 +855,7 @@ export const useStore = create<Store>((set, get) => ({
                 startedAt: Date.now(),
                 status: "running",
                 taskId: taskId ?? null,
+                role: profile,
                 transport: "daemon",
               },
             }
@@ -947,6 +952,7 @@ export const useStore = create<Store>((set, get) => ({
         startedAt: summary.created_at_unix ? summary.created_at_unix * 1000 : Date.now(),
         status: summary.alive ? "running" : "exited",
         taskId: summary.task_id ?? null,
+        role: summary.role ?? null,
         transport: "daemon",
       };
       return { rustPtySessions: { ...s.rustPtySessions, [summary.id]: meta } };
@@ -962,9 +968,13 @@ export const useStore = create<Store>((set, get) => ({
       const byId = new Map(sessions.map((sum) => [sum.id, sum.task_id ?? null]));
       for (const sum of sessions) {
         const m = next[sum.id];
+        if (!m) continue;
         const tid = sum.task_id ?? null;
-        if (m && (m.taskId ?? null) !== tid) {
-          next[sum.id] = { ...m, taskId: tid };
+        // Daemon role wins when known; never clobber a known role with null (the
+        // daemon forgets roles across a restart).
+        const role = sum.role ?? m.role ?? null;
+        if ((m.taskId ?? null) !== tid || (m.role ?? null) !== role) {
+          next[sum.id] = { ...m, taskId: tid, role };
           changed = true;
         }
       }

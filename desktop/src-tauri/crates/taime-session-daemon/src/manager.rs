@@ -1127,6 +1127,7 @@ impl Manager {
                     "status": s.status,
                     "alive": s.alive,
                     "task_id": s.task_id,
+                    "role": s.role,
                 })
             })
             .collect();
@@ -2008,6 +2009,16 @@ impl Manager {
             for s in &mut sums {
                 if let Some(key) = &s.agent_id {
                     s.task_id = store.task_of_worktree(key);
+                }
+            }
+        }
+        // Role/profile lives in the in-memory roles map (set at spawn) — fill it so
+        // the UI can show each agent's role (incl. assigned workers it adopted).
+        {
+            let roles = self.roles.lock().unwrap();
+            for s in &mut sums {
+                if let Some(key) = &s.agent_id {
+                    s.role = roles.get(key).cloned();
                 }
             }
         }

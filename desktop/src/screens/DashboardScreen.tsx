@@ -17,6 +17,7 @@ import { uiStatus } from "../lib/agentStatus";
 import { StatusBadge } from "../components/StatusBadge";
 import { providerTitle } from "../lib/providerLabel";
 import { agentLabel } from "../lib/agentLabel";
+import { profileMeta, displayRole } from "../lib/profiles";
 import { pickDirectory } from "../lib/pickDirectory";
 
 /**
@@ -564,7 +565,10 @@ function UncatAgentRow({ meta }: { meta: RustPtyMeta }) {
         <StatusBadge status={raw} />
       </span>
       <span className="shrink-0 text-xs text-zinc-200">
-        {providerTitle(meta.provider)}
+        {(() => {
+          const role = displayRole(meta.role);
+          return role ? profileMeta(role).label : providerTitle(meta.provider);
+        })()}
       </span>
       <span className="min-w-0 flex-1 truncate whitespace-nowrap font-mono text-[11px] text-zinc-500">
         {agentLabel(meta.terminalId)}

@@ -60,6 +60,13 @@ export const PROFILE_META: Record<string, ProfileMeta> = {
 /** Canonical display order: known profiles in this order, customs after. */
 export const PROFILE_ORDER = Object.keys(PROFILE_META);
 
+/** The role to SURFACE for an agent (its profile name), or null when it's the
+ *  generic `default` — which isn't a meaningful role worth showing. The UI leads
+ *  with this (role matters more than provider/model). */
+export function displayRole(role: string | null | undefined): string | null {
+  return role && role !== "default" ? role : null;
+}
+
 /** Meta for ANY profile name. Custom profiles (`~/.taime/agents/*.toml`) fall
  *  back to the daemon-reported description and the generic agent icon. */
 export function profileMeta(

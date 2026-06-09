@@ -51,6 +51,10 @@ export interface DaemonSessionSummary {
   /** Task membership (v9) — read from the worktree row at list time so
    *  reassignment shows next tick. null ⇒ Uncategorized. */
   task_id: string | null;
+  /** The agent's ROLE / profile name (`orchestrator` / `product-builder` /
+   *  `researcher` / …), filled by the daemon from its roles map — so adopted /
+   *  assigned workers report the role they were spawned with. null ⇒ unknown. */
+  role: string | null;
 }
 
 /**

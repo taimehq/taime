@@ -3,6 +3,7 @@ import { TerminalViewRustPty } from "../components/TerminalViewRustPty";
 import { StatusBadge } from "../components/StatusBadge";
 import { statusDotClass } from "../lib/agentStatus";
 import { providerTitle } from "../lib/providerLabel";
+import { profileMeta, displayRole } from "../lib/profiles";
 import { Loader2, X, TerminalSquare, Power, LayoutGrid } from "lucide-react";
 
 /** CSS grid template that keeps frames roughly square as count grows. */
@@ -76,6 +77,7 @@ function ShellTabs({
   const setActiveFrameGuarded = useStore((s) => s.setActiveFrameGuarded);
   const terminalStatuses = useStore((s) => s.terminalStatuses);
   const dirty = useStore((s) => s.dirty);
+  const rustPtySessions = useStore((s) => s.rustPtySessions);
 
   const tabClass = (on: boolean) =>
     `flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1 text-left ${
@@ -105,11 +107,17 @@ function ShellTabs({
             ? terminalStatuses[f.terminalId]
             : undefined;
         const d = f.terminalId ? dirty[f.terminalId] : undefined;
-        // Subtitle: the agent's profile, when it's a meaningful non-default one.
-        const profile =
-          f.agentProfile && f.agentProfile !== "default"
-            ? f.agentProfile.replace(/_/g, " ")
-            : null;
+        // Lead with the ROLE (orchestrator / product-builder / researcher / …) —
+        // resolved from the launch profile or the daemon's role for an adopted
+        // worker — with provider + model as the secondary line.
+        const role = displayRole(
+          f.agentProfile ?? (f.ptySessionId ? rustPtySessions[f.ptySessionId]?.role : null),
+        );
+        const rmeta = role ? profileMeta(role) : null;
+        const RoleIcon = rmeta?.icon;
+        const sub = [rmeta ? providerTitle(f.provider) : null, f.model]
+          .filter(Boolean)
+          .join(" · ");
         return (
           <button
             key={f.key}
@@ -117,7 +125,7 @@ function ShellTabs({
               setActiveFrameGuarded(f.key);
               setLayoutMode("focus");
             }}
-            title={`${providerTitle(f.provider)}${profile ? " · " + profile : ""}${
+            title={`${rmeta ? rmeta.label + " · " : ""}${providerTitle(f.provider)}${
               f.model ? " · " + f.model : ""
             } — fullscreen`}
             className={tabClass(layoutMode === "focus" && f.key === activeKey)}
@@ -130,18 +138,14 @@ function ShellTabs({
                 <span
                   className={`h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass(raw)}`}
                 />
+                {RoleIcon && <RoleIcon size={11} className="shrink-0 text-zinc-400" />}
                 <span className="max-w-[130px] truncate text-[11px] font-medium">
-                  {providerTitle(f.provider)}
+                  {rmeta ? rmeta.label : providerTitle(f.provider)}
                 </span>
-                {f.model && (
-                  <span className="shrink-0 rounded bg-ink-600 px-1 text-[9px] font-medium text-zinc-300">
-                    {f.model}
-                  </span>
-                )}
               </span>
-              {profile && (
+              {sub && (
                 <span className="max-w-[150px] truncate text-[10px] text-zinc-500">
-                  {profile}
+                  {sub}
                 </span>
               )}
             </span>
@@ -170,6 +174,9 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
   const dirty = useStore((s) =>
     frame.terminalId ? s.dirty[frame.terminalId] : undefined,
   );
+  const meta = useStore((s) =>
+    frame.ptySessionId ? s.rustPtySessions[frame.ptySessionId] : undefined,
+  );
 
   const isRustPty = isDaemonTransport(frame.transport) && !!frame.ptySessionId;
 
@@ -179,11 +186,11 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
 
   const active = activeFrameKey === frame.key;
   const title = providerTitle(frame.provider);
-  // Agent profile — shown when it's a meaningful, non-default one.
-  const profile =
-    frame.agentProfile && frame.agentProfile !== "default"
-      ? frame.agentProfile.replace(/_/g, " ")
-      : null;
+  // Lead with the ROLE (resolved from the launch profile or the daemon's role
+  // for an adopted/assigned worker); provider + model are secondary.
+  const role = displayRole(frame.agentProfile ?? meta?.role);
+  const rmeta = role ? profileMeta(role) : null;
+  const RoleIcon = rmeta?.icon;
   // Key the frame for drag-and-drop hit-testing (file/screenshot drop → path).
   const termKey = isRustPty ? frame.ptySessionId : frame.terminalId;
 
@@ -213,11 +220,14 @@ function FrameCell({ frame, index }: { frame: Frame; index: number }) {
               {index + 1}
             </span>
           )}
-          <span className="shrink-0 text-xs font-medium text-zinc-200">
-            {title}
+          {RoleIcon && <RoleIcon size={13} className="shrink-0 text-accent" />}
+          <span className="shrink-0 text-xs font-medium text-zinc-100">
+            {rmeta ? rmeta.label : title}
           </span>
-          {profile && (
-            <span className="shrink-0 text-[11px] text-zinc-400">· {profile}</span>
+          {rmeta && (
+            <span className="shrink-0 text-[11px] text-zinc-500" title="Provider">
+              {title}
+            </span>
           )}
           {frame.model && (
             <span
