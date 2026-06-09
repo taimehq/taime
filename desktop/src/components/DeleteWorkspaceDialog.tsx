@@ -42,26 +42,27 @@ export function DeleteWorkspaceDialog({
   const run = async () => {
     if (!canRun) return;
     setBusy(true);
-    // Delete the folder FIRST (loud-fail) so a failed fs delete doesn't silently
-    // unlist the workspace while leaving the directory behind.
-    if (deleteDir) {
-      const err = await api.deleteDirectory(path);
-      if (err) {
-        useStore.getState().showSnackbar({
-          type: "error",
-          message: `Couldn't delete the folder: ${err}`,
-        });
-        setBusy(false);
-        return; // keep the dialog open; nothing was removed
-      }
-    }
+    // 1. Daemon teardown: stop the workspace's agents + delete its tasks. Do this
+    //    BEFORE any folder delete so nothing is writing into the dir as it goes.
+    const r = await api.deleteWorkspaceData(path);
+    // 2. Optional folder delete. If it fails we still finish (agents are already
+    //    stopped) and warn — never strand a half-deleted, still-listed workspace.
+    let dirErr: string | null = null;
+    if (deleteDir) dirErr = await api.deleteDirectory(path);
+    // 3. Remove it from Taime's list (switches away if it was the active one).
     deleteWorkspace(path);
     onClose();
+    const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+    const parts = [
+      r.killed ? `stopped ${plural(r.killed, "agent")}` : null,
+      r.tasks ? `deleted ${plural(r.tasks, "task")}` : null,
+      deleteDir && !dirErr ? "removed the folder" : null,
+    ].filter(Boolean);
     useStore.getState().showSnackbar({
-      type: "success",
-      message: deleteDir
-        ? `Deleted “${name}” and its folder`
-        : `Removed “${name}” from Taime`,
+      type: dirErr ? "error" : "success",
+      message: dirErr
+        ? `Removed “${name}”${parts.length ? ` (${parts.join(", ")})` : ""} — but the folder couldn't be deleted: ${dirErr}`
+        : `Deleted “${name}”${parts.length ? ` — ${parts.join(", ")}` : ""}`,
     });
   };
 
@@ -120,10 +121,8 @@ export function DeleteWorkspaceDialog({
           </div>
 
           <p className="mb-4 text-[11px] leading-relaxed text-zinc-500">
-            Removes this workspace from Taime's list. It does{" "}
-            <span className="text-zinc-300">not</span> stop running agents or delete
-            this workspace's tasks — those live in the daemon and reappear if you
-            reopen the folder.
+            Stops every agent working in this workspace, deletes its tasks, and
+            removes it from Taime.
             {isActive &&
               " Taime will switch to your next recent workspace (or none)."}
           </p>
@@ -191,13 +190,9 @@ export function DeleteWorkspaceDialog({
           <button
             onClick={() => void run()}
             disabled={!canRun}
-            className={`rounded-lg px-3 py-1.5 text-sm font-medium disabled:opacity-50 ${FOCUS_RING} ${
-              deleteDir
-                ? "bg-red-600 text-white hover:bg-red-500"
-                : "bg-ink-500 text-zinc-100 hover:bg-ink-400"
-            }`}
+            className={`rounded-lg bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50 ${FOCUS_RING}`}
           >
-            {busy ? "Working…" : deleteDir ? "Delete folder" : "Remove from Taime"}
+            {busy ? "Deleting…" : deleteDir ? "Delete workspace + folder" : "Delete workspace"}
           </button>
         </div>
       </div>

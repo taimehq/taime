@@ -421,6 +421,19 @@ export const api = {
     }
   },
 
+  /** Tear down a workspace daemon-side (the "delete workspace" flow): stop every
+   *  agent provisioned from it, remove their worktrees + rows, and delete the
+   *  workspace's tasks. Returns counts (or an error). Folder deletion is a
+   *  separate, typed-confirmation step (deleteDirectory). */
+  deleteWorkspaceData: (workspaceRoot: string) =>
+    daemonQuery<{
+      ok?: boolean;
+      agents?: number;
+      killed?: number;
+      tasks?: number;
+      error?: string;
+    }>("workspace_delete", { workspace_root: workspaceRoot }, { ok: false, error: "daemon unavailable" }),
+
   // ── Durable review acks (the flagship safe-context-switch guard) ──────────
   /** Persist that the user acknowledged an agent's current changes — so the ack
    *  survives a UI/daemon restart (it was frontend-local before). */

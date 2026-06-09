@@ -142,6 +142,32 @@ pub fn gc_one(
     GcOutcome::Removed
 }
 
+/// Force-remove a provisioned ISOLATED worktree checkout + its branch, for the
+/// "delete workspace" teardown. Unlike [`gc_one`], this does NOT preserve dirty
+/// or forked work — the user asked to delete the whole workspace. Best-effort:
+/// never errors. NEVER pass a shared-mode `worktree_path` (that's the user's
+/// real project dir) — callers gate on `mode == "isolated"`; the equality guard
+/// below is a second line of defense.
+pub fn remove_force(worktree_path: &str, repo_root: Option<&str>, branch: Option<&str>) {
+    // Refuse to fs-delete a path that is the repo root itself (shared mode).
+    let same_as_repo = repo_root.map(|r| Path::new(r) == Path::new(worktree_path)).unwrap_or(false);
+    if let Some(repo) = repo_root {
+        let repo = Path::new(repo);
+        if repo.is_dir() {
+            let _ = run_git(repo, &["worktree", "remove", "--force", worktree_path]);
+            if let Some(b) = branch {
+                let _ = run_git(repo, &["branch", "-D", b]);
+            }
+            let _ = run_git(repo, &["worktree", "prune"]);
+        }
+    }
+    // If git didn't remove it (repo gone / not registered), drop the checkout dir
+    // — but only when it's a real isolated worktree path, never the project root.
+    if !same_as_repo && Path::new(worktree_path).exists() {
+        let _ = std::fs::remove_dir_all(worktree_path);
+    }
+}
+
 /// Provision (or idempotently resolve) an isolated worktree for `agent_id`.
 /// Branch is `taime/<provider>-<agent_id>`, matching CAO.
 pub fn provision(
