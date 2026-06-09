@@ -13,6 +13,7 @@ import {
 import { api, type FileDiffEntry, type HunkEntry, type TaskAgent } from "../../api";
 import { useStore } from "../../store";
 import { providerTitle } from "../../lib/providerLabel";
+import { agentLabel } from "../../lib/agentLabel";
 import { statusDotClass } from "../../lib/agentStatus";
 import {
   AUTHOR_COLORS,
@@ -217,7 +218,7 @@ export function AgentDiffSection({
           title={member.agent_id}
           className="max-w-[160px] truncate whitespace-nowrap font-mono text-[10px] text-zinc-500"
         >
-          {member.agent_id}
+          {agentLabel(member.agent_id)}
         </span>
         {worktree?.branch && (
           <span className="flex shrink-0 items-center gap-1 rounded border border-ink-600 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">

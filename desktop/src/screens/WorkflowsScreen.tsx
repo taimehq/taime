@@ -21,6 +21,7 @@ import { useStore } from "../store";
 import { useTasks } from "../hooks/useTasks";
 import { WorkflowGraph } from "../components/WorkflowGraph";
 import { providerTitle } from "../lib/providerLabel";
+import { agentLabel } from "../lib/agentLabel";
 
 // ─── Wire-shape helpers ──────────────────────────────────────────────────────
 
@@ -768,7 +769,7 @@ function RunCard({
                     title={`Open diff for agent ${st.agent_id}`}
                     className="max-w-[110px] truncate rounded font-mono text-[10px] text-accent hover:underline"
                   >
-                    {st.agent_id}
+                    {agentLabel(st.agent_id)}
                   </button>
                 )}
               </span>

@@ -3,6 +3,7 @@ import { GitBranch, Plus } from "lucide-react";
 import { api, type TaskDetail, type TaskStatus } from "../../api";
 import { useStore } from "../../store";
 import { providerTitle } from "../../lib/providerLabel";
+import { agentLabel } from "../../lib/agentLabel";
 import { StatusBadge } from "../../components/StatusBadge";
 import { fmtUnix, memberWireStatus, middleTruncate, openAgent } from "./lib";
 
@@ -221,7 +222,7 @@ export function TaskOverviewTab({
                 </span>
                 <span className="min-w-0">
                   <span className="block truncate whitespace-nowrap font-mono text-[11px] text-zinc-200">
-                    {a.agent_id}
+                    {agentLabel(a.agent_id)}
                   </span>
                   {a.branch && (
                     <span className="flex items-center gap-1 font-mono text-[10px] text-zinc-600">

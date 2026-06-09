@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { AlertCircle, Eye, Hand, Inbox, Power, X } from "lucide-react";
 import { useStore, unreadCount, type AppNotification } from "../store";
+import { agentLabel } from "../lib/agentLabel";
 
 const FOCUS_RING =
   "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent";
@@ -114,7 +115,9 @@ export function NotificationsDrawer({ onClose }: { onClose: () => void }) {
             )}
           </span>
           <span className="flex items-center gap-1.5 text-[10px] text-zinc-600">
-            <span className="truncate font-mono">{n.agentId}</span>
+            <span className="truncate font-mono" title={n.agentId}>
+              {agentLabel(n.agentId)}
+            </span>
             <span className="tnum shrink-0">{ago(n.at)}</span>
           </span>
         </span>

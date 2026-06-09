@@ -18,8 +18,10 @@ const ROLE = `You are a workflow author for Taime. Your job: turn the user reque
 
 /** The contract block: tool, exact JSON schema, when-grammar, output routing,
  *  loop bounds, and the profile/provider vocabulary — verbatim from the
- *  daemon's workflow contract (workflow.rs + the create_workflow tool). */
-const SCHEMA_BLOCK = `THE create_workflow TOOL
+ *  daemon's workflow contract (workflow.rs + the create_workflow tool).
+ *  Exported so the new-workspace seed prompt (lib/seedPrompt.ts) reuses the
+ *  exact same contract — one source for the create_workflow schema. */
+export const SCHEMA_BLOCK = `THE create_workflow TOOL
 Call create_workflow with one argument, "definition": a JSON string of this exact shape:
 
 {

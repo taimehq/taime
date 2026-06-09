@@ -28,11 +28,13 @@ import {
   daemonCloseView,
   daemonPing,
   daemonCheckpoint,
+  daemonSendMessage,
   type TurnEvent,
   type DaemonSessionSummary,
 } from "./pty";
 import { sendToTerminal } from "./lib/terminalInput";
 import { providerTitle, PROVIDER_ORDER } from "./lib/providerLabel";
+import { agentLabel } from "./lib/agentLabel";
 
 /** Providers the daemon can launch via its provider registry. Every launch —
  *  any profile — routes through the daemon; it is the only transport. */
@@ -318,6 +320,13 @@ interface Store {
   newScheduleOpen: boolean;
   /** When true, the New-workflow dialog is open (workflows screen / sidebar "+"). */
   newWorkflowOpen: boolean;
+  /** When true, the "Start something new" dialog is open (first-run empty
+   *  state / ⌘O switcher / palette) — the generative new-workspace flow. */
+  seedOpen: boolean;
+  /** The workspace root the delete-confirmation dialog is open for (null =
+   *  closed). Store-owned so any surface (picker / switcher) can open it. */
+  deleteWorkspaceTarget: string | null;
+  setDeleteWorkspaceTarget: (root: string | null) => void;
   snackbar: Snackbar | null;
 
   // preferences (persisted via lib/preferences.ts)
@@ -352,6 +361,11 @@ interface Store {
   switchWorkspace: (root: string) => void;
   /** Record a workspace in the known list without activating it. */
   addWorkspace: (root: string) => void;
+  /** Remove a workspace from Taime's known list. If it's the active workspace,
+   *  switch to the next recent (or none) and clear workspace-scoped selections.
+   *  Does NOT touch disk — the dialog calls api.deleteDirectory separately when
+   *  the user opts in. Daemon agents/tasks for the root are untouched. */
+  deleteWorkspace: (root: string) => void;
 
   // notifications
   markRead: (id: string) => void;
@@ -379,6 +393,12 @@ interface Store {
       /** The per-agent intent — delivered once as the first prompt when the
        *  agent's terminal is ready (see `pendingAssignments`). */
       assignment?: string | null;
+      /** Deliver `assignment` through the DAEMON inbox (the proven Schedule/
+       *  Workflow path) instead of frontend keystroke injection — the daemon
+       *  types + submits it when the agent next goes idle, with no dependency on
+       *  the terminal frame being mounted/attached. Use for autonomous agents
+       *  (the founding agent) the user may not be watching. */
+      seedViaInbox?: boolean;
     },
   ) => Promise<void>;
   /** Launch a provider on the detached session daemon (the Rust PTY path; survives
@@ -397,6 +417,7 @@ interface Store {
     taskId?: string | null,
     projectRoot?: string | null,
     assignment?: string | null,
+    seedViaInbox?: boolean,
   ) => Promise<boolean>;
   /** Attempt the one-shot assignment delivery for `agentId`: no-op unless a
    *  pending entry exists AND the view's writer is attached for `sessionId`.
@@ -426,8 +447,12 @@ interface Store {
   /** Switch active frame, raising the dirty-state guard if needed. */
   setActiveFrameGuarded: (key: string) => void;
   resolveSwitch: (proceed: boolean) => void;
-  /** Acknowledge an agent's dirty changes (keyed by agent id). */
+  /** Acknowledge an agent's dirty changes (keyed by agent id). Also persisted
+   *  daemon-side so the ack survives a UI/daemon restart. */
   markReviewed: (agentId: string) => void;
+  /** Merge daemon-persisted review acks into the guard state (boot/tick
+   *  hydration — union only; can add an ack, never clear a local one). */
+  hydrateReviewed: (agentIds: string[]) => void;
   openDiff: (terminalId: string) => void;
   closeDiff: () => void;
   setGraphOpen: (open: boolean) => void;
@@ -438,6 +463,7 @@ interface Store {
   setNewTaskOpen: (open: boolean) => void;
   setNewScheduleOpen: (open: boolean) => void;
   setNewWorkflowOpen: (open: boolean) => void;
+  setSeedOpen: (open: boolean) => void;
   setLayoutMode: (mode: LayoutMode) => void;
   toggleLayoutMode: () => void;
 
@@ -523,6 +549,8 @@ export const useStore = create<Store>((set, get) => ({
   newTaskOpen: false,
   newScheduleOpen: false,
   newWorkflowOpen: false,
+  seedOpen: false,
+  deleteWorkspaceTarget: null,
   snackbar: null,
 
   setConnected: (connected) => {
@@ -590,6 +618,21 @@ export const useStore = create<Store>((set, get) => ({
       workspaces: deriveWorkspaces(s.workspaceDir, recents),
     });
   },
+
+  deleteWorkspace: (root) => {
+    const s = get();
+    if (root === s.workspaceDir) {
+      // Move to the next known workspace (or none) before dropping the active
+      // one, and clear workspace-scoped state (tasks belong to a workspace).
+      const next = s.recentProjects.find((p) => p !== root) ?? null;
+      s.setWorkspaceDir(next);
+      set({ selectedTaskId: null, taskInitialTab: null });
+    }
+    // Drop it from the recents/known list (re-derives `workspaces`).
+    s.removeRecentProject(root);
+  },
+
+  setDeleteWorkspaceTarget: (deleteWorkspaceTarget) => set({ deleteWorkspaceTarget }),
 
   markRead: (id) =>
     set((s) => {
@@ -707,6 +750,7 @@ export const useStore = create<Store>((set, get) => ({
       opts?.taskId ?? null,
       opts?.workingDirectory ?? null,
       opts?.assignment ?? null,
+      opts?.seedViaInbox ?? false,
     );
     if (ok && firstAgent) get().setGraphOpen(true);
   },
@@ -717,6 +761,7 @@ export const useStore = create<Store>((set, get) => ({
     taskId = null,
     projectRoot = null,
     assignment = null,
+    seedViaInbox = false,
   ) => {
     // Provision from the active workspace (or an explicit override root) — the
     // worktree row is the durable anchor for attribution AND Task membership.
@@ -782,10 +827,12 @@ export const useStore = create<Store>((set, get) => ({
         return {
           frames,
           activeFrameKey: existing ? existing.key : key,
-          // Stamp the assignment for one-shot delivery once the agent's view
-          // attaches AND it reports ready. Keyed by the freshly-minted agent id,
-          // so adopted/pre-existing agents can never receive one.
-          ...(assignment?.trim() && terminalId
+          // Stamp the assignment for one-shot KEYSTROKE delivery once the agent's
+          // view attaches AND it reports ready. Keyed by the freshly-minted agent
+          // id, so adopted/pre-existing agents can never receive one. Skipped when
+          // seedViaInbox is set — the daemon inbox path (below) delivers instead,
+          // so we never double-deliver.
+          ...(!seedViaInbox && assignment?.trim() && terminalId
             ? {
                 pendingAssignments: {
                   ...s.pendingAssignments,
@@ -811,9 +858,20 @@ export const useStore = create<Store>((set, get) => ({
             : s.rustPtySessions,
         };
       });
+      // Daemon-inbox seed delivery (the proven Schedule/Workflow path): the
+      // daemon types + submits the prompt when the agent next goes idle, retrying
+      // each tick — no dependency on the terminal frame being mounted/attached.
+      // (The keystroke path above is skipped when seedViaInbox is set.)
+      if (seedViaInbox && assignment?.trim() && terminalId) {
+        daemonSendMessage("taime", terminalId, assignment.trim()).catch((e) =>
+          console.warn("[taime] seed enqueue failed", e),
+        );
+      }
       get().showSnackbar({
         type: "success",
-        message: `${providerTitle(provider)} launched`,
+        message: terminalId
+          ? `${providerTitle(provider)} · ${agentLabel(terminalId)} launched`
+          : `${providerTitle(provider)} launched`,
       });
       return true;
     } catch (e) {
@@ -1080,6 +1138,9 @@ export const useStore = create<Store>((set, get) => ({
     const reviewedFrames = from?.terminalId
       ? { ...s.reviewedFrames, [from.terminalId]: true }
       : s.reviewedFrames;
+    // Persist the ack (durable review state) — same as markReviewed, so the
+    // acknowledgment isn't lost on the next app/daemon restart.
+    if (from?.terminalId) api.markReviewed(from.terminalId).catch(() => {});
     if (target.kind === "frame") {
       set({ activeFrameKey: target.key, pendingSwitch: null, reviewedFrames });
     } else if (target.kind === "section") {
@@ -1095,8 +1156,25 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  markReviewed: (agentId) =>
-    set((s) => ({ reviewedFrames: { ...s.reviewedFrames, [agentId]: true } })),
+  markReviewed: (agentId) => {
+    // Persist the ack so it survives a UI/daemon restart (best-effort; the local
+    // set below is authoritative for this session regardless).
+    api.markReviewed(agentId).catch(() => {});
+    set((s) => ({ reviewedFrames: { ...s.reviewedFrames, [agentId]: true } }));
+  },
+
+  hydrateReviewed: (agentIds) =>
+    set((s) => {
+      let changed = false;
+      const next = { ...s.reviewedFrames };
+      for (const id of agentIds) {
+        if (!next[id]) {
+          next[id] = true;
+          changed = true;
+        }
+      }
+      return changed ? { reviewedFrames: next } : s;
+    }),
 
   openDiff: (terminalId) => set({ diffTerminalId: terminalId }),
   closeDiff: () => set({ diffTerminalId: null }),
@@ -1107,6 +1185,7 @@ export const useStore = create<Store>((set, get) => ({
   setNewTaskOpen: (newTaskOpen) => set({ newTaskOpen }),
   setNewScheduleOpen: (newScheduleOpen) => set({ newScheduleOpen }),
   setNewWorkflowOpen: (newWorkflowOpen) => set({ newWorkflowOpen }),
+  setSeedOpen: (seedOpen) => set({ seedOpen }),
   setLayoutMode: (layoutMode) => set({ layoutMode }),
   toggleLayoutMode: () =>
     set((s) => ({ layoutMode: s.layoutMode === "grid" ? "focus" : "grid" })),

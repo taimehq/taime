@@ -21,6 +21,8 @@ import { LaunchAgentDialog } from "./components/LaunchAgentDialog";
 import { NewTaskDialog } from "./components/NewTaskDialog";
 import { AddScheduleDialog } from "./components/AddScheduleDialog";
 import { NewWorkflowDialog } from "./components/NewWorkflowDialog";
+import { SeedDialog } from "./components/SeedDialog";
+import { DeleteWorkspaceDialog } from "./components/DeleteWorkspaceDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { Snackbar } from "./components/Snackbar";
 import { ContextSwitchGuard } from "./components/ContextSwitchGuard";
@@ -68,6 +70,10 @@ export default function App() {
   const setNewScheduleOpen = useStore((s) => s.setNewScheduleOpen);
   const newWorkflowOpen = useStore((s) => s.newWorkflowOpen);
   const setNewWorkflowOpen = useStore((s) => s.setNewWorkflowOpen);
+  const seedOpen = useStore((s) => s.seedOpen);
+  const setSeedOpen = useStore((s) => s.setSeedOpen);
+  const deleteWorkspaceTarget = useStore((s) => s.deleteWorkspaceTarget);
+  const setDeleteWorkspaceTarget = useStore((s) => s.setDeleteWorkspaceTarget);
   const connected = useStore((s) => s.connected);
   const openDiff = useStore((s) => s.openDiff);
   const section = useStore((s) => s.section);
@@ -128,6 +134,13 @@ export default function App() {
       {newWorkflowOpen && (
         // The 5s workflow polls (sidebar + screen) surface the new row.
         <NewWorkflowDialog onClose={() => setNewWorkflowOpen(false)} />
+      )}
+      {seedOpen && <SeedDialog onClose={() => setSeedOpen(false)} />}
+      {deleteWorkspaceTarget && (
+        <DeleteWorkspaceDialog
+          path={deleteWorkspaceTarget}
+          onClose={() => setDeleteWorkspaceTarget(null)}
+        />
       )}
       <CommandPalette />
       <ContextSwitchGuard onReview={openDiff} />

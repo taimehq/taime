@@ -16,6 +16,8 @@ vi.mock("./api", () => ({
     provisionWorktree: vi.fn(),
     listAgents: vi.fn(async () => []),
     clearDaemonDirty: vi.fn(async () => true),
+    markReviewed: vi.fn(async () => true),
+    reviewedAgents: vi.fn(async () => []),
   },
 }));
 
@@ -25,6 +27,7 @@ vi.mock("./pty", () => ({
   daemonCloseView: vi.fn(async () => {}),
   daemonPing: vi.fn(async () => false),
   daemonCheckpoint: vi.fn(async () => {}),
+  daemonSendMessage: vi.fn(async () => 1),
 }));
 
 vi.mock("./backend", () => ({
@@ -67,6 +70,7 @@ import {
   daemonSpawnAgent,
   daemonPing,
   daemonCheckpoint,
+  daemonSendMessage,
   type DaemonSessionSummary,
 } from "./pty";
 import { inTauri } from "./backend";
@@ -74,9 +78,11 @@ import { sendToTerminal } from "./lib/terminalInput";
 
 const provisionWorktree = vi.mocked(api.provisionWorktree);
 const listAgents = vi.mocked(api.listAgents);
+const markReviewedApi = vi.mocked(api.markReviewed);
 const spawnAgent = vi.mocked(daemonSpawnAgent);
 const ping = vi.mocked(daemonPing);
 const checkpoint = vi.mocked(daemonCheckpoint);
+const sendMessage = vi.mocked(daemonSendMessage);
 const inTauriMock = vi.mocked(inTauri);
 const sendToTerminalMock = vi.mocked(sendToTerminal);
 
@@ -526,6 +532,61 @@ describe("setLaunchOpen task preset", () => {
   });
 });
 
+describe("setSeedOpen", () => {
+  it("toggles the Start-something-new dialog flag (default closed)", () => {
+    expect(useStore.getState().seedOpen).toBe(false);
+    useStore.getState().setSeedOpen(true);
+    expect(useStore.getState().seedOpen).toBe(true);
+    useStore.getState().setSeedOpen(false);
+    expect(useStore.getState().seedOpen).toBe(false);
+  });
+});
+
+describe("deleteWorkspace", () => {
+  it("removes a non-active workspace, leaving the active one untouched", () => {
+    useStore.setState({
+      workspaceDir: "/a",
+      activeWorkspaceRoot: "/a",
+      recentProjects: ["/a", "/b", "/c"],
+      workspaces: ["/a", "/b", "/c"],
+    });
+    useStore.getState().deleteWorkspace("/b");
+    const s = useStore.getState();
+    expect(s.workspaceDir).toBe("/a");
+    expect(s.recentProjects).not.toContain("/b");
+    expect(s.workspaces).not.toContain("/b");
+  });
+
+  it("deleting the ACTIVE workspace switches to the next recent + clears task selection", () => {
+    useStore.setState({
+      workspaceDir: "/a",
+      activeWorkspaceRoot: "/a",
+      recentProjects: ["/a", "/b"],
+      workspaces: ["/a", "/b"],
+      selectedTaskId: "task-1",
+      section: "tasks",
+    });
+    useStore.getState().deleteWorkspace("/a");
+    const s = useStore.getState();
+    expect(s.workspaceDir).toBe("/b");
+    expect(s.recentProjects).not.toContain("/a");
+    expect(s.selectedTaskId).toBeNull();
+  });
+
+  it("deleting the only (active) workspace leaves none active", () => {
+    useStore.setState({
+      workspaceDir: "/only",
+      activeWorkspaceRoot: "/only",
+      recentProjects: ["/only"],
+      workspaces: ["/only"],
+    });
+    useStore.getState().deleteWorkspace("/only");
+    const s = useStore.getState();
+    expect(s.workspaceDir).toBeNull();
+    expect(s.recentProjects).toEqual([]);
+  });
+});
+
 describe("clearSelectedTask", () => {
   it("clears the selection and any pending deep-link tab", () => {
     useStore.getState().selectTask("task-1", "review");
@@ -923,6 +984,20 @@ describe("assignment delivery", () => {
     expect(useStore.getState().pendingAssignments).toEqual({});
   });
 
+  it("seedViaInbox delivers via the daemon inbox (enqueue), NOT the keystroke path", async () => {
+    useStore.setState({ workspaceDir: "/proj" });
+    provisionWorktree.mockResolvedValueOnce(makeWorktree({ agent_id: "term-seed" }));
+    spawnAgent.mockResolvedValueOnce("sess-seed");
+
+    await useStore
+      .getState()
+      .launchAgentDaemon("claude_code", "orchestrator", "task-1", null, "build a thing", true);
+
+    // Daemon inbox owns delivery — no keystroke pending (never double-delivers).
+    expect(useStore.getState().pendingAssignments).toEqual({});
+    expect(sendMessage).toHaveBeenCalledWith("taime", "term-seed", "build a thing");
+  });
+
   it("IDLE before the view attaches keeps the entry pending (writer not registered)", async () => {
     await launchWithAssignment();
     sendToTerminalMock.mockReturnValue(false); // no writer yet
@@ -997,5 +1072,36 @@ describe("assignment delivery", () => {
     useStore.getState().setTerminalStatus("term-1", "IDLE");
 
     expect(sendToTerminalMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── durable review acks (the flagship safe-context-switch guard) ────────────
+
+describe("durable review acks", () => {
+  it("markReviewed sets the local ack AND persists it to the daemon", () => {
+    useStore.getState().markReviewed("agent-z");
+    expect(useStore.getState().reviewedFrames["agent-z"]).toBe(true);
+    expect(markReviewedApi).toHaveBeenCalledWith("agent-z");
+  });
+
+  it("resolveSwitch(true) persists the proceeded-past agent's ack", () => {
+    seedUnreviewedAgent();
+    useStore.getState().setSection("dashboard"); // raises the guard
+    useStore.getState().resolveSwitch(true);
+    expect(useStore.getState().reviewedFrames["term-1"]).toBe(true);
+    expect(markReviewedApi).toHaveBeenCalledWith("term-1");
+  });
+
+  it("hydrateReviewed unions daemon acks without clobbering local ones", () => {
+    useStore.setState({ reviewedFrames: { local: true } });
+    useStore.getState().hydrateReviewed(["a", "b", "local"]);
+    expect(useStore.getState().reviewedFrames).toEqual({ local: true, a: true, b: true });
+  });
+
+  it("hydrateReviewed is an identity no-op when nothing new", () => {
+    useStore.setState({ reviewedFrames: { a: true } });
+    const before = useStore.getState();
+    useStore.getState().hydrateReviewed(["a"]);
+    expect(useStore.getState()).toBe(before);
   });
 });

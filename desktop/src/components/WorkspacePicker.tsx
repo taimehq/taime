@@ -3,7 +3,7 @@ import {
   Folder,
   FolderSearch,
   GitBranch,
-  X,
+  Trash2,
   ChevronDown,
   AlertTriangle,
   Keyboard,
@@ -24,7 +24,7 @@ export function WorkspacePicker() {
   const workspaceDir = useStore((s) => s.workspaceDir);
   const setWorkspaceDir = useStore((s) => s.setWorkspaceDir);
   const recentProjects = useStore((s) => s.recentProjects);
-  const removeRecentProject = useStore((s) => s.removeRecentProject);
+  const setDeleteWorkspaceTarget = useStore((s) => s.setDeleteWorkspaceTarget);
   const clearRecentProjects = useStore((s) => s.clearRecentProjects);
   const isolationEnabled = useStore((s) => s.isolationEnabled);
   const setIsolationEnabled = useStore((s) => s.setIsolationEnabled);
@@ -149,11 +149,12 @@ export function WorkspacePicker() {
                       </span>
                     </button>
                     <button
-                      onClick={() => removeRecentProject(p)}
-                      aria-label={`Remove ${p} from recent`}
-                      className="ml-0.5 shrink-0 rounded p-1 text-zinc-700 opacity-0 hover:text-zinc-300 group-hover/recent:opacity-100"
+                      onClick={() => setDeleteWorkspaceTarget(p)}
+                      aria-label={`Delete workspace ${p}`}
+                      title="Delete workspace…"
+                      className="ml-0.5 shrink-0 rounded p-1 text-zinc-700 opacity-0 hover:text-red-400 group-hover/recent:opacity-100"
                     >
-                      <X size={12} />
+                      <Trash2 size={12} />
                     </button>
                   </li>
                 ))}
@@ -200,6 +201,19 @@ export function WorkspacePicker() {
               <Keyboard size={11} />
               Enter path manually
             </button>
+          )}
+
+          {workspaceDir && (
+            <>
+              <div className="mx-1 my-0.5 h-px bg-ink-700" />
+              <button
+                onClick={() => setDeleteWorkspaceTarget(workspaceDir)}
+                className="flex items-center gap-1.5 self-start rounded-md px-2 py-1 text-[11px] text-zinc-600 hover:text-red-400"
+              >
+                <Trash2 size={11} />
+                Delete this workspace…
+              </button>
+            </>
           )}
         </div>
       )}

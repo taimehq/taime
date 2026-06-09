@@ -8,6 +8,7 @@ import {
   FolderOpen,
   Layers,
   Plus,
+  Sparkles,
   type LucideIcon,
 } from "lucide-react";
 import { useStore, type RustPtyMeta } from "../store";
@@ -15,6 +16,7 @@ import { api, type ScheduleInfo, type TaskInfo } from "../api";
 import { uiStatus } from "../lib/agentStatus";
 import { StatusBadge } from "../components/StatusBadge";
 import { providerTitle } from "../lib/providerLabel";
+import { agentLabel } from "../lib/agentLabel";
 import { pickDirectory } from "../lib/pickDirectory";
 
 /**
@@ -565,7 +567,7 @@ function UncatAgentRow({ meta }: { meta: RustPtyMeta }) {
         {providerTitle(meta.provider)}
       </span>
       <span className="min-w-0 flex-1 truncate whitespace-nowrap font-mono text-[11px] text-zinc-500">
-        {meta.terminalId}
+        {agentLabel(meta.terminalId)}
       </span>
       {meta.branch && (
         <span
@@ -594,6 +596,7 @@ function EmptyWorkspace() {
   const workspaceDir = useStore((s) => s.workspaceDir);
   const connected = useStore((s) => s.connected);
   const setLaunchOpen = useStore((s) => s.setLaunchOpen);
+  const setSeedOpen = useStore((s) => s.setSeedOpen);
   const switchWorkspace = useStore((s) => s.switchWorkspace);
   const [picking, setPicking] = useState(false);
 
@@ -615,20 +618,28 @@ function EmptyWorkspace() {
           {workspaceDir ? "Workspace is empty" : "No workspace open"}
         </p>
         <p className="mt-1 max-w-sm text-xs text-zinc-500">
-          {workspaceDir
-            ? "No tasks or agents yet. Launch an agent to start working — each runs in its own worktree."
-            : "Open a project folder to scope tasks, or launch an agent right away."}
+          Start a brand-new project, open an existing folder, or launch an agent
+          right away — each agent runs in its own worktree.
         </p>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-center gap-2">
+        <button
+          onClick={() => setSeedOpen(true)}
+          disabled={!connected}
+          title={connected ? "Start something new" : "Daemon unreachable"}
+          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40"
+        >
+          <Sparkles size={13} className="shrink-0" />
+          Start something new
+        </button>
         <button
           onClick={() => setLaunchOpen(true)}
           disabled={!connected}
           title={connected ? "Launch an agent" : "Daemon unreachable"}
-          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40"
+          className="flex items-center gap-1.5 rounded-md border border-ink-500 px-3 py-1.5 text-xs text-zinc-300 hover:bg-ink-600 disabled:cursor-default disabled:opacity-40"
         >
           <Bot size={13} className="shrink-0" />
-          Launch your first agent
+          Launch an agent
         </button>
         <button
           onClick={() => void openWorkspace()}

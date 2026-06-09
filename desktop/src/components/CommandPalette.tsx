@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore, type Section } from "../store";
 import { providerTitle } from "../lib/providerLabel";
+import { agentLabel } from "../lib/agentLabel";
 import { statusLabel, uiStatus } from "../lib/agentStatus";
 import { useTasks } from "../hooks/useTasks";
 import { pickDirectory } from "../lib/pickDirectory";
@@ -195,9 +196,9 @@ function PaletteBody() {
       out.push({
         id: `agent:${m.ptySessionId}`,
         group: "Agents",
-        label: `Open agent: ${providerTitle(m.provider)}`,
+        label: `Open agent: ${providerTitle(m.provider)} · ${agentLabel(m.terminalId)}`,
         hint,
-        keywords: `${m.provider} ${m.terminalId} ${m.branch ?? ""} terminal`,
+        keywords: `${m.provider} ${m.terminalId} ${agentLabel(m.terminalId)} ${m.branch ?? ""} terminal`,
         run: () => {
           close();
           openAgentSession(m.ptySessionId);
@@ -224,6 +225,16 @@ function PaletteBody() {
     }
 
     // ── Actions ───────────────────────────────────────────────────────────
+    out.push({
+      id: "action:start-new",
+      group: "Actions",
+      label: "Start something new",
+      keywords: "create new project workspace scaffold generate brand new founding seed",
+      run: () => {
+        close();
+        useStore.getState().setSeedOpen(true);
+      },
+    });
     out.push({
       id: "action:launch",
       group: "Actions",

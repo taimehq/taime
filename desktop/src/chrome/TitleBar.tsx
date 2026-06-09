@@ -6,6 +6,7 @@ import {
   FolderGit2,
   Plus,
   Search,
+  Sparkles,
 } from "lucide-react";
 import { useStore, unreadCount } from "../store";
 import { api } from "../api";
@@ -13,6 +14,7 @@ import { inTauri, type BackendState } from "../backend";
 import { BackendStatusPill } from "../components/BackendStatusPill";
 import { StatusBadge } from "../components/StatusBadge";
 import { providerTitle } from "../lib/providerLabel";
+import { agentLabel } from "../lib/agentLabel";
 import { basename, dirname } from "../lib/recentProjects";
 import { pickDirectory } from "../lib/pickDirectory";
 import { useFullscreen } from "../hooks/useFullscreen";
@@ -113,6 +115,7 @@ export function TitleBar({ backend }: { backend: BackendState }) {
 }
 
 const ADD_WORKSPACE = "__add__";
+const START_NEW = "__start_new__";
 
 /**
  * The workspace switcher chip + dropdown. Opens on click or ⌘O (store-owned
@@ -134,8 +137,10 @@ function WorkspaceSwitcher() {
     Record<string, { tasks: number; agents: number }>
   >({});
 
-  // The navigable items: every known workspace, then "Add workspace…".
-  const items = [...workspaces, ADD_WORKSPACE];
+  // The navigable items: every known workspace, then the two creation verbs
+  // ("Add workspace…" = open an existing folder, "Start something new" = the
+  // generative new-project flow).
+  const items = [...workspaces, ADD_WORKSPACE, START_NEW];
 
   // Outside-mousedown closes (in addition to blur + Escape).
   useEffect(() => {
@@ -195,7 +200,9 @@ function WorkspaceSwitcher() {
     const item = items[idx];
     if (!item) return;
     close();
-    if (item === ADD_WORKSPACE) {
+    if (item === START_NEW) {
+      useStore.getState().setSeedOpen(true);
+    } else if (item === ADD_WORKSPACE) {
       void pickDirectory(workspaceDir ?? undefined).then((dir) => {
         if (dir) switchWorkspace(dir);
         // null = cancelled (Tauri) or no native dialog (dev browser) — only
@@ -316,6 +323,19 @@ function WorkspaceSwitcher() {
             <Plus size={13} className="shrink-0 text-zinc-600" />
             Add workspace…
           </button>
+          <button
+            role="option"
+            aria-selected={false}
+            tabIndex={-1}
+            onClick={() => activate(workspaces.length + 1)}
+            onMouseEnter={() => setCursor(workspaces.length + 1)}
+            className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-zinc-300 ${
+              cursor === workspaces.length + 1 ? "bg-ink-500" : ""
+            }`}
+          >
+            <Sparkles size={13} className="shrink-0 text-accent" />
+            Start something new
+          </button>
           <div className="flex items-center gap-1.5 px-2 pb-0.5 pt-1.5 text-[10px] text-zinc-600">
             <kbd className="rounded border border-ink-500 bg-ink-600 px-1 font-mono text-[9px] text-zinc-500">
               ⌘O
@@ -357,7 +377,7 @@ function Breadcrumb() {
       const mt = taskTitle(activeFrame.taskId);
       middle = mt ? `Task: ${mt}` : null;
       leaf = `${providerTitle(activeFrame.provider)}${
-        activeFrame.terminalId ? ` · ${activeFrame.terminalId}` : ""
+        activeFrame.terminalId ? ` · ${agentLabel(activeFrame.terminalId)}` : ""
       }`;
     } else {
       leaf = "Agents";

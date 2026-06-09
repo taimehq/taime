@@ -393,6 +393,42 @@ export const api = {
     }
   },
 
+  /** Create a brand-new project folder (the "Start something new" flow), then
+   *  return its WorkspaceInfo. App-side (mirrors getWorkspaceInfo) so the dialog
+   *  can generate a workspace from a typed / not-yet-existing path. Idempotent.
+   *  `gitInit` defaults false — the founding agent runs its own git init so
+   *  genesis stays attributed to its turn. Outside Tauri it's a no-op probe. */
+  initWorkspace: async (path: string, gitInit = false): Promise<WorkspaceInfo> => {
+    if (!inTauri()) return api.getWorkspaceInfo(path);
+    try {
+      return await invoke<WorkspaceInfo>("workspace_init", { path, gitInit });
+    } catch {
+      return api.getWorkspaceInfo(path);
+    }
+  },
+
+  /** Permanently delete a directory and all its contents (the "delete workspace
+   *  → also remove from disk" path). DESTRUCTIVE — gated in the UI behind a typed
+   *  confirmation; the backend additionally refuses root/home/shallow paths.
+   *  Returns an error string on failure, else null. */
+  deleteDirectory: async (path: string): Promise<string | null> => {
+    if (!inTauri()) return "Deleting the folder is only available in the desktop app.";
+    try {
+      await invoke("delete_directory", { path });
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  },
+
+  // ── Durable review acks (the flagship safe-context-switch guard) ──────────
+  /** Persist that the user acknowledged an agent's current changes — so the ack
+   *  survives a UI/daemon restart (it was frontend-local before). */
+  markReviewed: (agentId: string) =>
+    daemonQuery<boolean>("mark_reviewed", { agent_id: agentId }, true),
+  /** Agent ids with a standing review ack — hydrates the guard on boot. */
+  reviewedAgents: () => daemonQuery<string[]>("reviewed", {}, []),
+
   /** The daemon's agents (its registry is the only roster); the tmux-shaped
    *  session grouping is gone. */
   listAgents: () => daemonQuery<AgentSummary[]>("agents", {}, []),
