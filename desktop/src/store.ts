@@ -740,11 +740,11 @@ export const useStore = create<Store>((set, get) => ({
     // launchAgentDaemon reports its own (real) error on failure. `taskId` is the
     // Task the agent joins — real membership (stamped on the worktree row at
     // provision), not just a label; null ⇒ Uncategorized.
-    // Open the (non-disruptive) team drawer on the FIRST agent so the team view is
-    // discovered, then leave it to the user — repeat launches just update the
-    // "Team N" badge in the title bar rather than popping the panel each time.
-    const firstAgent = Object.keys(get().rustPtySessions).length === 0;
-    const ok = await get().launchAgentDaemon(
+    // NOTE: we deliberately do NOT auto-open the Team/activity drawer here. It
+    // popped open on first launch showing global, cross-workspace data (stale
+    // contended files from other repos), which read as "wrong for this project."
+    // The user opens it explicitly (⌘⇧A) when they want it.
+    await get().launchAgentDaemon(
       provider,
       agentProfile || "default",
       opts?.taskId ?? null,
@@ -752,7 +752,6 @@ export const useStore = create<Store>((set, get) => ({
       opts?.assignment ?? null,
       opts?.seedViaInbox ?? false,
     );
-    if (ok && firstAgent) get().setGraphOpen(true);
   },
 
   launchAgentDaemon: async (

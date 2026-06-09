@@ -189,8 +189,13 @@ fn binary_installed(binary: &str) -> bool {
 /// The delimited stdin payload for an inbox delivery — a clear visual frame so
 /// the user can tell orchestrator injection from agent output (the plan's
 /// delivery format). Pure + testable.
+/// Frame an inbox message for injection. Uses bare line-feeds (NO carriage
+/// returns), so nothing in the payload reads as Enter: a long multi-line message
+/// is detected as a bracketed paste by the CLI, and `deliver_pending` submits it
+/// with a SEPARATE, delayed `\r`. (A trailing `\r\n` in the same burst becomes
+/// paste content, leaving the prompt sitting in the input box unsent.)
 fn format_delivery(sender_id: &str, body: &str) -> String {
-    format!("\r\n--- MESSAGE FROM {sender_id} ---\r\n{body}\r\n--- END MESSAGE ---\r\n")
+    format!("\n--- MESSAGE FROM {sender_id} ---\n{body}\n--- END MESSAGE ---\n")
 }
 
 impl Default for Manager {
@@ -441,6 +446,17 @@ impl Manager {
             match session.input(payload.as_bytes()) {
                 Ok(_) => {
                     let _ = store.set_message_status(msg.id, "delivered");
+                    // Submit on a SEPARATE, delayed write. A long multi-line
+                    // message is detected as a bracketed paste, so a newline in the
+                    // same burst becomes paste content rather than Enter — the
+                    // prompt would sit in the input box unsent. A short delay
+                    // breaks the burst so this `\r` reads as a real submit (mirrors
+                    // the app's keystroke-delivery path).
+                    let submit = session.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let _ = submit.input(b"\r");
+                    });
                 }
                 Err(_) => {
                     let _ = store.set_message_status(msg.id, "failed");
@@ -2205,10 +2221,13 @@ mod tests {
     #[test]
     fn delivery_payload_is_clearly_delimited() {
         let out = format_delivery("term-a", "please review the diff");
+        // Bare line-feeds only — the submit is a SEPARATE delayed `\r` so the
+        // payload itself never reads as Enter (long messages paste, don't submit).
         assert_eq!(
             out,
-            "\r\n--- MESSAGE FROM term-a ---\r\nplease review the diff\r\n--- END MESSAGE ---\r\n"
+            "\n--- MESSAGE FROM term-a ---\nplease review the diff\n--- END MESSAGE ---\n"
         );
+        assert!(!out.contains('\r'), "no carriage returns in the framed payload");
         // The frame is visually distinguishable from agent output.
         assert!(out.contains("--- MESSAGE FROM term-a ---"));
         assert!(out.contains("--- END MESSAGE ---"));
