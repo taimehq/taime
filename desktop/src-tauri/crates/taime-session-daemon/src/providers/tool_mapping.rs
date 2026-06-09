@@ -17,6 +17,12 @@ const CLAUDE_CODE_MAPPING: &[(&str, &[&str])] = &[
     ("fs_read", &["Read"]),
     ("fs_write", &["Edit", "Write"]),
     ("fs_list", &["Glob", "Grep"]),
+    // Beyond CAO's original vocab: lets a restricted profile (e.g. the
+    // orchestrator) also block web research and Claude's own subagent spawner —
+    // so the ONLY way it can delegate is Taime's tracked `assign`, never an
+    // invisible in-process Task worker.
+    ("web", &["WebSearch", "WebFetch"]),
+    ("subagent", &["Task"]),
     ("fs_*", &["Read", "Edit", "Write", "Glob", "Grep"]),
 ];
 
@@ -137,11 +143,18 @@ mod tests {
     fn disallowed_is_the_sorted_complement_of_allowed() {
         assert_eq!(
             get_disallowed_tools("claude_code", &allowed(&["fs_read"])),
-            vec!["Bash", "Edit", "Glob", "Grep", "Write"]
+            vec!["Bash", "Edit", "Glob", "Grep", "Task", "WebFetch", "WebSearch", "Write"]
         );
         assert_eq!(
             get_disallowed_tools("claude_code", &allowed(&["execute_bash", "fs_write"])),
-            vec!["Glob", "Grep", "Read"]
+            vec!["Glob", "Grep", "Read", "Task", "WebFetch", "WebSearch"]
+        );
+        // The orchestrator's lock-down: read + list allowed, everything else
+        // (incl. web research + Claude's Task subagent) blocked, so delegation can
+        // only go through Taime's `assign`.
+        assert_eq!(
+            get_disallowed_tools("claude_code", &allowed(&["fs_read", "fs_list"])),
+            vec!["Bash", "Edit", "Task", "WebFetch", "WebSearch", "Write"]
         );
     }
 
@@ -188,12 +201,16 @@ mod tests {
 
     #[test]
     fn fs_star_is_a_literal_key_not_a_glob() {
-        // `fs_*` hits its own mapping entry (all fs tools) → only Bash blocked.
-        assert_eq!(get_disallowed_tools("claude_code", &allowed(&["fs_*"])), vec!["Bash"]);
+        // `fs_*` hits its own mapping entry (all fs tools) → fs tools allowed; the
+        // non-fs natives (Bash, web, subagent) are blocked.
+        assert_eq!(
+            get_disallowed_tools("claude_code", &allowed(&["fs_*"])),
+            vec!["Bash", "Task", "WebFetch", "WebSearch"]
+        );
         // An unknown name and an MCP ref contribute nothing → everything blocked.
         assert_eq!(
             get_disallowed_tools("claude_code", &allowed(&["fs_reed", "@cao-mcp-server"])),
-            vec!["Bash", "Edit", "Glob", "Grep", "Read", "Write"]
+            vec!["Bash", "Edit", "Glob", "Grep", "Read", "Task", "WebFetch", "WebSearch", "Write"]
         );
     }
 }

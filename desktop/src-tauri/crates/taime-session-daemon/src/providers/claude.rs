@@ -316,6 +316,9 @@ mod tests {
             "--disallowedTools", "Edit",
             "--disallowedTools", "Glob",
             "--disallowedTools", "Grep",
+            "--disallowedTools", "Task",
+            "--disallowedTools", "WebFetch",
+            "--disallowedTools", "WebSearch",
             "--disallowedTools", "Write",
         ]
         .iter()
@@ -327,15 +330,22 @@ mod tests {
     #[test]
     fn restricted_profile_without_mode_keeps_skip_permissions() {
         // CAO posture: skipping the prompts is unchanged — `--disallowedTools`
-        // IS the enforcement. `fs_*` hits its literal mapping entry → only Bash.
+        // IS the enforcement. `fs_*` hits its literal mapping entry (all fs tools
+        // allowed), so the non-fs natives (Bash + web + Task) are blocked.
         let mut prof = profile();
         prof.allowed_tools = vec!["fs_*".into()];
         let p = ClaudeProvider::new(ProviderDefaults { binary: "claude".into(), base_args: vec![], model_flag: "--model".into(), env: Default::default() });
         let a = p.build(&prof, &opts()).unwrap().spec.args;
-        let expected: Vec<String> = ["--dangerously-skip-permissions", "--disallowedTools", "Bash"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let expected: Vec<String> = [
+            "--dangerously-skip-permissions",
+            "--disallowedTools", "Bash",
+            "--disallowedTools", "Task",
+            "--disallowedTools", "WebFetch",
+            "--disallowedTools", "WebSearch",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         assert_eq!(a, expected);
     }
 

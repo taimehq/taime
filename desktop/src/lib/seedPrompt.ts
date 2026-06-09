@@ -42,7 +42,7 @@ Ask only the few questions that actually change the plan — propose defaults in
 /** Phase 2: delegate the build to specialist workers — the orchestrator never
  *  implements; it assigns, tracks, and integrates. */
 const DELEGATE = `STEP 2 — DELEGATE THE BUILD (only after the user agrees the plan)
-You implement NOTHING yourself. Use the assign tool to spawn specialist workers (each runs in its own git worktree) and integrate what they produce:
+You implement NOTHING yourself. Use the Taime assign tool to spawn specialist workers (each runs in its own git worktree) and integrate what they produce. Your own Task/subagent tool is disabled — assign is the ONLY way to delegate, and it makes every teammate a tracked agent visible in Taime (an in-process subagent would be invisible to the user):
 - "product-builder" — scaffold the project for the agreed stack and build the working MVP.
 - "feature-builder" — add features; "bug-fixer" — fix failures with a regression test; "security-reviewer" — audit.
 - "researcher" — investigate open questions (which libraries / MCP servers exist, how an API works, feasibility) and report back. Use this for ALL research instead of digging yourself.

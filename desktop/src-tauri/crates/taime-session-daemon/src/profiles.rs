@@ -141,8 +141,11 @@ You ORCHESTRATE — you do NOT do hands-on work yourself. Delegate ALL execution
 investigation to workers via `assign`: writing code, scaffolding, running commands, \
 reading files, and research (including web searches) are workers' jobs, never yours. \
 If you need information to plan, assign a worker to find it and report back (via \
-`share`) — don't go find out yourself. Your own actions are limited to talking with \
-the user and using the coordination tools above. Decompose the work, run independent \
+`share`) — don't go find out yourself. Delegate ONLY through `assign`: your own \
+Task/subagent tool is DISABLED, so `assign` is the only way to spawn help — and it \
+makes every teammate a tracked agent visible in Taime (an in-process subagent would \
+be invisible). Your own actions are limited to talking with the user and using the \
+coordination tools above. Decompose the work, run independent \
 pieces in parallel, use `list_agents` to track progress, and integrate the results — \
 you are the integrator: own the final result.";
 
@@ -203,6 +206,13 @@ fn builtins() -> Vec<Profile> {
                 description: "Team lead — plans and delegates to specialist workers.".to_string(),
                 system_prompt: Some(ORCHESTRATOR_PROMPT.to_string()),
                 orchestrator: true,
+                // HARD lock-down: read + list only. This blocks Bash / Edit /
+                // Write / WebSearch / WebFetch AND Claude's own `Task` subagent
+                // (see tool_mapping), so the orchestrator can't build, research,
+                // or spawn invisible in-process helpers — the ONLY way it can
+                // delegate is Taime's tracked `assign`. Its MCP orchestration
+                // tools and the question picker aren't in the map, so they stay.
+                allowed_tools: vec!["fs_read".to_string(), "fs_list".to_string()],
                 ..Default::default()
             },
             source: "builtin",
@@ -276,6 +286,12 @@ mod tests {
         // by chance and the user sees "nothing happened".
         let sp = orch.system_prompt.as_deref().unwrap_or("");
         assert!(sp.contains("assign") && sp.contains("orchestrator"), "orchestrator seed prompt");
+        // Hard lock-down: tool-restricted (non-empty allow-list, no wildcard) so it
+        // can only read + coordinate — never build/research/spawn-Task itself.
+        assert!(
+            !orch.allowed_tools.is_empty() && !orch.allowed_tools.iter().any(|t| t == "*"),
+            "orchestrator is tool-restricted"
+        );
         // The infos surface is a JSON array containing the base roles + starter
         // specialists, each (except plain default) carrying a real system prompt.
         let v: serde_json::Value = serde_json::from_str(&store.infos_json()).unwrap();
