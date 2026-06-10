@@ -100,11 +100,18 @@ export function DeleteWorkspaceDialog({
         : null,
       deleteDir && !dirErr ? "removed the folder" : null,
     ].filter(Boolean);
+    // `r.ok` ⇒ the daemon actually tore down (stopped agents, deleted tasks,
+    // etc.). If it didn't (daemon unavailable), say so plainly — only the local
+    // unlist (and any folder delete, which is filesystem-side) happened.
+    const torn = r.ok;
+    const tail = parts.length ? ` — ${parts.join(", ")}` : "";
     useStore.getState().showSnackbar({
       type: dirErr ? "error" : "success",
       message: dirErr
         ? `Removed “${name}”${parts.length ? ` (${parts.join(", ")})` : ""} — but the folder couldn't be deleted: ${dirErr}`
-        : `Deleted “${name}”${parts.length ? ` — ${parts.join(", ")}` : ""}`,
+        : torn
+          ? `Deleted “${name}”${tail}`
+          : `Removed “${name}” from Taime${tail} — daemon unavailable, so its agents and tasks weren't torn down`,
     });
   };
 
@@ -163,22 +170,36 @@ export function DeleteWorkspaceDialog({
           </div>
 
           <p className="mb-1 text-[11px] leading-relaxed text-zinc-500">
-            Stops every agent working in this workspace, reclaims their worktree
-            checkouts, and deletes its tasks, then removes it from Taime.
+            {connected ? (
+              <>
+                Stops every agent working in this workspace, reclaims their
+                worktree checkouts, and deletes its tasks, then removes it from
+                Taime.
+              </>
+            ) : (
+              <>
+                Removes it from Taime’s list. The daemon is unreachable, so its
+                agents and tasks can’t be torn down right now — only the local
+                unlisting happens.
+              </>
+            )}
             {isActive &&
               " Taime will switch to your next recent workspace (or none)."}
           </p>
-          <p className="mb-4 text-[11px] leading-relaxed text-zinc-500">
-            {hasArchives ? (
-              <>
-                Each reclaimed agent’s unmerged work is{" "}
-                <span className="text-zinc-300">kept</span> (recoverable) unless
-                you destroy it below.
-              </>
-            ) : (
-              "No unmerged archived work to lose."
-            )}
-          </p>
+          {connected && (
+            <p className="mb-4 text-[11px] leading-relaxed text-zinc-500">
+              {hasArchives ? (
+                <>
+                  Each reclaimed agent’s unmerged work is{" "}
+                  <span className="text-zinc-300">kept</span> — preserved as a git
+                  archive ref (<span className="font-mono">refs/taime/archive/*</span>),
+                  recoverable via git — unless you destroy it below.
+                </>
+              ) : (
+                "No unmerged archived work to lose."
+              )}
+            </p>
+          )}
 
           {/* Opt-in: destroy archived unmerged work — only when there is any */}
           {hasArchives && (
@@ -268,10 +289,7 @@ export function DeleteWorkspaceDialog({
           )}
 
           {!connected && (
-            <p className="mt-3 text-[11px] text-amber">
-              daemon unreachable · agents and archived work can’t be torn down —
-              retrying
-            </p>
+            <p className="mt-3 text-[11px] text-amber">daemon unreachable · retrying</p>
           )}
         </div>
 
