@@ -73,6 +73,8 @@ import {
   daemonPing,
   daemonCheckpoint,
   daemonSendMessage,
+  daemonCloseView,
+  daemonKill,
   type DaemonSessionSummary,
 } from "./pty";
 import { inTauri } from "./backend";
@@ -81,6 +83,9 @@ import { sendToTerminal } from "./lib/terminalInput";
 const provisionWorktree = vi.mocked(api.provisionWorktree);
 const listAgents = vi.mocked(api.listAgents);
 const markReviewedApi = vi.mocked(api.markReviewed);
+const clearDaemonDirty = vi.mocked(api.clearDaemonDirty);
+const closeView = vi.mocked(daemonCloseView);
+const killSession = vi.mocked(daemonKill);
 const spawnAgent = vi.mocked(daemonSpawnAgent);
 const ping = vi.mocked(daemonPing);
 const checkpoint = vi.mocked(daemonCheckpoint);
@@ -387,6 +392,94 @@ describe("reopenRustPty", () => {
     const s = useStore.getState();
     expect(s.frames).toHaveLength(2);
     expect(s.activeFrameKey).toBe("f-current");
+  });
+});
+
+// ── closeFrame / clearDirty (view lifecycle vs the daemon dirty signal) ─────
+
+describe("closeFrame", () => {
+  it("removes the frame, detaches (never kills), and PRESERVES the dirty signal", async () => {
+    useStore.setState({
+      frames: [makeFrame()],
+      activeFrameKey: "frame-test",
+      rustPtySessions: { "sess-1": makeMeta() },
+      dirty: { "term-1": { count: 2, paths: ["a.ts", "b.ts"] } },
+    });
+
+    await useStore.getState().closeFrame("frame-test");
+
+    const s = useStore.getState();
+    expect(s.frames).toHaveLength(0);
+    expect(closeView).toHaveBeenCalledWith("sess-1"); // detach — close ≠ kill
+    expect(killSession).not.toHaveBeenCalled();
+    // Closing a view is NOT a review: the daemon's accumulated dirty set (the
+    // unreviewed-work signal behind badges/guard/notifications) must survive,
+    // and so must the local mirror.
+    expect(clearDaemonDirty).not.toHaveBeenCalled();
+    expect(s.dirty["term-1"]).toEqual({ count: 2, paths: ["a.ts", "b.ts"] });
+  });
+
+  it("does not dismiss daemon frames (they have the detached-agent lifecycle)", async () => {
+    useStore.setState({ frames: [makeFrame()] });
+
+    await useStore.getState().closeFrame("frame-test");
+
+    expect(useStore.getState().dismissedTerminalIds.has("term-1")).toBe(false);
+  });
+
+  it("falls back the active frame to the last remaining frame", async () => {
+    useStore.setState({
+      frames: [
+        makeFrame({ key: "f-1", ptySessionId: "sess-1" }),
+        makeFrame({ key: "f-2", ptySessionId: "sess-2", terminalId: "term-2" }),
+      ],
+      activeFrameKey: "f-2",
+    });
+
+    await useStore.getState().closeFrame("f-2");
+
+    expect(useStore.getState().activeFrameKey).toBe("f-1");
+  });
+
+  it("keeps the active frame when closing an inactive one", async () => {
+    useStore.setState({
+      frames: [
+        makeFrame({ key: "f-1", ptySessionId: "sess-1" }),
+        makeFrame({ key: "f-2", ptySessionId: "sess-2", terminalId: "term-2" }),
+      ],
+      activeFrameKey: "f-2",
+    });
+
+    await useStore.getState().closeFrame("f-1");
+
+    expect(useStore.getState().activeFrameKey).toBe("f-2");
+  });
+});
+
+describe("clearDirty (the review action)", () => {
+  it("clears the local entry AND resets the daemon's accumulated set", () => {
+    useStore.setState({ dirty: { "term-1": { count: 1, paths: ["a.ts"] } } });
+
+    useStore.getState().clearDirty("term-1");
+
+    expect(clearDaemonDirty).toHaveBeenCalledWith("term-1");
+    expect(useStore.getState().dirty["term-1"]).toBeUndefined();
+  });
+
+  it("tells the daemon even without a local entry (the daemon owns the watch)", () => {
+    useStore.getState().clearDirty("term-x");
+    expect(clearDaemonDirty).toHaveBeenCalledWith("term-x");
+  });
+});
+
+describe("setDirty", () => {
+  it("stores the dirty state and no-ops on an identical payload", () => {
+    useStore.getState().setDirty("term-1", { count: 1, paths: ["a.ts"] });
+    const after = useStore.getState();
+    expect(after.dirty["term-1"]).toEqual({ count: 1, paths: ["a.ts"] });
+
+    useStore.getState().setDirty("term-1", { count: 1, paths: ["a.ts"] });
+    expect(useStore.getState()).toBe(after); // referential no-op
   });
 });
 

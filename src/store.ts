@@ -1110,8 +1110,10 @@ export const useStore = create<Store>((set, get) => ({
     if (isDaemonTransport(frame?.transport) && frame?.ptySessionId) {
       await daemonCloseView(frame.ptySessionId);
     }
-    // Best-effort clear dirty marker for the closed terminal.
-    if (frame?.terminalId) get().clearDirty(frame.terminalId);
+    // Deliberately NO clearDirty here: clearing also resets the DAEMON's
+    // accumulated dirty set — the durable "this agent has unreviewed work"
+    // signal (badges, the switch guard, review notifications). Only review
+    // actions (Mark reviewed) may reset it; closing a view is not a review.
   },
 
   dismissTerminal: (id) =>
