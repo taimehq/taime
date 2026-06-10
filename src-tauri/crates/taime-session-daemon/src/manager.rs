@@ -139,6 +139,25 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Provider id → human title for provenance (`Co-authored-by`). Mirrors the
+/// frontend `PROVIDER_TITLE`; unknown providers fall back to the raw id so the
+/// trailer is never empty (the daemon is the single writer of the commit).
+fn provider_title(provider: &str) -> String {
+    match provider {
+        "claude_code" => "Claude Code".to_string(),
+        "codex" => "Codex CLI".to_string(),
+        "gemini_cli" => "Gemini CLI".to_string(),
+        "grok_cli" => "Grok Build CLI".to_string(),
+        "" => "Agent".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The first 8 chars of an Agent ID — the short display form in commit subjects.
+fn short_id(agent_id: &str) -> String {
+    agent_id.chars().take(8).collect()
+}
+
 /// Read a `u64` tunable from the environment, falling back to `default`. Used for
 /// the worktree retention caps (grace / keep-recent / max-idle), so they're
 /// configurable without a config surface.
@@ -940,6 +959,125 @@ impl Manager {
         Ok(dst.worktree_path)
     }
 
+    /// Ensure a durable `refs/taime/archive/<id>` snapshot exists for `agent_id`
+    /// and return it, so the provenance commit references an immediately
+    /// dereferenceable ref (`Taime-Agent-Id` ↔ `refs/taime/archive/<id>` — the
+    /// unified identity). A reclaimed / already-archived agent returns its
+    /// existing ref; a LIVE isolated agent is snapshotted in place (no reclaim —
+    /// the checkout stays, only `archived_at`/the cached patch are written, a
+    /// truthful "its work is now durable"). Best-effort: `None` when there's
+    /// nothing to snapshot (clean / shared / no base) or the snapshot fails — the
+    /// caller then omits the ref line rather than emit one that doesn't resolve.
+    fn ensure_archive_snapshot(&self, agent_id: &str) -> Option<String> {
+        let store = self.store.as_ref()?;
+        let w = store.worktree_row(agent_id).ok().flatten()?;
+        // Already archived (reclaimed or previously snapshotted) — reuse if it
+        // still resolves in the repo.
+        if let (Some(ar), Some(repo)) = (w.archive_ref.as_deref(), w.repo_root.as_deref()) {
+            if crate::worktree::archive_ref_exists(repo, agent_id) {
+                return Some(ar.to_string());
+            }
+        }
+        // Snapshot a live isolated agent in place (never a shared/reclaimed row).
+        if w.mode.as_deref() != Some("isolated") || w.reclaimed_at.is_some() {
+            return None;
+        }
+        let repo = w.repo_root.as_deref()?;
+        let base = w.base_sha.as_deref().filter(|b| !b.is_empty())?;
+        if !std::path::Path::new(&w.worktree_path).exists() {
+            return None;
+        }
+        match crate::worktree::archive_agent(agent_id, &w.worktree_path, repo, base) {
+            crate::worktree::ArchiveOutcome::Archived(res) => {
+                let now = now_unix();
+                let _ = store.put_review_patch(
+                    &crate::store::ReviewPatch {
+                        agent_id: agent_id.to_string(),
+                        base_sha: res.base_sha.clone(),
+                        archive_ref: res.archive_ref.clone(),
+                        digest: res.digest.clone(),
+                        diff_blob: res.diff_blob.clone(),
+                        files_changed: res.files_changed as i64,
+                    },
+                    now,
+                );
+                let _ = store.mark_archived(agent_id, Some(&res.archive_ref), now);
+                Some(res.archive_ref)
+            }
+            _ => None,
+        }
+    }
+
+    /// Assemble the provenance commit message (subject + body + trailer block) for
+    /// a merge of `agent_id`'s selected hunks into `target_symbol`. The always-present
+    /// core is `Co-authored-by` plus `Taime-Agent-Id` (== `refs/taime/archive/<id>`);
+    /// `Taime-Reviewed` records whether the user opted into review (the
+    /// autonomy-primary model: review is opt-in, attribution is always-on).
+    #[allow(clippy::too_many_arguments)]
+    fn build_merge_message(
+        &self,
+        agent_id: &str,
+        target_symbol: &str,
+        base: Option<&str>,
+        reviewed: bool,
+        digest: Option<&str>,
+        selected: usize,
+        total: usize,
+        archive_ref: Option<&str>,
+    ) -> String {
+        let (provider, task_id) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.worktree_row(agent_id).ok().flatten())
+            .map(|w| (w.provider.unwrap_or_default(), w.task_id))
+            .unwrap_or_default();
+        let turns = self
+            .store
+            .as_ref()
+            .and_then(|s| s.agent_turns(agent_id, 10_000).ok())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let title = provider_title(&provider);
+        let short = short_id(agent_id);
+        let scope = if total > 0 && selected >= total { "full" } else { "partial" };
+        let mode = if reviewed { "reviewed" } else { "autonomous" };
+        let target_disp = if target_symbol == "main" {
+            "main".to_string()
+        } else {
+            format!("agent {}", short_id(target_symbol))
+        };
+        let mut m = String::new();
+        m.push_str(&format!("taime: merge {title} agent {short} → {target_disp}\n\n"));
+        m.push_str(&format!("{selected}/{total} hunk(s) merged from agent {short}. {mode}.\n\n"));
+        m.push_str(&format!("Co-authored-by: {title} <agent-{agent_id}@taime.local>\n"));
+        m.push_str(&format!("Taime-Agent-Id: {agent_id}\n"));
+        if let Some(ar) = archive_ref {
+            m.push_str(&format!("Taime-Archive-Ref: {ar}\n"));
+        }
+        if let Some(b) = base.filter(|b| !b.is_empty()) {
+            m.push_str(&format!("Taime-Base-Sha: {b}\n"));
+        }
+        if !provider.is_empty() {
+            m.push_str(&format!("Taime-Provider: {provider}\n"));
+        }
+        if let Some(t) = task_id.as_deref().filter(|t| !t.is_empty()) {
+            m.push_str(&format!("Taime-Task-Id: {t}\n"));
+        }
+        m.push_str(&format!("Taime-Reviewed: {reviewed}\n"));
+        // The content fingerprint of the merged change set — proof the merger held
+        // what they merged (the integrity floor), present whether or not the user
+        // opted into review. `Taime-Reviewed` above records the opt-in itself.
+        if let Some(d) = digest {
+            m.push_str(&format!("Taime-Patch-Digest: {d}\n"));
+        }
+        m.push_str(&format!("Taime-Merge-Scope: {scope}\n"));
+        m.push_str(&format!("Taime-Hunks: {selected}/{total}\n"));
+        if turns > 0 {
+            m.push_str(&format!("Taime-Turns: {turns}\n"));
+        }
+        m
+    }
+
     /// Generic query RPC (Phase 6 route-layer migration): returns a JSON string in
     /// the frontend's shape for `kind`. Shells out to git (diffs) — call from a
     /// blocking context.
@@ -1065,6 +1203,90 @@ impl Manager {
                         }
                         ReviewSource::Empty => {
                             err_json("nothing to apply: this agent made no changes".to_string())
+                        }
+                    },
+                }
+            }
+            // Merge an agent's selected hunks into a target AND record them as one
+            // provenance commit (gap #1: the merge no longer dead-ends at `git
+            // apply`). Gate (approved policy): `expected_digest` is REQUIRED — the
+            // integrity floor, proof the merger held the fingerprint of what they
+            // merge; a standing review ack is OPTIONAL (autonomy is primary) and
+            // its presence is RECORDED in the trailer as reviewed|autonomous.
+            // Always forward (main / sibling), never "self".
+            "commit_merge" => {
+                let src = self.review_source(tk);
+                let symbol = a.get("target_dir").and_then(|v| v.as_str()).unwrap_or("main");
+                let sel = a.get("selections").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let digest = a.get("expected_digest").and_then(|v| v.as_str());
+                let err_json = |e: String| {
+                    serde_json::json!({
+                        "committed": false, "applied": false, "target_dir": symbol,
+                        "files": [], "conflicts": [], "error": e
+                    })
+                    .to_string()
+                };
+                let reviewed = self.has_review_ack(tk);
+                let gate: Result<(), String> = if sel.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                    Err("nothing selected — fetch hunked_diff and select hunks".to_string())
+                } else if symbol == "self" {
+                    Err("commit_merge applies an agent's work forward (main or a sibling), not to itself".to_string())
+                } else if digest.is_none() {
+                    Err("merge refused: missing expected_digest (the hunked_diff fingerprint of the reviewed changes)".to_string())
+                } else {
+                    Ok(())
+                };
+                match gate {
+                    Err(e) => err_json(e),
+                    Ok(()) => match src {
+                        ReviewSource::Empty => {
+                            err_json("nothing to merge: this agent made no changes".to_string())
+                        }
+                        ReviewSource::Live { cwd, base } => {
+                            match self.resolve_apply_target(tk, &cwd, symbol) {
+                                Err(e) => err_json(e),
+                                Ok(target) => {
+                                    let (s, t) =
+                                        crate::diff::selection_counts_live(&cwd, base.as_deref(), &sel);
+                                    let ar = self.ensure_archive_snapshot(tk);
+                                    let msg = self.build_merge_message(
+                                        tk, symbol, base.as_deref(), reviewed, digest, s, t, ar.as_deref(),
+                                    );
+                                    crate::diff::commit_selection(
+                                        &cwd, base.as_deref(), &target, &sel, digest, &msg,
+                                    )
+                                    .to_string()
+                                }
+                            }
+                        }
+                        ReviewSource::Archive { repo_root, patch } => {
+                            match self.resolve_apply_target(tk, "", symbol) {
+                                Err(e) => err_json(e),
+                                Ok(target) => {
+                                    let (s, t) =
+                                        crate::diff::selection_counts_archived(&patch.diff_blob, &sel);
+                                    let msg = self.build_merge_message(
+                                        tk,
+                                        symbol,
+                                        Some(&patch.base_sha),
+                                        reviewed,
+                                        digest,
+                                        s,
+                                        t,
+                                        Some(&patch.archive_ref),
+                                    );
+                                    crate::diff::commit_selection_archived(
+                                        &repo_root,
+                                        &patch.archive_ref,
+                                        &patch.diff_blob,
+                                        &target,
+                                        &sel,
+                                        digest,
+                                        &msg,
+                                    )
+                                    .to_string()
+                                }
+                            }
                         }
                     },
                 }
@@ -4220,6 +4442,136 @@ mod tests {
         .unwrap();
         assert_eq!(rev["applied"], false, "revert of a reclaimed agent is refused");
 
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    // ---- commit_merge: the provenance-commit path (gap #1). The merge no longer
+    // ---- dead-ends at `git apply` — it records ONE commit with the trailer.
+
+    fn commit_merge_args(
+        agent: &str,
+        target: &str,
+        selections: serde_json::Value,
+        digest: Option<&str>,
+    ) -> String {
+        let mut o = serde_json::json!({
+            "agent_id": agent, "target_dir": target, "selections": selections
+        });
+        if let Some(d) = digest {
+            o["expected_digest"] = serde_json::json!(d);
+        }
+        o.to_string()
+    }
+
+    #[test]
+    fn commit_merge_records_an_autonomous_provenance_commit() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let head_before = git_in(&proj, &["rev-parse", "HEAD"]);
+        let digest = fetch_digest(&mgr, "agent-a");
+
+        // NO ack — autonomy is primary; the merge proceeds and records reviewed:false.
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "commit_merge",
+            &commit_merge_args("agent-a", "main", serde_json::json!({ "a.txt": [0] }), Some(&digest)),
+        ))
+        .unwrap();
+        assert_eq!(v["committed"], true, "autonomous merge should commit: {v}");
+        assert!(v["commit"].as_str().is_some_and(|s| !s.is_empty()), "{v}");
+        assert!(std::fs::read_to_string(proj.join("a.txt")).unwrap().contains("TWO"));
+
+        let head_after = git_in(&proj, &["rev-parse", "HEAD"]);
+        assert_ne!(head_before, head_after, "a provenance commit was recorded");
+        let body = git_in(&proj, &["log", "-1", "--format=%B"]);
+        assert!(body.contains("Co-authored-by: Claude Code <agent-agent-a@taime.local>"), "{body}");
+        assert!(body.contains("Taime-Agent-Id: agent-a"), "{body}");
+        assert!(body.contains("Taime-Reviewed: false"), "autonomous merge recorded: {body}");
+        assert!(body.contains("Taime-Patch-Digest:"), "{body}");
+        // The live agent was snapshotted so the trailer ref resolves.
+        assert!(
+            crate::worktree::archive_ref_exists(&proj.to_string_lossy(), "agent-a"),
+            "merge ensured the archive snapshot exists"
+        );
+        assert!(body.contains("Taime-Archive-Ref: refs/taime/archive/agent-a"), "{body}");
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn commit_merge_records_reviewed_true_when_acked() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let digest = fetch_digest(&mgr, "agent-a");
+        ack_review(&mgr, "agent-a"); // the user opted into review
+
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "commit_merge",
+            &commit_merge_args("agent-a", "main", serde_json::json!({ "a.txt": [0] }), Some(&digest)),
+        ))
+        .unwrap();
+        assert_eq!(v["committed"], true, "{v}");
+        let body = git_in(&proj, &["log", "-1", "--format=%B"]);
+        assert!(body.contains("Taime-Reviewed: true"), "reviewed merge recorded: {body}");
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn commit_merge_requires_a_digest_and_refuses_self() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let head_before = git_in(&proj, &["rev-parse", "HEAD"]);
+
+        // No digest → refused (the integrity floor is never relaxed).
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "commit_merge",
+            &commit_merge_args("agent-a", "main", serde_json::json!({ "a.txt": [0] }), None),
+        ))
+        .unwrap();
+        assert_eq!(v["committed"], false, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("expected_digest"), "{v}");
+
+        // Self target → refused (a merge is always forward).
+        let digest = fetch_digest(&mgr, "agent-a");
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "commit_merge",
+            &commit_merge_args("agent-a", "self", serde_json::json!({ "a.txt": [0] }), Some(&digest)),
+        ))
+        .unwrap();
+        assert_eq!(v["committed"], false, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("not to itself"), "{v}");
+
+        assert_eq!(head_before, git_in(&proj, &["rev-parse", "HEAD"]), "no commit on refusal");
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn commit_merge_from_a_reclaimed_archive() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        assert!(mgr.reclaim_agent("agent-a"), "reclaim should succeed");
+        assert!(!wt.exists(), "checkout reclaimed");
+
+        let digest = fetch_digest(&mgr, "agent-a"); // served from the archive now
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "commit_merge",
+            &commit_merge_args("agent-a", "main", serde_json::json!({ "a.txt": [0] }), Some(&digest)),
+        ))
+        .unwrap();
+        assert_eq!(v["committed"], true, "merge-from-archive should commit: {v}");
+        assert!(std::fs::read_to_string(proj.join("a.txt")).unwrap().contains("TWO"));
+        let body = git_in(&proj, &["log", "-1", "--format=%B"]);
+        assert!(body.contains("Taime-Archive-Ref: refs/taime/archive/agent-a"), "{body}");
+        assert!(body.contains("Taime-Base-Sha:"), "{body}");
         let _ = std::fs::remove_dir_all(&proj);
     }
 

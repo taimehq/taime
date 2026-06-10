@@ -745,6 +745,197 @@ pub fn apply_selection_archived(
     assemble_and_apply(&parsed, &read_src, target_dir, mode, selections)
 }
 
+// ---- Commit-with-provenance (Phase 2, gap #1): the merge no longer dead-ends at
+// ---- `git apply`. After a clean apply of the selected hunks, stage exactly those
+// ---- files and record them as ONE commit carrying the provenance trailer the
+// ---- caller assembled (Co-authored-by + Taime-Agent-Id == refs/taime/archive/*).
+// ---- Built ON the hardened apply core, so the digest/staleness binding, untracked
+// ---- handling, and conflict detection all carry over unchanged. Merge-only —
+// ---- revert never commits (it discards the agent's own work back to base). ----
+
+/// Whether `target_dir` can produce a commit identity. `git commit` hard-fails
+/// without `user.name`/`user.email` (config or env); pre-checking lets the merge
+/// refuse BEFORE it applies anything, so a missing identity never leaves a
+/// half-applied, uncommitted tree.
+fn has_commit_identity(target_dir: &str) -> bool {
+    git_ok(Path::new(target_dir), &["var", "GIT_COMMITTER_IDENT"]).is_some()
+}
+
+/// The first selected path that already has uncommitted changes (staged or
+/// unstaged) at the target — the merge would otherwise fold the target's own
+/// edits into the provenance commit (the partial-commit pathspec captures the
+/// working-tree content of these paths). A `Some` is a refusal: the commit must
+/// record ONLY the agent's applied hunks. One `git status` probe per selected
+/// path keeps the match exact (no porcelain rename/quote parsing).
+fn target_dirty_selected_path(target_dir: &str, selections: &Value) -> Option<String> {
+    let obj = selections.as_object()?;
+    let top = repo_toplevel(Path::new(target_dir));
+    for key in obj.keys() {
+        let dirty = git_ok(&top, &["status", "--porcelain", "--", key])
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if dirty {
+            return Some(key.clone());
+        }
+    }
+    None
+}
+
+/// Refusals that must short-circuit BEFORE any apply touches the target tree:
+/// a selected path that's already dirty, or a target with no commit identity.
+/// `None` ⇒ clear to apply + commit.
+fn commit_preflight(target_dir: &str, selections: &Value) -> Option<Value> {
+    if let Some(path) = target_dirty_selected_path(target_dir, selections) {
+        return Some(json!({
+            "applied": false, "committed": false, "target_dir": target_dir,
+            "files": [], "conflicts": [],
+            "error": format!("target already has uncommitted changes to '{path}' — commit or stash it before merging")
+        }));
+    }
+    if !has_commit_identity(target_dir) {
+        return Some(json!({
+            "applied": false, "committed": false, "target_dir": target_dir,
+            "files": [], "conflicts": [],
+            "error": "target repo has no git identity — set user.name and user.email to commit the merge"
+        }));
+    }
+    None
+}
+
+/// Stage + commit exactly the files an apply landed in `target_dir`, with
+/// `message` (subject + body + trailer block, assembled by the caller). Called
+/// ONLY after a successful, conflict-free apply: a non-applied / stale /
+/// conflicted `res` passes straight through with `committed:false` — a tree that
+/// didn't cleanly receive the hunks is never committed. The commit is a partial
+/// commit over just the applied pathspec, so unrelated changes in the target
+/// (e.g. the user's real `main` tree) are left untouched. Returns the apply
+/// result augmented with `{committed, commit}` (commit = short sha).
+fn finish_commit(mut res: Value, target_dir: &str, message: &str) -> Value {
+    let applied = res["applied"].as_bool().unwrap_or(false);
+    let conflict_free = res["conflicts"].as_array().map(|a| a.is_empty()).unwrap_or(true);
+    let files: Vec<String> = res["files"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if !applied || !conflict_free || files.is_empty() {
+        res["committed"] = json!(false);
+        return res;
+    }
+    let top = repo_toplevel(Path::new(target_dir));
+    // Stage exactly the applied files (the partial commit below re-reads the
+    // worktree for these paths regardless, but staging surfaces an error early
+    // and makes the intent explicit).
+    let mut add_args: Vec<&str> = vec!["add", "--"];
+    add_args.extend(files.iter().map(String::as_str));
+    if git_ok(&top, &add_args).is_none() {
+        res["committed"] = json!(false);
+        res["error"] = json!("staging the merged files failed");
+        return res;
+    }
+    // Commit ONLY those paths — a partial commit, so other staged/unstaged
+    // changes in the target are not swept in.
+    let mut commit_args: Vec<&str> = vec!["commit", "-m", message, "--"];
+    commit_args.extend(files.iter().map(String::as_str));
+    match git_raw(&top, &commit_args) {
+        Ok(o) if o.status.success() => {
+            let sha = git_ok(&top, &["rev-parse", "--short", "HEAD"])
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            res["committed"] = json!(true);
+            res["commit"] = json!(sha);
+            res
+        }
+        Ok(o) => {
+            res["committed"] = json!(false);
+            res["error"] = json!(String::from_utf8_lossy(&o.stderr).trim().to_string());
+            res
+        }
+        Err(e) => {
+            res["committed"] = json!(false);
+            res["error"] = json!(e.to_string());
+            res
+        }
+    }
+}
+
+/// Merge selected hunks of a LIVE agent's worktree into `target_dir` AND record
+/// them as one provenance commit (the `apply_selection` twin that doesn't stop at
+/// `git apply`). Same digest binding, untracked handling, and `--3way` conflict
+/// path; the caller supplies the trailer-bearing `message`.
+pub fn commit_selection(
+    cwd: &str,
+    base: Option<&str>,
+    target_dir: &str,
+    selections: &Value,
+    expected_digest: Option<&str>,
+    message: &str,
+) -> Value {
+    if let Some(refusal) = commit_preflight(target_dir, selections) {
+        return refusal;
+    }
+    let res = apply_selection(cwd, base, target_dir, "merge", selections, expected_digest);
+    finish_commit(res, target_dir, message)
+}
+
+/// Merge selected hunks of a RECLAIMED agent's archived patch into `target_dir`
+/// AND record them as one provenance commit (the `apply_selection_archived`
+/// twin). Content comes from the archive ref; everything else matches
+/// [`commit_selection`].
+#[allow(clippy::too_many_arguments)]
+pub fn commit_selection_archived(
+    repo_root: &str,
+    archive_ref: &str,
+    cached_patch: &str,
+    target_dir: &str,
+    selections: &Value,
+    expected_digest: Option<&str>,
+    message: &str,
+) -> Value {
+    if let Some(refusal) = commit_preflight(target_dir, selections) {
+        return refusal;
+    }
+    let res = apply_selection_archived(
+        repo_root, archive_ref, cached_patch, target_dir, "merge", selections, expected_digest,
+    );
+    finish_commit(res, target_dir, message)
+}
+
+/// `(selected, total)` hunk counts for a selection — the provenance trailer's
+/// `Taime-Hunks`/`Taime-Merge-Scope`. Each changed file is ≥1 unit (an empty
+/// new file has no hunks but is one unit of work); a present selection key with a
+/// null/empty array means "the whole file". `selected == total` ⇒ a full merge.
+fn count_selected(raw: &str, selections: &Value) -> (usize, usize) {
+    let parsed = parse_unified(raw);
+    let sel_obj = selections.as_object();
+    let mut total = 0usize;
+    let mut selected = 0usize;
+    for file in &parsed {
+        let path = file["path"].as_str().unwrap_or("");
+        let units = file["hunks"].as_array().map(|a| a.len()).unwrap_or(0).max(1);
+        total += units;
+        match sel_obj.and_then(|o| o.get(path)) {
+            None => {}
+            Some(v) => match v.as_array() {
+                Some(ids) if !ids.is_empty() => selected += ids.len().min(units),
+                _ => selected += units, // null / empty array ⇒ whole file
+            },
+        }
+    }
+    (selected, total)
+}
+
+/// `(selected, total)` hunk counts for a LIVE agent's worktree selection.
+pub fn selection_counts_live(cwd: &str, base: Option<&str>, selections: &Value) -> (usize, usize) {
+    let p = Path::new(cwd);
+    let base = resolve_base(p, base);
+    count_selected(&review_patch(p, &base), selections)
+}
+
+/// `(selected, total)` hunk counts for a RECLAIMED agent's archived patch.
+pub fn selection_counts_archived(cached_patch: &str, selections: &Value) -> (usize, usize) {
+    count_selected(cached_patch, selections)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,6 +1311,171 @@ mod tests {
         );
         assert_eq!(v["applied"], false, "nothing to apply for a non-UTF8-only selection");
         assert!(!target.join("latin1.txt").exists(), "no corrupted bytes written");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    /// A target clone at the same base as [`repo`] (a separate checkout with
+    /// `a.txt` at its committed content + a git identity, ready to commit into).
+    fn target_clone() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("taime-target-{:08x}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "t@t"]);
+        git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        dir
+    }
+
+    #[test]
+    fn commit_selection_records_one_provenance_commit() {
+        let src = repo();
+        std::fs::write(src.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let target = target_clone();
+        let before = git_ok(Path::new(&target), &["rev-parse", "HEAD"]).unwrap();
+
+        let msg = "taime: merge Claude Code agent abcd1234 → main\n\n1 file(s).\n\nCo-authored-by: Claude Code <agent-abcd1234@taime.local>\nTaime-Agent-Id: abcd1234";
+        let v = commit_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            target.to_str().unwrap(),
+            &json!({ "a.txt": [0] }),
+            None,
+            msg,
+        );
+        assert_eq!(v["applied"], true, "error: {:?}", v["error"]);
+        assert_eq!(v["committed"], true, "error: {:?}", v["error"]);
+        assert!(v["commit"].as_str().is_some_and(|s| !s.is_empty()), "commit sha: {v}");
+
+        // HEAD advanced by exactly one commit carrying the trailer.
+        let after = git_ok(Path::new(&target), &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(before, after, "a new commit was recorded");
+        let body = git_ok(Path::new(&target), &["log", "-1", "--format=%B"]).unwrap();
+        assert!(body.contains("Taime-Agent-Id: abcd1234"), "trailer present: {body}");
+        assert!(body.contains("Co-authored-by: Claude Code"), "co-author present: {body}");
+        // Exactly one file changed by the commit.
+        let changed = git_ok(Path::new(&target), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        assert_eq!(changed.lines().filter(|l| !l.is_empty()).count(), 1, "only a.txt: {changed}");
+        assert!(changed.contains("a.txt"));
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn commit_selection_refuses_a_dirty_target_path() {
+        let src = repo();
+        std::fs::write(src.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let target = target_clone();
+        // The target already has an uncommitted edit to the same file — merging
+        // would otherwise fold it into the provenance commit.
+        std::fs::write(target.join("a.txt"), "one\ntwo\nthree\nlocal\n").unwrap();
+        let before = git_ok(Path::new(&target), &["rev-parse", "HEAD"]).unwrap();
+
+        let v = commit_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            target.to_str().unwrap(),
+            &json!({ "a.txt": [0] }),
+            None,
+            "msg",
+        );
+        assert_eq!(v["applied"], false, "refused before applying: {v}");
+        assert_eq!(v["committed"], false);
+        assert!(v["error"].as_str().unwrap().contains("a.txt"), "names the dirty file: {v}");
+        // No commit, and the target's local edit is untouched.
+        assert_eq!(before, git_ok(Path::new(&target), &["rev-parse", "HEAD"]).unwrap());
+        assert!(std::fs::read_to_string(target.join("a.txt")).unwrap().contains("local"));
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn commit_selection_does_not_commit_on_conflict() {
+        let src = repo();
+        std::fs::write(src.join("b.txt"), "agent-created\n").unwrap();
+        let target = target_clone();
+        // A committed b.txt with DIFFERENT content ⇒ new-file collision (a
+        // pre-conflict refusal); HEAD must not move.
+        std::fs::write(target.join("b.txt"), "different\n").unwrap();
+        git(&target, &["add", "-A"]);
+        git(&target, &["commit", "-qm", "add b"]);
+        let before = git_ok(Path::new(&target), &["rev-parse", "HEAD"]).unwrap();
+
+        let v = commit_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            target.to_str().unwrap(),
+            &json!({ "b.txt": [0] }),
+            None,
+            "msg",
+        );
+        assert_eq!(v["committed"], false, "conflict never commits: {v}");
+        assert_eq!(v["conflicts"][0], "b.txt", "names the conflicting file: {v}");
+        assert_eq!(before, git_ok(Path::new(&target), &["rev-parse", "HEAD"]).unwrap(), "HEAD unmoved");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn commit_selection_archived_commits_from_the_ref() {
+        // Build a real archive snapshot, then commit it forward from the archive
+        // (the reclaimed-agent path: no live checkout).
+        let repo = repo();
+        let base = git_ok(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        std::fs::write(repo.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let outcome = crate::worktree::archive_agent(
+            "agent-x",
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            &base,
+        );
+        let res = match outcome {
+            crate::worktree::ArchiveOutcome::Archived(r) => r,
+            other => panic!("expected Archived, got {other:?}"),
+        };
+        // Simulate reclaim: the worktree returns to base (work lives only in the ref).
+        git(&repo, &["checkout", "-q", "--", "a.txt"]);
+
+        let target = target_clone();
+        let msg = "taime: merge agent agent-x\n\nTaime-Agent-Id: agent-x\nTaime-Archive-Ref: refs/taime/archive/agent-x";
+        let v = commit_selection_archived(
+            repo.to_str().unwrap(),
+            &res.archive_ref,
+            &res.diff_blob,
+            target.to_str().unwrap(),
+            &json!({ "a.txt": [0] }),
+            Some(&res.digest),
+            msg,
+        );
+        assert_eq!(v["applied"], true, "error: {:?}", v["error"]);
+        assert_eq!(v["committed"], true, "error: {:?}", v["error"]);
+        let body = git_ok(Path::new(&target), &["log", "-1", "--format=%B"]).unwrap();
+        assert!(body.contains("Taime-Archive-Ref: refs/taime/archive/agent-x"), "trailer: {body}");
+        assert!(std::fs::read_to_string(target.join("a.txt")).unwrap().contains("TWO"));
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn commit_selection_stale_digest_does_not_commit() {
+        let src = repo();
+        std::fs::write(src.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let target = target_clone();
+        let before = git_ok(Path::new(&target), &["rev-parse", "HEAD"]).unwrap();
+        // A digest that can't match the patch assembled now ⇒ stale refusal.
+        let v = commit_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            target.to_str().unwrap(),
+            &json!({ "a.txt": [0] }),
+            Some("deadbeefdeadbeef"),
+            "msg",
+        );
+        assert_eq!(v["stale"], true, "stale refusal: {v}");
+        assert_eq!(v["committed"], false);
+        assert_eq!(before, git_ok(Path::new(&target), &["rev-parse", "HEAD"]).unwrap());
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&target);
     }
