@@ -119,6 +119,9 @@ export function useTaskDetail(taskId: string): {
 export interface AgentDiffBundle {
   files: FileDiffEntry[];
   hunks: HunkedFileEntry[];
+  /** Fingerprint of the hunked diff as served — Merge echoes it back so the
+   *  daemon refuses if the worktree moved after this bundle was fetched. */
+  digest: string | null;
   worktree: WorktreeInfo | null;
   attribution: AttributionResponse;
 }
@@ -126,9 +129,11 @@ export interface AgentDiffBundle {
 export async function loadAgentDiffBundle(agentId: string): Promise<AgentDiffBundle> {
   const [fd, hk, wt, attr] = await Promise.all([
     api.getFileDiffs(agentId).catch(() => ({ agent_id: agentId, files: [] })),
-    api.getHunks(agentId).catch(() => ({ agent_id: agentId, base: null, files: [] })),
+    api
+      .getHunks(agentId)
+      .catch(() => ({ agent_id: agentId, base: null, digest: null, files: [] })),
     api.getWorktree(agentId).catch(() => null),
     api.getAttribution(agentId).catch(() => ({ team: [], files: {} })),
   ]);
-  return { files: fd.files, hunks: hk.files, worktree: wt, attribution: attr };
+  return { files: fd.files, hunks: hk.files, digest: hk.digest, worktree: wt, attribution: attr };
 }

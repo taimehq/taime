@@ -246,6 +246,10 @@ export interface HunkedFileEntry {
 export interface HunkedDiffResponse {
   agent_id: string;
   base: string | null;
+  /** Fingerprint of the served patch — echo it back to applySelection as the
+   *  reviewed-content binding; the daemon refuses a merge when the worktree
+   *  has moved since this response was fetched. */
+  digest: string | null;
   files: HunkedFileEntry[];
 }
 
@@ -254,6 +258,9 @@ export interface ApplyResult {
   target_dir: string | null;
   files: string[];
   conflicts: string[];
+  /** True when the refusal is a digest mismatch — the worktree changed since
+   *  the diff was reviewed; reload and re-review. */
+  stale?: boolean;
   error: string | null;
 }
 
@@ -439,9 +446,12 @@ export const api = {
 
   // ── Durable review acks (the flagship safe-context-switch guard) ──────────
   /** Persist that the user acknowledged an agent's current changes — so the ack
-   *  survives a UI/daemon restart (it was frontend-local before). */
+   *  survives a UI/daemon restart (it was frontend-local before). Resolves
+   *  `false` when the ack was NOT durably recorded (daemon down or persistence
+   *  off) — the daemon's merge gate reads the durable row, so callers about to
+   *  merge must treat `false` as a hard stop, not a cosmetic miss. */
   markReviewed: (agentId: string) =>
-    daemonQuery<boolean>("mark_reviewed", { agent_id: agentId }, true),
+    daemonQuery<boolean>("mark_reviewed", { agent_id: agentId }, false),
   /** Drop an agent's standing ack: its dirty set grew past what was
    *  acknowledged, so new changes must re-raise the guard. */
   clearReviewed: (agentId: string) =>
@@ -567,6 +577,7 @@ export const api = {
     daemonQuery<HunkedDiffResponse>("hunked_diff", { agent_id: id }, {
       agent_id: id,
       base: null,
+      digest: null,
       files: [],
     }),
 
@@ -579,11 +590,20 @@ export const api = {
       target: string;
       mode: "merge" | "revert";
       selections: Record<string, number[] | null>;
+      /** The digest of the hunked_diff the user reviewed — required for merge
+       *  (the daemon refuses unbound merges and stale views). */
+      expectedDigest?: string;
     },
   ) =>
     daemonQuery<ApplyResult>(
       "apply_selection",
-      { agent_id: id, target_dir: body.target, mode: body.mode, selections: body.selections },
+      {
+        agent_id: id,
+        target_dir: body.target,
+        mode: body.mode,
+        selections: body.selections,
+        expected_digest: body.expectedDigest,
+      },
       { applied: false, target_dir: body.target, files: [], conflicts: [], error: "daemon unavailable" },
     ),
 

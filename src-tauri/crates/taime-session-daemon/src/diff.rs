@@ -90,27 +90,87 @@ fn is_transient(rel_path: &str) -> bool {
     crate::fswatch::is_transient_file(name)
 }
 
-/// Untracked (non-transient) files as synthetic new-file patches — the
-/// `git diff --no-index /dev/null` form, `(path, patch)` per file. Agents
-/// almost never commit, so their new files exist only as untracked paths,
-/// which `git diff <base>` omits. Every patch-shaped review surface
-/// (terminal_diff, hunked_diff, apply_selection) appends these, so
-/// agent-created files are visible, hunked, mergeable, AND revertable —
-/// not just listed.
-fn untracked_patches(path: &Path) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for f in git_ok(path, &["ls-files", "--others", "--exclude-standard"])
+/// FNV-1a over the assembled review patch — the content fingerprint that binds
+/// "the diff the user reviewed" to "the diff being applied" (review L2/L3: the
+/// gate must refuse when the worktree moved under a stale view). Not a security
+/// boundary (same-uid clients are trusted by design); it only detects drift.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+pub fn patch_digest(raw: &str) -> String {
+    format!("{:016x}", fnv1a64(raw.as_bytes()))
+}
+
+/// The repo toplevel of `dir` (the dir itself when not a repo) — `git apply`
+/// and `git diff` paths are toplevel-relative, so every path we emit or probe
+/// must anchor there, not at the cwd (which in shared mode can be a subdir).
+fn repo_toplevel(dir: &Path) -> std::path::PathBuf {
+    git_ok(dir, &["rev-parse", "--show-toplevel"])
+        .map(|s| std::path::PathBuf::from(s.trim()))
+        .unwrap_or_else(|| dir.to_path_buf())
+}
+
+/// Untracked (non-transient) files as `(toplevel_relative, cwd_relative)`
+/// pairs. `ls-files` emits cwd-relative names, but every other diff surface
+/// (tracked `git diff`, `git apply`) speaks toplevel-relative — emitting the
+/// bare names from a subdir cwd makes `git apply` silently skip them (exit 0,
+/// "Skipped patch", review L4).
+fn untracked_files(path: &Path) -> Vec<(String, String)> {
+    let prefix = git_ok(path, &["rev-parse", "--show-prefix"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    git_ok(path, &["ls-files", "--others", "--exclude-standard"])
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.is_empty() && !is_transient(l))
-    {
-        // `--no-index` exits 1 when the sides differ — read stdout regardless.
-        let patch = git_raw(path, &["diff", "--no-index", "--", "/dev/null", f])
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        out.push((f.to_string(), patch));
+        .map(|f| (format!("{prefix}{f}"), f.to_string()))
+        .collect()
+}
+
+/// Untracked files as synthetic new-file patches — the
+/// `git diff --no-index /dev/null` form, `(toplevel_relative, patch)` per
+/// file; `patch` is `None` for non-UTF8 content (embedding it through the
+/// String pipeline would corrupt the bytes with U+FFFD on merge — review L5 —
+/// so such files stay listed-but-unhunked, exactly the pre-untracked-support
+/// behavior). Binary files get git's "Binary files differ" stub (no hunks),
+/// which parses to an unselectable entry. Agents almost never commit, so
+/// their new files exist only as untracked paths, which `git diff <base>`
+/// omits; every patch-shaped surface appends these so agent-created files
+/// are visible, hunked, mergeable, AND revertable — not just listed.
+fn untracked_patches(path: &Path) -> Vec<(String, Option<String>)> {
+    let top = repo_toplevel(path);
+    untracked_files(path)
+        .into_iter()
+        .map(|(rel, _)| {
+            // Run from the toplevel with the toplevel-relative path so the
+            // patch headers carry it. `--no-index` exits 1 when the sides
+            // differ — read stdout regardless.
+            let patch = git_raw(&top, &["diff", "--no-index", "--", "/dev/null", &rel])
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok());
+            (rel, patch)
+        })
+        .collect()
+}
+
+/// The full review patch: tracked changes vs `base` + synthetic new-file
+/// patches for untracked files. This single assembly feeds hunked_diff (what
+/// the UI selects from) AND apply_selection (what the merge reassembles), so
+/// the two surfaces can never drift apart.
+fn review_patch(path: &Path, base: &str) -> String {
+    let mut raw = git_ok(path, &["diff", base]).unwrap_or_default();
+    for (_, patch) in untracked_patches(path) {
+        if let Some(p) = patch {
+            raw.push_str(&p);
+        }
     }
-    out
+    raw
 }
 
 pub fn terminal_diff(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
@@ -130,7 +190,9 @@ pub fn terminal_diff(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
         .map(String::from)
         .collect();
     for (f, patch) in untracked_patches(path) {
-        diff.push_str(&patch);
+        if let Some(p) = patch {
+            diff.push_str(&p);
+        }
         files.push(f);
     }
     json!({
@@ -201,16 +263,15 @@ pub fn file_diffs(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
             "additions": add, "deletions": del, "binary": binary || bin2
         }));
     }
-    // Untracked → added (skipping transient temps).
-    for f in git_ok(path, &["ls-files", "--others", "--exclude-standard"])
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.is_empty() && !is_transient(l))
-    {
-        let (modified, binary) = read_worktree_file(path, f);
+    // Untracked → added (skipping transient temps). Keyed by the
+    // toplevel-relative path so the entry matches its hunked_diff hunks (the
+    // UI joins the two surfaces on `path`); content is read via the
+    // cwd-relative name.
+    for (rel, cwd_rel) in untracked_files(path) {
+        let (modified, binary) = read_worktree_file(path, &cwd_rel);
         let adds = modified.lines().count() as i64;
         files.push(json!({
-            "path": f, "status": "added", "old_path": null,
+            "path": rel, "status": "added", "old_path": null,
             "original": "", "modified": modified, "additions": adds, "deletions": 0, "binary": binary
         }));
     }
@@ -218,17 +279,22 @@ pub fn file_diffs(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
 }
 
 /// Per-file, per-hunk diff for selective merge/revert (CAO `get_hunked_diff`).
+/// `digest` fingerprints the served patch; the client echoes it back to
+/// apply_selection as `expected_digest`, which refuses when the worktree has
+/// moved since this view was fetched (stale hunk indices would otherwise
+/// select content the reviewer never saw).
 pub fn hunked_diff(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
     let path = Path::new(cwd);
     if !is_git(path) {
-        return json!({ "agent_id": agent_id, "base": null, "files": [] });
+        return json!({ "agent_id": agent_id, "base": null, "digest": null, "files": [] });
     }
     let base = resolve_base(path, base);
-    let mut raw = git_ok(path, &["diff", &base]).unwrap_or_default();
-    for (_, patch) in untracked_patches(path) {
-        raw.push_str(&patch);
-    }
-    json!({ "agent_id": agent_id, "base": base, "files": parse_unified(&raw) })
+    let raw = review_patch(path, &base);
+    json!({
+        "agent_id": agent_id, "base": base,
+        "digest": patch_digest(&raw),
+        "files": parse_unified(&raw)
+    })
 }
 
 /// Parse unified-diff text into per-file blocks with indexed hunks (CAO
@@ -310,11 +376,17 @@ fn parse_unified(raw: &str) -> Vec<Value> {
             hunk_body.push_str(line);
             hunk_body.push('\n');
         } else {
+            // git appends a TAB after paths containing spaces on the
+            // `--- a/X\t` / `+++ b/X\t` lines — strip it, or the hunk key
+            // would never match the file list / selection keys (review L11).
             if line.starts_with("--- ") {
-                old_path = line.strip_prefix("--- a/").map(String::from);
+                old_path = line
+                    .strip_prefix("--- a/")
+                    .map(|p| p.strip_suffix('\t').unwrap_or(p))
+                    .map(String::from);
             } else if line.starts_with("+++ ") {
                 if let Some(p) = line.strip_prefix("+++ b/") {
-                    cur_path = Some(p.to_string());
+                    cur_path = Some(p.strip_suffix('\t').unwrap_or(p).to_string());
                 }
             }
             header.push_str(line);
@@ -329,28 +401,43 @@ fn parse_unified(raw: &str) -> Vec<Value> {
 /// Apply selected hunks to a target dir (CAO `apply_selection`): reassemble a
 /// patch from the chosen hunks and `git apply` it (`--reverse` for revert).
 /// `selections` is `{path: [hunk_index, …]}` (null/absent ⇒ all hunks of that
-/// file). Returns `{applied, target_dir, files, conflicts, error}`.
+/// file). `expected_digest`, when given, must match the digest of the patch
+/// assembled NOW — the binding between the diff the reviewer saw (hunked_diff
+/// served it alongside the same digest) and the diff being applied; a worktree
+/// that moved in between is a structured `stale` refusal, never a merge of
+/// content nobody reviewed. Returns `{applied, target_dir, files, conflicts,
+/// error}`.
 pub fn apply_selection(
     cwd: &str,
     base: Option<&str>,
     target_dir: &str,
     mode: &str, // "merge" | "revert"
     selections: &Value,
+    expected_digest: Option<&str>,
 ) -> Value {
     let src = Path::new(cwd);
     let base = resolve_base(src, base);
-    // The same patch set hunked_diff serves: tracked changes + synthetic
-    // new-file patches for untracked files, so the UI's hunk selections
-    // (including agent-created files) reassemble 1:1.
-    let mut raw = git_ok(src, &["diff", &base]).unwrap_or_default();
-    for (_, patch) in untracked_patches(src) {
-        raw.push_str(&patch);
+    // The same patch set hunked_diff serves, so the UI's hunk selections
+    // (including agent-created untracked files) reassemble 1:1.
+    let raw = review_patch(src, &base);
+    if let Some(exp) = expected_digest {
+        let now = patch_digest(&raw);
+        if now != exp {
+            return json!({
+                "applied": false, "stale": true, "target_dir": target_dir,
+                "files": [], "conflicts": [],
+                "error": "the diff changed since it was reviewed — reload and review the new changes"
+            });
+        }
     }
     let parsed = parse_unified(&raw);
 
     // Reassemble a patch from the selected hunks.
+    let src_top = repo_toplevel(src);
+    let target_top = repo_toplevel(Path::new(target_dir));
     let mut patch = String::new();
     let mut applied_files: Vec<String> = Vec::new();
+    let mut pre_conflicts: Vec<String> = Vec::new();
     let sel_obj = selections.as_object();
     for file in &parsed {
         let path = file["path"].as_str().unwrap_or("");
@@ -375,6 +462,41 @@ pub fn apply_selection(
                 _ => true, // null/empty selection ⇒ all hunks
             })
             .collect();
+        // New-file patches need target-aware handling `git apply` doesn't give:
+        // it hard-fails the WHOLE patch when the file already exists at the
+        // target (the normal state after the first merge of an agent-created
+        // file, which stays untracked in the worktree and re-appears in every
+        // diff — review L1). Identical content ⇒ no-op success; different ⇒ a
+        // conflict naming the file; reverting an already-absent file ⇒ no-op.
+        let is_new_file = header.contains("\nnew file mode");
+        let is_binary_stub = header.contains("\nBinary files ");
+        if is_new_file && !is_binary_stub {
+            let at_target = target_top.join(path);
+            if mode == "merge" && at_target.exists() {
+                let same = std::fs::read(src_top.join(path)).ok() == std::fs::read(&at_target).ok();
+                if same {
+                    applied_files.push(path.to_string()); // already there — no-op
+                } else {
+                    pre_conflicts.push(path.to_string());
+                }
+                continue;
+            }
+            if mode == "revert" && !at_target.exists() {
+                applied_files.push(path.to_string()); // already gone — no-op
+                continue;
+            }
+            // An EMPTY new file is a header-only patch with zero hunks; the
+            // header alone applies (creates/deletes the empty file), so a
+            // selected empty file must not fall through the no-hunks skip
+            // (review L6 — it used to vanish from the merge while the UI
+            // reported success).
+            if chosen.is_empty() && hunks.is_empty() {
+                patch.push_str(header);
+                patch.push('\n');
+                applied_files.push(path.to_string());
+                continue;
+            }
+        }
         if chosen.is_empty() {
             continue;
         }
@@ -387,7 +509,20 @@ pub fn apply_selection(
         applied_files.push(path.to_string());
     }
 
+    if !pre_conflicts.is_empty() {
+        // Refuse atomically BEFORE git apply: a mixed patch would hard-fail
+        // wholesale anyway, and this names the real cause.
+        return json!({
+            "applied": false, "conflicted": true, "target_dir": target_dir,
+            "files": applied_files, "conflicts": pre_conflicts,
+            "error": "file(s) already exist at the target with different content"
+        });
+    }
     if patch.trim().is_empty() {
+        if !applied_files.is_empty() {
+            // Everything selected was already at the target — a no-op merge.
+            return json!({ "applied": true, "target_dir": target_dir, "files": applied_files, "conflicts": [], "error": null });
+        }
         return json!({ "applied": false, "target_dir": target_dir, "files": [], "conflicts": [], "error": "nothing selected" });
     }
 
@@ -577,9 +712,37 @@ mod tests {
             target.to_str().unwrap(),
             "merge",
             &json!({ "b.txt": [0] }),
+            None,
         );
         assert_eq!(v["applied"], true, "error: {:?}", v["error"]);
         assert_eq!(std::fs::read_to_string(target.join("b.txt")).unwrap(), "agent-created\n");
+
+        // Re-merging the same (still-untracked) file is a no-op success, not
+        // the wholesale `git apply` failure "already exists in working
+        // directory" (review L1 — iterative review of agent files).
+        let v = apply_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            target.to_str().unwrap(),
+            "merge",
+            &json!({ "b.txt": [0] }),
+            None,
+        );
+        assert_eq!(v["applied"], true, "idempotent re-merge: {:?}", v["error"]);
+
+        // Same file but DIFFERENT content at the target: an explicit conflict
+        // naming the file — never a silent skip or a whole-patch failure.
+        std::fs::write(target.join("b.txt"), "edited at target\n").unwrap();
+        let v = apply_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            target.to_str().unwrap(),
+            "merge",
+            &json!({ "b.txt": [0] }),
+            None,
+        );
+        assert_eq!(v["applied"], false);
+        assert_eq!(v["conflicts"][0], "b.txt", "conflict names the file: {v}");
 
         // Revert (reverse-apply to self): the file is removed from the source.
         let v = apply_selection(
@@ -588,6 +751,7 @@ mod tests {
             src.to_str().unwrap(),
             "revert",
             &json!({ "b.txt": [0] }),
+            None,
         );
         assert_eq!(v["applied"], true, "error: {:?}", v["error"]);
         assert!(!src.join("b.txt").exists(), "reverted untracked file is gone");
@@ -616,9 +780,180 @@ mod tests {
             target.to_str().unwrap(),
             "merge",
             &json!({ "a.txt": [0] }),
+            None,
         );
         assert_eq!(v["applied"], true, "error: {:?}", v["error"]);
         assert!(std::fs::read_to_string(target.join("a.txt")).unwrap().contains("TWO"));
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn stale_digest_refuses_the_apply() {
+        let src = repo();
+        std::fs::write(src.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let h = hunked_diff("t1", src.to_str().unwrap(), Some("HEAD"));
+        let digest = h["digest"].as_str().unwrap().to_string();
+
+        // The worktree moves after the review was fetched…
+        std::fs::write(src.join("a.txt"), "one\nTWO\nTHREE\n").unwrap();
+        let v = apply_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            src.to_str().unwrap(),
+            "revert",
+            &json!({ "a.txt": [0] }),
+            Some(&digest),
+        );
+        assert_eq!(v["applied"], false);
+        assert_eq!(v["stale"], true, "a moved worktree must be a stale refusal: {v}");
+        assert!(
+            std::fs::read_to_string(src.join("a.txt")).unwrap().contains("THREE"),
+            "nothing applied on a stale digest"
+        );
+
+        // A digest matching the CURRENT patch applies.
+        let h = hunked_diff("t1", src.to_str().unwrap(), Some("HEAD"));
+        let digest = h["digest"].as_str().unwrap().to_string();
+        let v = apply_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            src.to_str().unwrap(),
+            "revert",
+            &json!({ "a.txt": [0] }),
+            Some(&digest),
+        );
+        assert_eq!(v["applied"], true, "fresh digest applies: {:?}", v["error"]);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn empty_untracked_file_is_merged_not_silently_dropped() {
+        let src = repo();
+        std::fs::write(src.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        std::fs::write(src.join("__init__.py"), "").unwrap();
+        let target = std::env::temp_dir().join(format!("taime-target-{:08x}", rand::random::<u32>()));
+        std::fs::create_dir_all(&target).unwrap();
+        git(Path::new(&target), &["init", "-q"]);
+        git(Path::new(&target), &["config", "user.email", "t@t"]);
+        git(Path::new(&target), &["config", "user.name", "t"]);
+        std::fs::write(target.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(Path::new(&target), &["add", "-A"]);
+        git(Path::new(&target), &["commit", "-qm", "init"]);
+
+        // The empty file is a header-only patch (zero hunks) — explicitly
+        // selecting it must create it at the target, not vanish from the merge.
+        let v = apply_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            target.to_str().unwrap(),
+            "merge",
+            &json!({ "a.txt": [0], "__init__.py": null }),
+            None,
+        );
+        assert_eq!(v["applied"], true, "error: {:?}", v["error"]);
+        assert!(target.join("__init__.py").exists(), "empty file landed: {v}");
+        assert!(std::fs::read_to_string(target.join("a.txt")).unwrap().contains("TWO"));
+        let files = v["files"].as_array().unwrap();
+        assert!(files.iter().any(|f| f == "__init__.py"), "reported in files: {v}");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn untracked_files_in_a_subdir_workspace_use_toplevel_relative_paths() {
+        // Shared-mode agents can have project_root = a SUBDIR of the git repo;
+        // cwd-relative patch paths would make `git apply` silently skip the
+        // file (exit 0, nothing written) — paths must be toplevel-relative.
+        let repo_dir = repo();
+        let sub = repo_dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("new.txt"), "from subdir agent\n").unwrap();
+
+        let h = hunked_diff("t1", sub.to_str().unwrap(), None);
+        let files = h["files"].as_array().unwrap();
+        assert!(
+            files.iter().any(|f| f["path"] == "sub/new.txt"),
+            "hunked path is toplevel-relative: {files:?}"
+        );
+        let fd = file_diffs("t1", sub.to_str().unwrap(), None);
+        let entry = fd["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "sub/new.txt")
+            .expect("file_diffs keys match the hunked surface");
+        assert!(entry["modified"].as_str().unwrap().contains("from subdir agent"));
+
+        // Reverting from the subdir cwd actually removes the file (the old
+        // cwd-relative form was a silent no-op success).
+        let v = apply_selection(
+            sub.to_str().unwrap(),
+            None,
+            sub.to_str().unwrap(),
+            "revert",
+            &json!({ "sub/new.txt": [0] }),
+            None,
+        );
+        assert_eq!(v["applied"], true, "error: {:?}", v["error"]);
+        assert!(!sub.join("new.txt").exists(), "subdir untracked file reverted");
+        let _ = std::fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn spaced_filenames_parse_without_the_tab_suffix() {
+        let dir = repo();
+        std::fs::write(dir.join("design notes.md"), "agent wrote this\n").unwrap();
+        let h = hunked_diff("t1", dir.to_str().unwrap(), Some("HEAD"));
+        let files = h["files"].as_array().unwrap();
+        let f = files
+            .iter()
+            .find(|f| f["path"] == "design notes.md")
+            .unwrap_or_else(|| panic!("clean (untabbed) path key, got: {files:?}"));
+        assert_eq!(f["hunks"].as_array().unwrap().len(), 1);
+
+        // And the clean key actually selects it for apply.
+        let v = apply_selection(
+            dir.to_str().unwrap(),
+            Some("HEAD"),
+            dir.to_str().unwrap(),
+            "revert",
+            &json!({ "design notes.md": [0] }),
+            None,
+        );
+        assert_eq!(v["applied"], true, "error: {:?}", v["error"]);
+        assert!(!dir.join("design notes.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_utf8_untracked_content_is_never_corrupted_into_a_merge() {
+        let src = repo();
+        // ISO-8859-1 "café latte" — text to the user, invalid UTF-8 to Rust.
+        std::fs::write(src.join("latin1.txt"), b"caf\xe9 latte\n").unwrap();
+        let target = std::env::temp_dir().join(format!("taime-target-{:08x}", rand::random::<u32>()));
+        std::fs::create_dir_all(&target).unwrap();
+        git(Path::new(&target), &["init", "-q"]);
+
+        // Listed for visibility, but NOT hunked (a lossy U+FFFD round-trip
+        // would silently corrupt the merged bytes — worse than not merging).
+        let t = terminal_diff("t1", src.to_str().unwrap(), Some("HEAD"));
+        assert!(t["files"].as_array().unwrap().iter().any(|f| f == "latin1.txt"));
+        let h = hunked_diff("t1", src.to_str().unwrap(), Some("HEAD"));
+        assert!(
+            !h["files"].as_array().unwrap().iter().any(|f| f["path"] == "latin1.txt"),
+            "non-UTF8 file must not be hunked/mergeable: {h}"
+        );
+        let v = apply_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            target.to_str().unwrap(),
+            "merge",
+            &json!({ "latin1.txt": null }),
+            None,
+        );
+        assert_eq!(v["applied"], false, "nothing to apply for a non-UTF8-only selection");
+        assert!(!target.join("latin1.txt").exists(), "no corrupted bytes written");
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&target);
     }

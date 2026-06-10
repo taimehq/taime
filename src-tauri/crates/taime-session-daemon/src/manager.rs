@@ -709,6 +709,14 @@ impl Manager {
         if !same_workspace {
             return Err(format!("merge target '{target}' is not in this agent's workspace"));
         }
+        // A shared-mode sibling's "worktree" IS the user's real project dir
+        // (worktree.rs's fallback) — merging "into agent-b" must never silently
+        // write the mainline under another agent's name.
+        if dst.mode.as_deref() != Some("isolated") {
+            return Err(format!(
+                "merge target '{target}' shares the project directory — merge to 'main' instead"
+            ));
+        }
         Ok(dst.worktree_path)
     }
 
@@ -737,23 +745,38 @@ impl Manager {
                 let symbol = a.get("target_dir").and_then(|v| v.as_str()).unwrap_or("self");
                 let mode = a.get("mode").and_then(|v| v.as_str()).unwrap_or("merge");
                 let sel = a.get("selections").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let digest = a.get("expected_digest").and_then(|v| v.as_str());
                 // The review gate, enforced where the merge happens — not by UI
-                // placement: a merge requires a standing review ack for the
-                // agent (the review surfaces record one; any new dirty path
-                // invalidates it). Fails closed when persistence is off — no
-                // store means no acks, and unrecorded merges break the thesis.
-                // Reverts stay ungated: discarding the agent's own work back to
-                // base is the safe direction.
-                let resolved = if mode != "revert" && !self.has_review_ack(tk) {
+                // placement. A merge requires (1) a standing review ack for the
+                // agent (any new dirty path invalidates it; fails closed when
+                // persistence is off — no store means no acks, and unrecorded
+                // merges break the thesis) and (2) the digest of the reviewed
+                // hunked_diff, which apply_selection checks against the patch it
+                // assembles NOW — the content binding that refuses merging what
+                // nobody saw. A revert discards the agent's own work back to
+                // base — the safe direction — so it skips the ack, but ONLY
+                // toward "self": aimed anywhere else it is cross-tree
+                // destruction, not a revert. An empty selection map is refused
+                // outright — "everything, implicitly" is never a reviewed
+                // action (the review surfaces always send explicit selections).
+                let resolved = if sel.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                    Err("nothing selected — fetch hunked_diff and select hunks".to_string())
+                } else if mode == "revert" && symbol != "self" {
+                    Err(format!("revert only applies to the agent's own worktree, not '{symbol}'"))
+                } else if mode != "revert" && self.store.is_none() {
+                    Err("merge refused: daemon persistence is unavailable, so review acks cannot be recorded — nothing merges without Review".to_string())
+                } else if mode != "revert" && !self.has_review_ack(tk) {
                     Err(format!(
                         "merge refused: no standing review ack for '{tk}' — nothing merges without Review"
                     ))
+                } else if mode != "revert" && digest.is_none() {
+                    Err("merge refused: missing expected_digest (the hunked_diff fingerprint of the reviewed changes)".to_string())
                 } else {
                     self.resolve_apply_target(tk, &cwd, symbol)
                 };
                 match resolved {
                     Ok(target) => {
-                        crate::diff::apply_selection(&cwd, base.as_deref(), &target, mode, &sel)
+                        crate::diff::apply_selection(&cwd, base.as_deref(), &target, mode, &sel, digest)
                             .to_string()
                     }
                     Err(e) => serde_json::json!({
@@ -785,10 +808,16 @@ impl Manager {
             // records an ack when the user proceeds past the guard / marks reviewed,
             // and hydrates `reviewed` on boot so the ack survives a restart.
             "mark_reviewed" => {
-                if let Some(store) = &self.store {
-                    let _ = store.mark_reviewed(tk, now_unix());
-                }
-                "true".to_string()
+                // Honest result: an ack that wasn't durably recorded must not
+                // report success — the merge gate reads the store, so a client
+                // proceeding on a phantom "true" would hit a refusal it can't
+                // explain (or worse, believe a review was recorded).
+                let ok = self
+                    .store
+                    .as_ref()
+                    .map(|store| store.mark_reviewed(tk, now_unix()).is_ok())
+                    .unwrap_or(false);
+                if ok { "true" } else { "false" }.to_string()
             }
             // Drop a standing ack without touching the watcher's dirty
             // accumulation (unlike clear_dirty): the agent changed more files
@@ -3095,11 +3124,45 @@ mod tests {
         .to_string()
     }
 
+    fn apply_args_with_digest(
+        agent: &str,
+        target: &str,
+        mode: &str,
+        selections: serde_json::Value,
+        digest: &str,
+    ) -> String {
+        serde_json::json!({
+            "agent_id": agent, "target_dir": target, "mode": mode,
+            "selections": selections, "expected_digest": digest
+        })
+        .to_string()
+    }
+
     /// Record the review ack the merge gate requires — the same `mark_reviewed`
     /// query the review surfaces issue when the user merges/marks reviewed.
     fn ack_review(mgr: &Manager, agent: &str) {
         let args = serde_json::json!({ "agent_id": agent }).to_string();
         assert_eq!(mgr.query("mark_reviewed", &args), "true");
+    }
+
+    /// Fetch the served diff's digest the way the UI does (hunked_diff) — the
+    /// reviewed-content fingerprint apply_selection requires for merges.
+    fn fetch_digest(mgr: &Manager, agent: &str) -> String {
+        let h: serde_json::Value = serde_json::from_str(
+            &mgr.query("hunked_diff", &serde_json::json!({ "agent_id": agent }).to_string()),
+        )
+        .unwrap();
+        h["digest"].as_str().expect("hunked_diff serves a digest").to_string()
+    }
+
+    /// The full UI merge flow: review (hunked_diff → digest), ack, apply.
+    fn ui_merge(mgr: &Manager, agent: &str, target: &str, selections: serde_json::Value) -> serde_json::Value {
+        let digest = fetch_digest(mgr, agent);
+        ack_review(mgr, agent);
+        serde_json::from_str(
+            &mgr.query("apply_selection", &apply_args_with_digest(agent, target, "merge", selections, &digest)),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3108,12 +3171,8 @@ mod tests {
         let proj = project_repo();
         let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
         std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
-        ack_review(&mgr, "agent-a");
 
-        let v: serde_json::Value = serde_json::from_str(
-            &mgr.query("apply_selection", &apply_args("agent-a", "main", "merge", serde_json::json!({ "a.txt": [0] }))),
-        )
-        .unwrap();
+        let v = ui_merge(&mgr, "agent-a", "main", serde_json::json!({ "a.txt": [0] }));
         assert_eq!(v["applied"], true, "merge to 'main' failed: {v}");
         assert!(
             std::fs::read_to_string(proj.join("a.txt")).unwrap().contains("TWO"),
@@ -3131,9 +3190,9 @@ mod tests {
         std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
 
         // Deliberately NO review ack: revert (discarding the agent's own work
-        // back to base) is the safe direction and must stay ungated.
+        // back to base) is the safe direction and stays ungated — toward self.
         let v: serde_json::Value = serde_json::from_str(
-            &mgr.query("apply_selection", &apply_args("agent-a", "self", "revert", serde_json::json!({}))),
+            &mgr.query("apply_selection", &apply_args("agent-a", "self", "revert", serde_json::json!({ "a.txt": null }))),
         )
         .unwrap();
         assert_eq!(v["applied"], true, "revert from 'self' failed: {v}");
@@ -3147,22 +3206,85 @@ mod tests {
     }
 
     #[test]
+    fn revert_refuses_any_target_but_self() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt_a = seed_isolated_agent(&mgr, &proj, "agent-a");
+        let _wt_b = seed_isolated_agent(&mgr, &proj, "agent-b");
+        std::fs::write(wt_a.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+
+        // Reverts skip the review ack BECAUSE they only discard the agent's
+        // own work; aimed at "main" or a sibling they'd be ungated cross-tree
+        // destruction (reverse-applying merged work from the mainline).
+        for target in ["main", "agent-b"] {
+            let v: serde_json::Value = serde_json::from_str(
+                &mgr.query("apply_selection", &apply_args("agent-a", target, "revert", serde_json::json!({ "a.txt": null }))),
+            )
+            .unwrap();
+            assert_eq!(v["applied"], false, "revert to '{target}' must be refused: {v}");
+            assert!(v["error"].as_str().unwrap().contains("own worktree"), "{v}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(proj.join("a.txt")).unwrap(),
+            "one\ntwo\nthree\n",
+            "the project checkout is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&wt_a);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
     fn apply_selection_merges_into_a_same_workspace_sibling() {
         let mgr = mem_manager();
         let proj = project_repo();
         let wt_a = seed_isolated_agent(&mgr, &proj, "agent-a");
         let wt_b = seed_isolated_agent(&mgr, &proj, "agent-b");
         std::fs::write(wt_a.join("a.txt"), "one\nTWO\nthree\n").unwrap();
-        ack_review(&mgr, "agent-a");
 
-        let v: serde_json::Value = serde_json::from_str(
-            &mgr.query("apply_selection", &apply_args("agent-a", "agent-b", "merge", serde_json::json!({}))),
-        )
-        .unwrap();
+        let v = ui_merge(&mgr, "agent-a", "agent-b", serde_json::json!({ "a.txt": null }));
         assert_eq!(v["applied"], true, "merge to sibling failed: {v}");
         assert!(std::fs::read_to_string(wt_b.join("a.txt")).unwrap().contains("TWO"));
         let _ = std::fs::remove_dir_all(&wt_a);
         let _ = std::fs::remove_dir_all(&wt_b);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn shared_mode_sibling_is_not_a_merge_target() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        // agent-b's isolation failed → worktree.rs's shared fallback records
+        // the USER'S project dir as its "worktree". Merging "into agent-b"
+        // must refuse, not silently write the mainline under another name.
+        mgr.store()
+            .unwrap()
+            .upsert_worktree(
+                &WorktreeInfo {
+                    agent_id: "agent-b".into(),
+                    project_root: proj.to_string_lossy().into_owned(),
+                    repo_root: None,
+                    worktree_path: proj.to_string_lossy().into_owned(),
+                    branch: None,
+                    base_sha: None,
+                    mode: "shared".into(),
+                    error: None,
+                },
+                "claude_code",
+                2,
+            )
+            .unwrap();
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+
+        let v = ui_merge(&mgr, "agent-a", "agent-b", serde_json::json!({ "a.txt": null }));
+        assert_eq!(v["applied"], false, "shared sibling must be refused: {v}");
+        assert!(v["error"].as_str().unwrap().contains("shares the project directory"), "{v}");
+        assert_eq!(
+            std::fs::read_to_string(proj.join("a.txt")).unwrap(),
+            "one\ntwo\nthree\n",
+            "the user's checkout is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&proj);
     }
 
@@ -3190,14 +3312,17 @@ mod tests {
             )
             .unwrap();
         std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
-        // Acked, so target rejection (not the review gate) is what's exercised.
+        // Acked + digested, so target rejection (not the review gate) is what's
+        // exercised.
+        let digest = fetch_digest(&mgr, "agent-a");
         ack_review(&mgr, "agent-a");
 
         // A literal directory must NOT be treated as a path (the old behavior).
         for bad in ["no-such-agent", "/tmp", "agent-z"] {
-            let v: serde_json::Value = serde_json::from_str(
-                &mgr.query("apply_selection", &apply_args("agent-a", bad, "merge", serde_json::json!({}))),
-            )
+            let v: serde_json::Value = serde_json::from_str(&mgr.query(
+                "apply_selection",
+                &apply_args_with_digest("agent-a", bad, "merge", serde_json::json!({ "a.txt": null }), &digest),
+            ))
             .unwrap();
             assert_eq!(v["applied"], false, "target '{bad}' must be rejected");
             assert!(v["error"].as_str().unwrap_or("").contains(bad), "error names the target: {v}");
@@ -3217,10 +3342,12 @@ mod tests {
         let proj = project_repo();
         let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
         std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let digest = fetch_digest(&mgr, "agent-a");
         let merge = || -> serde_json::Value {
-            serde_json::from_str(
-                &mgr.query("apply_selection", &apply_args("agent-a", "main", "merge", serde_json::json!({}))),
-            )
+            serde_json::from_str(&mgr.query(
+                "apply_selection",
+                &apply_args_with_digest("agent-a", "main", "merge", serde_json::json!({ "a.txt": null }), &digest),
+            ))
             .unwrap()
         };
 
@@ -3240,11 +3367,74 @@ mod tests {
     }
 
     #[test]
+    fn merge_requires_the_reviewed_diff_digest() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        ack_review(&mgr, "agent-a");
+
+        // Acked but WITHOUT the hunked_diff digest → refused (nothing binds the
+        // ack to the content being merged).
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "apply_selection",
+            &apply_args("agent-a", "main", "merge", serde_json::json!({ "a.txt": null })),
+        ))
+        .unwrap();
+        assert_eq!(v["applied"], false, "digest-less merge must be refused: {v}");
+        assert!(v["error"].as_str().unwrap().contains("expected_digest"), "{v}");
+
+        // With a STALE digest (worktree moved after review) → stale refusal.
+        let digest = fetch_digest(&mgr, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nTHREE\n").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "apply_selection",
+            &apply_args_with_digest("agent-a", "main", "merge", serde_json::json!({ "a.txt": null }), &digest),
+        ))
+        .unwrap();
+        assert_eq!(v["applied"], false, "stale digest must refuse: {v}");
+        assert_eq!(v["stale"], true, "{v}");
+        assert_eq!(
+            std::fs::read_to_string(proj.join("a.txt")).unwrap(),
+            "one\ntwo\nthree\n",
+            "nothing lands from an unreviewed worktree state"
+        );
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn empty_selections_are_refused_never_merge_all() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let digest = fetch_digest(&mgr, "agent-a");
+        ack_review(&mgr, "agent-a");
+
+        // "{}" used to mean "everything" — one RPC could merge (or worse,
+        // revert) an entire tree nobody enumerated. Now it's a refusal, for
+        // both modes.
+        for (mode, target) in [("merge", "main"), ("revert", "self")] {
+            let v: serde_json::Value = serde_json::from_str(&mgr.query(
+                "apply_selection",
+                &apply_args_with_digest("agent-a", target, mode, serde_json::json!({}), &digest),
+            ))
+            .unwrap();
+            assert_eq!(v["applied"], false, "{mode} with empty selections must refuse: {v}");
+            assert!(v["error"].as_str().unwrap().contains("nothing selected"), "{v}");
+        }
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
     fn clear_dirty_drops_the_ack_and_re_arms_the_merge_gate() {
         let mgr = mem_manager();
         let proj = project_repo();
         let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
         std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let digest = fetch_digest(&mgr, "agent-a");
         ack_review(&mgr, "agent-a");
         assert!(mgr.store().unwrap().is_reviewed("agent-a").unwrap());
 
@@ -3253,13 +3443,32 @@ mod tests {
         assert!(!mgr.store().unwrap().is_reviewed("agent-a").unwrap());
 
         // …so the next merge is refused until the diff is reviewed again.
-        let v: serde_json::Value = serde_json::from_str(
-            &mgr.query("apply_selection", &apply_args("agent-a", "main", "merge", serde_json::json!({}))),
-        )
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "apply_selection",
+            &apply_args_with_digest("agent-a", "main", "merge", serde_json::json!({ "a.txt": null }), &digest),
+        ))
         .unwrap();
         assert_eq!(v["applied"], false, "merge after a cleared ack must be refused: {v}");
         let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn mark_reviewed_reports_failure_without_persistence() {
+        // With no store an ack can never be recorded; answering "true" anyway
+        // would send the client into an inexplicable merge refusal.
+        let mgr = Manager::for_test(None);
+        let args = serde_json::json!({ "agent_id": "agent-a" }).to_string();
+        assert_eq!(mgr.query("mark_reviewed", &args), "false");
+
+        // And the merge refusal itself names the real cause.
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "apply_selection",
+            &apply_args("agent-a", "main", "merge", serde_json::json!({ "a.txt": null })),
+        ))
+        .unwrap();
+        assert_eq!(v["applied"], false);
+        assert!(v["error"].as_str().unwrap().contains("persistence"), "{v}");
     }
 
     #[test]
@@ -3284,12 +3493,7 @@ mod tests {
         assert!(!file["hunks"].as_array().unwrap().is_empty(), "untracked file has hunks");
 
         // And the UI's selection of that hunk must merge it into 'main'.
-        ack_review(&mgr, "agent-a");
-        let v: serde_json::Value = serde_json::from_str(&mgr.query(
-            "apply_selection",
-            &apply_args("agent-a", "main", "merge", serde_json::json!({ "generated.rs": [0] })),
-        ))
-        .unwrap();
+        let v = ui_merge(&mgr, "agent-a", "main", serde_json::json!({ "generated.rs": [0] }));
         assert_eq!(v["applied"], true, "untracked merge failed: {v}");
         assert_eq!(
             std::fs::read_to_string(proj.join("generated.rs")).unwrap(),

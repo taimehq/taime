@@ -128,13 +128,21 @@ export function AgentDiffSection({
 
   // Selection helpers (DiffView's, verbatim semantics).
   const allIdx = (path: string) => (hunksByPath[path] ?? []).map((h) => h.index);
+  // An EMPTY new file is a real, mergeable change with zero hunks (its patch
+  // is header-only) — selectable as a whole file. Binary files stay inert.
+  const isSelectableEmpty = (path: string) => {
+    const f = files.find((x) => x.path === path);
+    return allIdx(path).length === 0 && f?.status === "added" && !f.binary;
+  };
   const isFileFull = (path: string) => {
     const all = allIdx(path);
-    return all.length > 0 && (sel[path]?.length ?? 0) === all.length;
+    if (all.length === 0) return isSelectableEmpty(path) && sel[path] !== undefined;
+    return (sel[path]?.length ?? 0) === all.length;
   };
   const toggleFile = (path: string) =>
     setSel((s) => {
       const next = { ...s };
+      if (allIdx(path).length === 0 && !isSelectableEmpty(path)) return next;
       if (isFileFull(path)) delete next[path];
       else next[path] = allIdx(path);
       return next;
@@ -149,7 +157,8 @@ export function AgentDiffSection({
       else next[path] = [...cur].sort((a, b) => a - b);
       return next;
     });
-  const selectionCount = Object.values(sel).reduce((n, a) => n + a.length, 0);
+  // A selected empty file counts as one unit (it has no hunks to count).
+  const selectionCount = Object.values(sel).reduce((n, a) => n + Math.max(a.length, 1), 0);
 
   const agentName = providerTitle(member.provider ?? worktree?.provider ?? "agent");
   const totalAdd = files.reduce((n, f) => n + f.additions, 0);
@@ -162,13 +171,25 @@ export function AgentDiffSection({
     setBusy(mode);
     try {
       // Merging from the review surface IS the review act: record the durable
-      // ack the daemon's merge gate requires (it refuses unacked merges). The
-      // local guard state is untouched — unmerged changes still need review.
-      if (mode === "merge") await api.markReviewed(member.agent_id);
+      // ack the daemon's merge gate requires (it refuses unacked merges). A
+      // failed ack is a hard stop — proceeding would hit the gate with a
+      // refusal that doesn't name the real cause. The local guard state is
+      // untouched — unmerged changes still need review.
+      if (mode === "merge") {
+        const acked = await api.markReviewed(member.agent_id);
+        if (!acked) {
+          showSnackbar({
+            type: "error",
+            message: "Could not record the review ack (daemon persistence unavailable) — merge aborted",
+          });
+          return;
+        }
+      }
       const res = await api.applySelection(member.agent_id, {
         target: mode === "revert" ? "self" : target,
         mode,
         selections: sel,
+        expectedDigest: bundle?.digest ?? undefined,
       });
       if (res.applied) {
         const where = mode === "revert" ? agentName : target === "main" ? "main" : "agent";
@@ -177,6 +198,15 @@ export function AgentDiffSection({
           message: `${mode === "merge" ? "Merged" : "Reverted"} ${res.files.length} file(s) ${
             mode === "merge" ? `→ ${where}` : `from ${where}`
           }`,
+        });
+        setSel({});
+        onApplied();
+      } else if (res.stale) {
+        // The worktree moved since this bundle was fetched — reload; the
+        // selection is meaningless against the new hunks.
+        showSnackbar({
+          type: "error",
+          message: "The agent changed files after this diff loaded — review the new changes",
         });
         setSel({});
         onApplied();
@@ -322,6 +352,7 @@ export function AgentDiffSection({
             collapsed={collapsedFiles.has(f.path)}
             onToggleCollapsed={() => toggleFileCollapsed(f.path)}
             fileFull={isFileFull(f.path)}
+            selectable={allIdx(f.path).length > 0 || isSelectableEmpty(f.path)}
             selIdx={sel[f.path] ?? []}
             onToggleFile={() => toggleFile(f.path)}
             onToggleHunk={(idx) => toggleHunk(f.path, idx)}
@@ -343,6 +374,7 @@ function FileBlock({
   collapsed,
   onToggleCollapsed,
   fileFull,
+  selectable,
   selIdx,
   onToggleFile,
   onToggleHunk,
@@ -356,6 +388,9 @@ function FileBlock({
   collapsed: boolean;
   onToggleCollapsed: () => void;
   fileFull: boolean;
+  /** Whole-file selection allowed: has hunks, or is an empty added file
+   *  (header-only patch — still a real, mergeable change). */
+  selectable: boolean;
   selIdx: number[];
   onToggleFile: () => void;
   onToggleHunk: (idx: number) => void;
@@ -374,7 +409,7 @@ function FileBlock({
             if (el) el.indeterminate = selIdx.length > 0 && !fileFull;
           }}
           onChange={onToggleFile}
-          disabled={hunks.length === 0}
+          disabled={!selectable}
           aria-label={`Select all hunks in ${file.path}`}
           className="shrink-0 accent-teal-500"
         />
@@ -422,7 +457,9 @@ function FileBlock({
         (file.binary ? (
           <p className="px-4 pb-2 text-[11px] text-zinc-600">Binary file — no preview.</p>
         ) : hunks.length === 0 ? (
-          <p className="px-4 pb-2 text-[11px] text-zinc-600">No hunks vs base.</p>
+          <p className="px-4 pb-2 text-[11px] text-zinc-600">
+            {file.status === "added" ? "Empty new file." : "No hunks vs base."}
+          </p>
         ) : (
           hunks.map((h) => {
             const ha = hunkAuthor(h.index);

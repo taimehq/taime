@@ -65,6 +65,10 @@ export function DiffView() {
 
   const [files, setFiles] = useState<FileDiffEntry[]>([]);
   const [hunks, setHunks] = useState<HunkedFileEntry[]>([]);
+  // Fingerprint of the hunked diff on screen — sent with Merge so the daemon
+  // refuses if the worktree moved after this view was fetched (stale hunk
+  // indices must never merge content nobody saw).
+  const [digest, setDigest] = useState<string | null>(null);
   const [worktree, setWorktree] = useState<WorktreeInfo | null>(null);
   const [attribution, setAttribution] = useState<AttributionResponse | null>(null);
   const [contended, setContended] = useState<Set<string>>(new Set());
@@ -84,12 +88,15 @@ export function DiffView() {
     try {
       const [fd, hk, wt, attr] = await Promise.all([
         api.getFileDiffs(terminalId).catch(() => ({ agent_id: terminalId, files: [] })),
-        api.getHunks(terminalId).catch(() => ({ agent_id: terminalId, base: null, files: [] })),
+        api
+          .getHunks(terminalId)
+          .catch(() => ({ agent_id: terminalId, base: null, digest: null, files: [] })),
         api.getWorktree(terminalId).catch(() => null),
         api.getAttribution(terminalId).catch(() => ({ team: [], files: {} })),
       ]);
       setFiles(fd.files);
       setHunks(hk.files);
+      setDigest(hk.digest);
       setWorktree(wt);
       setAttribution(attr);
       setSelected((prev) => prev ?? fd.files[0]?.path ?? null);
@@ -178,13 +185,21 @@ export function DiffView() {
 
   const allIdx = (path: string) =>
     (hunksByPath[path]?.hunks ?? []).map((h) => h.index);
+  // An EMPTY new file is a real, mergeable change with zero hunks (its patch
+  // is header-only) — selectable as a whole file. Binary files stay inert.
+  const isSelectableEmpty = (path: string) => {
+    const f = files.find((x) => x.path === path);
+    return allIdx(path).length === 0 && f?.status === "added" && !f.binary;
+  };
   const isFileFull = (path: string) => {
     const all = allIdx(path);
-    return all.length > 0 && (sel[path]?.length ?? 0) === all.length;
+    if (all.length === 0) return isSelectableEmpty(path) && sel[path] !== undefined;
+    return (sel[path]?.length ?? 0) === all.length;
   };
   const toggleFile = (path: string) =>
     setSel((s) => {
       const next = { ...s };
+      if (allIdx(path).length === 0 && !isSelectableEmpty(path)) return next;
       if (isFileFull(path)) delete next[path];
       else next[path] = allIdx(path);
       return next;
@@ -199,7 +214,8 @@ export function DiffView() {
       return next;
     });
 
-  const selectionCount = Object.values(sel).reduce((n, a) => n + a.length, 0);
+  // A selected empty file counts as one unit (it has no hunks to count).
+  const selectionCount = Object.values(sel).reduce((n, a) => n + Math.max(a.length, 1), 0);
   const buildSelections = (): Record<string, number[]> => sel;
 
   // Group the changed files by their last author so the reviewer sees, at a
@@ -292,19 +308,40 @@ export function DiffView() {
     setBusy(true);
     try {
       // Merging from the review surface IS the review act: record the durable
-      // ack the daemon's merge gate requires (it refuses unacked merges). The
-      // local guard state is untouched — unmerged changes still need review.
-      if (mode === "merge") await api.markReviewed(terminalId);
+      // ack the daemon's merge gate requires (it refuses unacked merges). A
+      // failed ack is a hard stop — proceeding would hit the gate with a
+      // refusal that doesn't name the real cause. The local guard state is
+      // untouched — unmerged changes still need review.
+      if (mode === "merge") {
+        const acked = await api.markReviewed(terminalId);
+        if (!acked) {
+          showSnackbar({
+            type: "error",
+            message: "Could not record the review ack (daemon persistence unavailable) — merge aborted",
+          });
+          return;
+        }
+      }
       const res = await api.applySelection(terminalId, {
         target: mode === "revert" ? "self" : target,
         mode,
         selections: buildSelections(),
+        expectedDigest: digest ?? undefined,
       });
       if (res.applied) {
         const where = mode === "revert" ? agentName : target === "main" ? "main" : "agent";
         showSnackbar({
           type: "success",
           message: `${mode === "merge" ? "Merged" : "Reverted"} ${res.files.length} file(s) ${mode === "merge" ? `→ ${where}` : `from ${where}`}`,
+        });
+        setSel({});
+        await load();
+      } else if (res.stale) {
+        // The worktree moved since this view was fetched — show the fresh
+        // diff; the selection is meaningless against the new hunks.
+        showSnackbar({
+          type: "error",
+          message: "The agent changed files after you loaded this diff — review the new changes",
         });
         setSel({});
         await load();
