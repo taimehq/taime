@@ -158,6 +158,41 @@ fn short_id(agent_id: &str) -> String {
     agent_id.chars().take(8).collect()
 }
 
+/// Attach the provenance record as a git note on the merge commit under
+/// `refs/notes/taime` — the in-repo, pushable twin of the trailer (`git push
+/// origin refs/notes/taime` travels it to collaborators). Best-effort: a note
+/// failure never undoes the commit (the trailer already carries the core).
+fn write_git_note(repo: &str, commit: &str, json: &str) -> bool {
+    std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["notes", "--ref=taime", "add", "-f", "-m", json, commit])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// A recorded merge → the JSON shape the app reads (merge history + attribution
+/// export). Field names align with the commit trailer / git note.
+fn merge_record_json(m: &crate::store::MergeRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": m.id,
+        "commit": m.commit_sha,
+        "target": m.target_symbol,
+        "target_repo": m.target_repo,
+        "base_sha": m.base_sha,
+        "archive_ref": m.archive_ref,
+        "digest": m.digest,
+        "scope": m.scope,
+        "hunks_selected": m.hunks_selected,
+        "hunks_total": m.hunks_total,
+        "reviewed": m.reviewed,
+        "pushed": m.pushed,
+        "pr_url": m.pr_url,
+        "files": m.files,
+        "merged_at": m.created_at_unix,
+    })
+}
+
 /// Read a `u64` tunable from the environment, falling back to `default`. Used for
 /// the worktree retention caps (grace / keep-recent / max-idle), so they're
 /// configurable without a config surface.
@@ -1078,6 +1113,143 @@ impl Manager {
         m
     }
 
+    /// After a `commit_selection*` returns, record the provenance of a committed
+    /// merge: write the `refs/notes/taime` git note (the pushable in-repo record)
+    /// and append a `taime_merges` ledger row (the queryable backing for the badge
+    /// and export). Both best-effort — the commit and trailer already stand, so a
+    /// store-less or note-failing daemon still produced a fully attributed commit.
+    /// A non-committed `res` (refused / conflicted / stale) passes straight
+    /// through. Returns the result augmented with `note_written`.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_merge(
+        &self,
+        res: serde_json::Value,
+        agent_id: &str,
+        target_symbol: &str,
+        target_repo: &str,
+        base: Option<&str>,
+        archive_ref: Option<&str>,
+        digest: Option<&str>,
+        reviewed: bool,
+        selected: usize,
+        total: usize,
+    ) -> String {
+        let mut res = res;
+        if res["committed"].as_bool() != Some(true) {
+            return res.to_string();
+        }
+        let commit = res["commit"].as_str().unwrap_or("").to_string();
+        let files: Vec<String> = res["files"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let scope = if total > 0 && selected >= total { "full" } else { "partial" };
+        let (provider, task_id) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.worktree_row(agent_id).ok().flatten())
+            .map(|w| (w.provider.unwrap_or_default(), w.task_id))
+            .unwrap_or_default();
+        let turns = self
+            .store
+            .as_ref()
+            .and_then(|s| s.agent_turns(agent_id, 10_000).ok())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let now = now_unix();
+
+        // The git note: the full machine-readable provenance record, field-aligned
+        // with the trailer + the attribution export.
+        let note = serde_json::json!({
+            "schema": "taime.provenance/v1",
+            "agent_id": agent_id,
+            "provider": provider,
+            "base_sha": base,
+            "archive_ref": archive_ref,
+            "task_id": task_id,
+            "commit": commit,
+            "target": target_symbol,
+            "reviewed": reviewed,
+            "digest": digest,
+            "scope": scope,
+            "hunks_selected": selected,
+            "hunks_total": total,
+            "turns": turns,
+            "files": files,
+            "merged_at": now,
+        });
+        let note_written =
+            write_git_note(target_repo, &commit, &serde_json::to_string(&note).unwrap_or_default());
+
+        if let Some(store) = &self.store {
+            let _ = store.put_merge(&crate::store::MergeRecord {
+                id: None,
+                agent_id: agent_id.to_string(),
+                target_repo: target_repo.to_string(),
+                target_symbol: target_symbol.to_string(),
+                commit_sha: commit.clone(),
+                base_sha: base.map(String::from),
+                archive_ref: archive_ref.map(String::from),
+                digest: digest.map(String::from),
+                scope: scope.to_string(),
+                hunks_selected: selected as i64,
+                hunks_total: total as i64,
+                reviewed,
+                pushed: false,
+                pr_url: None,
+                files,
+                created_at_unix: now,
+            });
+        }
+        res["note_written"] = serde_json::json!(note_written);
+        res.to_string()
+    }
+
+    /// The attribution export (gap #2): a portable JSON artifact for `agent_id` —
+    /// identity + current change set + recorded merges + turn count. The git
+    /// trailer + `refs/notes/taime` note are the in-repo twin; this is the
+    /// download / external-tooling form.
+    fn export_attribution_json(&self, agent_id: &str) -> String {
+        let row = self.store.as_ref().and_then(|s| s.worktree_row(agent_id).ok().flatten());
+        let provider = row.as_ref().and_then(|w| w.provider.clone()).unwrap_or_default();
+        let base_sha = row.as_ref().and_then(|w| w.base_sha.clone());
+        let archive_ref = row.as_ref().and_then(|w| w.archive_ref.clone());
+        let task_id = row.as_ref().and_then(|w| w.task_id.clone());
+        let turns = self
+            .store
+            .as_ref()
+            .and_then(|s| s.agent_turns(agent_id, 10_000).ok())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let merges =
+            self.store.as_ref().and_then(|s| s.merges_for_agent(agent_id).ok()).unwrap_or_default();
+        // The agent's current (pre-merge) change set, from wherever it renders.
+        let current_files: Vec<String> = match self.review_source(agent_id) {
+            ReviewSource::Live { cwd, base } => {
+                let d = crate::diff::terminal_diff(agent_id, &cwd, base.as_deref());
+                d["files"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
+            }
+            ReviewSource::Archive { patch, .. } => {
+                let d = crate::diff::terminal_diff_archived(agent_id, &patch.diff_blob);
+                d["files"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
+            }
+            ReviewSource::Empty => Vec::new(),
+        };
+        serde_json::json!({
+            "schema": "taime.attribution/v1",
+            "agent_id": agent_id,
+            "provider": provider,
+            "base_sha": base_sha,
+            "archive_ref": archive_ref,
+            "task_id": task_id,
+            "turns": turns,
+            "current_files": current_files,
+            "merges": merges.iter().map(merge_record_json).collect::<Vec<_>>(),
+            "exported_at": now_unix(),
+        })
+        .to_string()
+    }
+
     /// Generic query RPC (Phase 6 route-layer migration): returns a JSON string in
     /// the frontend's shape for `kind`. Shells out to git (diffs) — call from a
     /// blocking context.
@@ -1252,10 +1424,13 @@ impl Manager {
                                     let msg = self.build_merge_message(
                                         tk, symbol, base.as_deref(), reviewed, digest, s, t, ar.as_deref(),
                                     );
-                                    crate::diff::commit_selection(
+                                    let res = crate::diff::commit_selection(
                                         &cwd, base.as_deref(), &target, &sel, digest, &msg,
+                                    );
+                                    self.finalize_merge(
+                                        res, tk, symbol, &target, base.as_deref(), ar.as_deref(),
+                                        digest, reviewed, s, t,
                                     )
-                                    .to_string()
                                 }
                             }
                         }
@@ -1275,7 +1450,7 @@ impl Manager {
                                         t,
                                         Some(&patch.archive_ref),
                                     );
-                                    crate::diff::commit_selection_archived(
+                                    let res = crate::diff::commit_selection_archived(
                                         &repo_root,
                                         &patch.archive_ref,
                                         &patch.diff_blob,
@@ -1283,13 +1458,26 @@ impl Manager {
                                         &sel,
                                         digest,
                                         &msg,
+                                    );
+                                    self.finalize_merge(
+                                        res, tk, symbol, &target, Some(&patch.base_sha),
+                                        Some(&patch.archive_ref), digest, reviewed, s, t,
                                     )
-                                    .to_string()
                                 }
                             }
                         }
                     },
                 }
+            }
+            // Attribution export (gap #2): a portable JSON artifact for an agent —
+            // identity + current change set + recorded merges + turns. The git
+            // commit trailer + `refs/notes/taime` note are the in-repo twin.
+            "export_attribution" => self.export_attribution_json(tk),
+            // The agent's recorded provenance merges (the merged-✓ badge / history).
+            "merge_history" => {
+                let merges =
+                    self.store.as_ref().and_then(|s| s.merges_for_agent(tk).ok()).unwrap_or_default();
+                serde_json::json!(merges.iter().map(merge_record_json).collect::<Vec<_>>()).to_string()
             }
             "contention" => self.contention_json(a.get("session").and_then(|v| v.as_str()).unwrap_or("")),
             "workspace_info" => {
@@ -4572,6 +4760,55 @@ mod tests {
         let body = git_in(&proj, &["log", "-1", "--format=%B"]);
         assert!(body.contains("Taime-Archive-Ref: refs/taime/archive/agent-a"), "{body}");
         assert!(body.contains("Taime-Base-Sha:"), "{body}");
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn commit_merge_records_ledger_note_and_export() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let digest = fetch_digest(&mgr, "agent-a");
+
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "commit_merge",
+            &commit_merge_args("agent-a", "main", serde_json::json!({ "a.txt": [0] }), Some(&digest)),
+        ))
+        .unwrap();
+        assert_eq!(v["committed"], true, "{v}");
+        assert_eq!(v["note_written"], true, "git note written: {v}");
+        let commit = v["commit"].as_str().unwrap();
+
+        // The git note (refs/notes/taime) carries the machine-readable record.
+        let note = git_in(&proj, &["notes", "--ref=taime", "show", commit]);
+        let note_json: serde_json::Value = serde_json::from_str(&note).expect("note is JSON");
+        assert_eq!(note_json["schema"], "taime.provenance/v1");
+        assert_eq!(note_json["agent_id"], "agent-a");
+        assert_eq!(note_json["reviewed"], false);
+        assert_eq!(note_json["files"][0], "a.txt");
+
+        // merge_history surfaces the ledger row.
+        let hist: serde_json::Value = serde_json::from_str(
+            &mgr.query("merge_history", &serde_json::json!({ "agent_id": "agent-a" }).to_string()),
+        )
+        .unwrap();
+        let rows = hist.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one recorded merge: {hist}");
+        assert_eq!(rows[0]["target"], "main");
+        assert_eq!(rows[0]["scope"], "full");
+
+        // export_attribution returns the portable agent artifact.
+        let exp: serde_json::Value = serde_json::from_str(
+            &mgr.query("export_attribution", &serde_json::json!({ "agent_id": "agent-a" }).to_string()),
+        )
+        .unwrap();
+        assert_eq!(exp["schema"], "taime.attribution/v1");
+        assert_eq!(exp["agent_id"], "agent-a");
+        assert_eq!(exp["provider"], "claude_code");
+        assert_eq!(exp["merges"].as_array().unwrap().len(), 1);
+        assert_eq!(exp["merges"][0]["commit"], commit);
+        let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&proj);
     }
 

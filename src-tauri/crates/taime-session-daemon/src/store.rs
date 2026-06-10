@@ -28,7 +28,10 @@ use taime_protocol::{StoreHealth, WorktreeInfo};
 /// L13). Bump when the schema changes so a future gating migration can branch.
 /// v12: worktree archive-then-reclaim — `taime_review_patches` + the
 /// `archive_ref`/`archived_at`/`reclaimed_at` columns on `taime_worktrees`.
-const SCHEMA_VERSION: i64 = 13;
+/// v14: `taime_merges` — the durable provenance-merge ledger (gap #1/#2): one row
+/// per provenance commit, the queryable backing for the merge badge + attribution
+/// export (the git commit trailer + `refs/notes/taime` note are the in-repo twin).
+const SCHEMA_VERSION: i64 = 14;
 
 /// Whether an open-path error is corruption of the database FILE — the class
 /// where moving the file aside and starting fresh is the right recovery.
@@ -151,6 +154,31 @@ pub struct ReviewPatch {
     pub digest: String,
     pub diff_blob: String,
     pub files_changed: i64,
+}
+
+/// One recorded provenance merge (the `taime_merges` ledger, v14). Mirrors the
+/// git commit trailer the merge wrote: who (`agent_id`), where (`target_repo` +
+/// `target_symbol`), what (`commit_sha`, `files`), against what (`base_sha`,
+/// `archive_ref`, `digest`), how much (`scope`/`hunks_*`), and the review opt-in
+/// (`reviewed`). `id` is `None` before insert.
+#[derive(Debug, Clone)]
+pub struct MergeRecord {
+    pub id: Option<i64>,
+    pub agent_id: String,
+    pub target_repo: String,
+    pub target_symbol: String,
+    pub commit_sha: String,
+    pub base_sha: Option<String>,
+    pub archive_ref: Option<String>,
+    pub digest: Option<String>,
+    pub scope: String,
+    pub hunks_selected: i64,
+    pub hunks_total: i64,
+    pub reviewed: bool,
+    pub pushed: bool,
+    pub pr_url: Option<String>,
+    pub files: Vec<String>,
+    pub created_at_unix: u64,
 }
 
 /// A schedule row (the `flows` table; user-facing term is "Schedule").
@@ -921,6 +949,75 @@ impl Store {
             rusqlite::params![agent_id],
         )?;
         Ok(())
+    }
+
+    /// Append a recorded provenance merge to the ledger (v14); returns its rowid.
+    /// Best-effort caller — the git commit + `refs/notes/taime` note are the
+    /// in-repo system of record, so a store failure never loses provenance.
+    pub fn put_merge(&self, m: &MergeRecord) -> rusqlite::Result<i64> {
+        let files_json = serde_json::to_string(&m.files).unwrap_or_else(|_| "[]".to_string());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO taime_merges \
+               (agent_id, target_repo, target_symbol, commit_sha, base_sha, archive_ref, \
+                digest, scope, hunks_selected, hunks_total, reviewed, pushed, pr_url, \
+                files_json, created_at_unix) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                m.agent_id,
+                m.target_repo,
+                m.target_symbol,
+                m.commit_sha,
+                m.base_sha,
+                m.archive_ref,
+                m.digest,
+                m.scope,
+                m.hunks_selected,
+                m.hunks_total,
+                m.reviewed as i64,
+                m.pushed as i64,
+                m.pr_url,
+                files_json,
+                m.created_at_unix as i64,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// An agent's recorded merges, newest first — the merge-badge / attribution
+    /// export read.
+    pub fn merges_for_agent(&self, agent_id: &str) -> rusqlite::Result<Vec<MergeRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, target_repo, target_symbol, commit_sha, base_sha, archive_ref, \
+                    digest, scope, hunks_selected, hunks_total, reviewed, pushed, pr_url, \
+                    files_json, created_at_unix \
+             FROM taime_merges WHERE agent_id = ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![agent_id], |r| {
+                let files_json: String = r.get(14)?;
+                Ok(MergeRecord {
+                    id: Some(r.get(0)?),
+                    agent_id: r.get(1)?,
+                    target_repo: r.get(2)?,
+                    target_symbol: r.get(3)?,
+                    commit_sha: r.get(4)?,
+                    base_sha: r.get(5)?,
+                    archive_ref: r.get(6)?,
+                    digest: r.get(7)?,
+                    scope: r.get(8)?,
+                    hunks_selected: r.get(9)?,
+                    hunks_total: r.get(10)?,
+                    reviewed: r.get::<_, i64>(11)? != 0,
+                    pushed: r.get::<_, i64>(12)? != 0,
+                    pr_url: r.get(13)?,
+                    files: serde_json::from_str(&files_json).unwrap_or_default(),
+                    created_at_unix: r.get::<_, i64>(15)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Read a `taime_meta` key (small daemon-scoped flags, e.g. one-time
@@ -2056,6 +2153,32 @@ CREATE TABLE IF NOT EXISTS taime_review_patches (
     files_changed INTEGER NOT NULL DEFAULT 0,
     created_at_unix INTEGER NOT NULL
 );
+
+-- Provenance-merge ledger (v14, gap #1/#2). One row per provenance commit the
+-- merge path records (commit + Co-authored-by/Taime-* trailer + refs/notes/taime
+-- note). The queryable backing for the merged-✓ badge and the attribution export;
+-- the git commit/note are the in-repo system of record (this is a rebuildable
+-- convenience cache). An agent can merge to several targets, so NOT keyed by
+-- agent_id — append-only with an autoincrement id.
+CREATE TABLE IF NOT EXISTS taime_merges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL,
+    target_repo TEXT NOT NULL,
+    target_symbol TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    base_sha TEXT,
+    archive_ref TEXT,
+    digest TEXT,
+    scope TEXT NOT NULL,
+    hunks_selected INTEGER NOT NULL DEFAULT 0,
+    hunks_total INTEGER NOT NULL DEFAULT 0,
+    reviewed INTEGER NOT NULL DEFAULT 0,
+    pushed INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT,
+    files_json TEXT NOT NULL DEFAULT '[]',
+    created_at_unix INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_merges_agent ON taime_merges(agent_id);
 "#;
 
 #[cfg(test)]
@@ -2577,5 +2700,44 @@ mod tests {
         assert_eq!(store.unwrap().list_sessions().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_ledger_roundtrips_newest_first() {
+        let store = Store::open_at(std::path::Path::new(":memory:")).unwrap();
+        let mk = |commit: &str, sym: &str, reviewed: bool, files: Vec<&str>| MergeRecord {
+            id: None,
+            agent_id: "agent-a".into(),
+            target_repo: "/p".into(),
+            target_symbol: sym.into(),
+            commit_sha: commit.into(),
+            base_sha: Some("base123".into()),
+            archive_ref: Some("refs/taime/archive/agent-a".into()),
+            digest: Some("abcd1234abcd1234".into()),
+            scope: if files.len() == 1 { "partial".into() } else { "full".into() },
+            hunks_selected: files.len() as i64,
+            hunks_total: 2,
+            reviewed,
+            pushed: false,
+            pr_url: None,
+            files: files.into_iter().map(String::from).collect(),
+            created_at_unix: 1000,
+        };
+        let id1 = store.put_merge(&mk("aaa1111", "main", true, vec!["a.txt"])).unwrap();
+        let id2 = store.put_merge(&mk("bbb2222", "agent-b", false, vec!["a.txt", "b.txt"])).unwrap();
+        assert!(id2 > id1, "autoincrement ids");
+
+        let got = store.merges_for_agent("agent-a").unwrap();
+        assert_eq!(got.len(), 2);
+        // Newest first.
+        assert_eq!(got[0].commit_sha, "bbb2222");
+        assert!(!got[0].reviewed);
+        assert_eq!(got[0].scope, "full");
+        assert_eq!(got[0].files, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        assert_eq!(got[1].commit_sha, "aaa1111");
+        assert!(got[1].reviewed);
+        assert_eq!(got[1].target_symbol, "main");
+        // A different agent has no merges.
+        assert!(store.merges_for_agent("agent-z").unwrap().is_empty());
     }
 }
