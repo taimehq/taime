@@ -556,13 +556,43 @@ impl Manager {
         info
     }
 
+    /// How many of a workspace's agents hold ARCHIVED, unmerged work — a durable
+    /// `refs/taime/archive/<id>` snapshot (the reclaimed agent's only copy of its
+    /// changes). This is exactly what a HARD `delete_workspace` would destroy, so
+    /// the UI shows the count and demands a typed confirm before destroying it.
+    pub fn workspace_archived_count(&self, workspace_root: &str) -> usize {
+        let Some(store) = &self.store else { return 0 };
+        store
+            .worktrees_in_workspace(workspace_root)
+            .unwrap_or_default()
+            .iter()
+            .filter(|w| w.archive_ref.is_some())
+            .count()
+    }
+
     /// Tear down a workspace (the "delete workspace" flow): kill every live agent
-    /// provisioned from `workspace_root`, force-remove their isolated worktree
-    /// checkouts, drop their worktree rows + review acks, and delete the
-    /// workspace's tasks. Agents/tasks in OTHER workspaces are untouched. Returns
-    /// `(agents_removed, agents_killed, tasks_deleted)`. Shells out to git
-    /// (worktree removal) — call from a blocking context.
-    pub fn delete_workspace(&self, workspace_root: &str) -> (usize, usize, usize) {
+    /// provisioned from `workspace_root`, reclaim their isolated checkouts, drop
+    /// their worktree rows + review acks, and delete the workspace's tasks.
+    /// Agents/tasks in OTHER workspaces are untouched.
+    ///
+    /// `destroy_archives` gates the only IRREVERSIBLE part — the durable
+    /// `refs/taime/archive/*` snapshots that hold reclaimed agents' unmerged work:
+    ///  - `false` (SOFT, the default): non-lossy. A still-on-disk checkout is
+    ///    archived BEFORE it is reclaimed, and NO archive ref is dropped — so every
+    ///    agent's work survives in git and nothing is silently destroyed. Only the
+    ///    disposable checkouts + Taime's rows/acks/tasks go.
+    ///  - `true` (HARD, opt-in + typed confirm): also `drop_archive_ref` on each
+    ///    archived agent, permanently discarding that unmerged work (git GCs it).
+    ///
+    /// Shared-mode rows point at the user's real project dir — never fs-delete
+    /// those here (the optional folder delete is a separate, guarded step). Returns
+    /// `(agents_removed, agents_killed, tasks_deleted)`. Shells out to git — call
+    /// from a blocking context.
+    pub fn delete_workspace(
+        &self,
+        workspace_root: &str,
+        destroy_archives: bool,
+    ) -> (usize, usize, usize) {
         let Some(store) = &self.store else { return (0, 0, 0) };
         let agents = store.worktrees_in_workspace(workspace_root).unwrap_or_default();
         let agent_ids: Vec<String> = agents.iter().map(|w| w.terminal_id.clone()).collect();
@@ -581,20 +611,27 @@ impl Manager {
         for id in &pty_ids {
             self.kill(id);
         }
-        // Remove isolated worktree checkouts (force) + their rows + review acks +
-        // any archive ref/cached patch (the workspace is being deleted outright,
-        // so the durable archive goes too). Shared-mode rows point at the user's
-        // real project dir — never fs-delete those here (the optional folder
-        // delete is a separate, guarded step).
         for wt in &agents {
             if wt.mode.as_deref() == Some("isolated") {
-                crate::worktree::remove_force(
-                    &wt.worktree_path,
-                    wt.repo_root.as_deref(),
-                    wt.branch.as_deref(),
-                );
-                if let (Some(repo), Some(ar)) = (wt.repo_root.as_deref(), wt.archive_ref.as_deref()) {
-                    crate::worktree::drop_archive_ref(repo, ar);
+                if destroy_archives {
+                    // HARD: force-remove the checkout and DESTROY the durable
+                    // archive ref — the reclaimed agent's only copy of its work.
+                    crate::worktree::remove_force(
+                        &wt.worktree_path,
+                        wt.repo_root.as_deref(),
+                        wt.branch.as_deref(),
+                    );
+                    if let (Some(repo), Some(ar)) =
+                        (wt.repo_root.as_deref(), wt.archive_ref.as_deref())
+                    {
+                        crate::worktree::drop_archive_ref(repo, ar);
+                    }
+                } else if wt.reclaimed_at.is_none() {
+                    // SOFT: snapshot any still-on-disk checkout into the archive ref
+                    // (non-lossy) before reclaiming it, and NEVER drop an archive
+                    // ref — so no unmerged work is silently destroyed. (An archive
+                    // failure keeps the checkout; nothing is lost.)
+                    self.archive_and_reclaim(wt);
                 }
             }
             let _ = store.delete_review_patch(&wt.terminal_id);
@@ -1087,12 +1124,21 @@ impl Manager {
             // Workspace teardown: stop the workspace's agents + delete its tasks
             // (the "delete workspace" flow). Folder deletion is a separate,
             // typed-confirmation step in the app (delete_directory command).
+            "workspace_archived_count" => {
+                let root = a.get("workspace_root").and_then(|v| v.as_str()).unwrap_or("");
+                serde_json::json!({ "count": self.workspace_archived_count(root) }).to_string()
+            }
             "workspace_delete" => {
                 let root = a.get("workspace_root").and_then(|v| v.as_str()).unwrap_or("");
                 if root.is_empty() {
                     serde_json::json!({ "error": "workspace_root required" }).to_string()
                 } else {
-                    let (agents, killed, tasks) = self.delete_workspace(root);
+                    // Destroying the durable archive refs is opt-in only (the UI
+                    // demands a typed confirm first); default is the soft, non-lossy
+                    // teardown that preserves them.
+                    let destroy_archives =
+                        a.get("destroy_archives").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let (agents, killed, tasks) = self.delete_workspace(root, destroy_archives);
                     serde_json::json!({ "ok": true, "agents": agents, "killed": killed, "tasks": tasks })
                         .to_string()
                 }
@@ -3036,13 +3082,60 @@ mod tests {
         store.create_task("t2", "/other", "Other", "", 2).unwrap();
 
         // No live sessions in for_test → killed = 0; 2 agents + 1 task removed.
-        let (agents, killed, tasks) = mgr.delete_workspace("/ws");
+        // destroy_archives=false (soft) — the default safe teardown.
+        let (agents, killed, tasks) = mgr.delete_workspace("/ws", false);
         assert_eq!((agents, killed, tasks), (2, 0, 1));
 
         // The target workspace is gone; the other workspace is untouched.
         assert_eq!(store.worktrees_in_workspace("/ws").unwrap().len(), 0);
         assert!(store.worktree_row("c").unwrap().is_some(), "/other agent survives");
         assert_eq!(store.list_tasks("/other", true).unwrap().len(), 1, "/other tasks survive");
+    }
+
+    #[test]
+    fn soft_delete_preserves_archive_refs_hard_delete_destroys_them() {
+        // The default (soft) delete must NOT destroy a reclaimed agent's only copy
+        // of its work — its refs/taime/archive/<id> snapshot. Only an explicit hard
+        // delete (the typed-confirm path) may.
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let root = proj.to_string_lossy().into_owned();
+
+        // Agent A: real changes → reclaim → archived (now holds an archive ref).
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("work.rs"), "fn agent() {}\n").unwrap();
+        assert!(mgr.reclaim_agent("agent-a"), "reclaim archives the work");
+        assert!(crate::worktree::archive_ref_exists(&root, "agent-a"), "agent-a archived");
+        assert_eq!(mgr.workspace_archived_count(&root), 1, "one archived-but-unmerged agent");
+
+        // SOFT delete: the rows go, but the archive ref SURVIVES — no unmerged work
+        // is silently destroyed.
+        mgr.delete_workspace(&root, false);
+        assert_eq!(mgr.store().unwrap().worktrees_in_workspace(&root).unwrap().len(), 0, "rows gone");
+        assert!(
+            crate::worktree::archive_ref_exists(&root, "agent-a"),
+            "SOFT delete preserves the durable archive ref"
+        );
+
+        // A second archived agent, then HARD delete destroys ITS ref (typed-confirm
+        // path). agent-a's earlier-preserved ref is independent and stays.
+        let wt2 = seed_isolated_agent(&mgr, &proj, "agent-b");
+        std::fs::write(wt2.join("more.rs"), "fn b() {}\n").unwrap();
+        assert!(mgr.reclaim_agent("agent-b"));
+        assert!(crate::worktree::archive_ref_exists(&root, "agent-b"));
+        assert_eq!(mgr.workspace_archived_count(&root), 1, "only agent-b's row remains");
+
+        mgr.delete_workspace(&root, true); // destroy_archives = true
+        assert!(
+            !crate::worktree::archive_ref_exists(&root, "agent-b"),
+            "HARD delete drops the archive ref"
+        );
+        assert!(
+            crate::worktree::archive_ref_exists(&root, "agent-a"),
+            "the soft-preserved ref is untouched by a later hard delete of another agent"
+        );
+
+        let _ = std::fs::remove_dir_all(&proj);
     }
 
     #[test]

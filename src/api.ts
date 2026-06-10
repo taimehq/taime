@@ -452,17 +452,36 @@ export const api = {
   },
 
   /** Tear down a workspace daemon-side (the "delete workspace" flow): stop every
-   *  agent provisioned from it, remove their worktrees + rows, and delete the
-   *  workspace's tasks. Returns counts (or an error). Folder deletion is a
-   *  separate, typed-confirmation step (deleteDirectory). */
-  deleteWorkspaceData: (workspaceRoot: string) =>
+   *  agent provisioned from it, reclaim their checkouts, remove their rows, and
+   *  delete the workspace's tasks. Returns counts (or an error).
+   *
+   *  `destroyArchives` gates the only IRREVERSIBLE part — the durable
+   *  `refs/taime/archive/*` snapshots of reclaimed agents' UNMERGED work. Default
+   *  (false) = soft, non-lossy: archives are PRESERVED. Pass true only behind the
+   *  typed-confirm path. Folder deletion is a separate typed-confirm step
+   *  (deleteDirectory). */
+  deleteWorkspaceData: (workspaceRoot: string, destroyArchives = false) =>
     daemonQuery<{
       ok?: boolean;
       agents?: number;
       killed?: number;
       tasks?: number;
       error?: string;
-    }>("workspace_delete", { workspace_root: workspaceRoot }, { ok: false, error: "daemon unavailable" }),
+    }>(
+      "workspace_delete",
+      { workspace_root: workspaceRoot, destroy_archives: destroyArchives },
+      { ok: false, error: "daemon unavailable" },
+    ),
+
+  /** How many of a workspace's agents hold ARCHIVED, unmerged work (a durable
+   *  `refs/taime/archive/*` snapshot). This is exactly what a HARD delete
+   *  destroys — the dialog shows the count and demands a typed confirm. */
+  workspaceArchivedCount: (workspaceRoot: string) =>
+    daemonQuery<{ count: number }>(
+      "workspace_archived_count",
+      { workspace_root: workspaceRoot },
+      { count: 0 },
+    ),
 
   // ── Durable review acks (the daemon merge gate's ack) ─────────────────────
   /** Persist that the user acknowledged an agent's current changes — so the ack
