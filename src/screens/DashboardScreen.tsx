@@ -156,7 +156,7 @@ export function DashboardScreen() {
   );
   const runningAgents = agents.filter((a) => a.status === "running");
   // "Needs review" = agents with dirty changes the user hasn't acknowledged
-  // (the same predicate the context-switch guard runs on).
+  // (dirty count > 0 and no standing review ack — the merge gate's predicate).
   const needsReview = Object.keys(dirty).filter(
     (id) => dirty[id].count > 0 && !reviewedFrames[id],
   ).length;
@@ -482,7 +482,7 @@ function TaskStatusChip({ status }: { status: string }) {
 }
 
 /** One task card: title, lifecycle chip, member + running counts, and the
- *  unreviewed-dirty rollup when present. Click → Tasks section (guarded). */
+ *  unreviewed-dirty rollup when present. Click → Tasks section. */
 function TaskCard({
   task,
   rollup,
@@ -529,7 +529,7 @@ function TaskCard({
 }
 
 /** One uncategorized-agent row: status · provider · mono agent id · branch ·
- *  unreviewed-dirty chip. Click focuses (or reopens) it in Agents — guarded. */
+ *  unreviewed-dirty chip. Click focuses (or reopens) it in Agents. */
 function UncatAgentRow({ meta }: { meta: RustPtyMeta }) {
   const frame = useStore((s) =>
     s.frames.find((f) => f.ptySessionId === meta.ptySessionId),

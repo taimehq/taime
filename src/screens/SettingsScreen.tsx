@@ -1,11 +1,11 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Folder, X } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 import { dataDir, join } from "@tauri-apps/api/path";
 import { useStore } from "../store";
 import { daemonQuery } from "../pty";
 import { inTauri } from "../backend";
-import type { AgentProfileInfo, ProviderInfo } from "../api";
+import { api, type AgentProfileInfo, type ProviderInfo, type ReclaimableAgent } from "../api";
 import { PROVIDER_ORDER, PROVIDER_VENDOR, providerTitle } from "../lib/providerLabel";
 import { basename, dirname } from "../lib/recentProjects";
 import { middleTruncate } from "../lib/format";
@@ -332,6 +332,8 @@ function WorkspaceTab() {
         </p>
       </div>
 
+      <FinishedAgentsCleanup />
+
       <div className="border-t border-ink-700 pt-3">
         <div className="flex items-center justify-between">
           <div className="text-xs font-medium text-zinc-200">
@@ -379,6 +381,115 @@ function WorkspaceTab() {
         )}
       </div>
     </section>
+  );
+}
+
+/** Compact "Xd / Xh / Xm ago" from a unix-seconds timestamp (or "" if null). */
+function agoLabel(unixSecs: number | null): string {
+  if (!unixSecs) return "";
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - unixSecs);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+/**
+ * Clean up finished agents (archive-then-reclaim): the daemon keeps one disposable
+ * worktree checkout per agent; reclaiming snapshots that work into the repo
+ * (`refs/taime/archive/*`) and removes the checkout. NON-LOSSY — a reclaimed agent
+ * stays fully reviewable and mergeable from its archive. Steady-state retention
+ * reclaims automatically; this panel is the "clean up now" convenience.
+ */
+function FinishedAgentsCleanup() {
+  const [items, setItems] = useState<ReclaimableAgent[] | null>(null);
+  const [busy, setBusy] = useState<Set<string>>(new Set());
+  const [cleaningAll, setCleaningAll] = useState(false);
+
+  const load = useCallback(() => {
+    api.listReclaimable().then((r) => setItems(r ?? []));
+  }, []);
+  useEffect(() => {
+    load();
+    const timer = setInterval(load, 5000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  const reclaimOne = async (id: string) => {
+    setBusy((b) => new Set(b).add(id));
+    await api.reclaimAgent(id);
+    await load();
+    setBusy((b) => {
+      const n = new Set(b);
+      n.delete(id);
+      return n;
+    });
+  };
+  const reclaimAll = async () => {
+    if (!items || items.length === 0) return;
+    setCleaningAll(true);
+    // Sequential so the daemon shells out to git one reclaim at a time.
+    for (const it of items) await api.reclaimAgent(it.agent_id);
+    await load();
+    setCleaningAll(false);
+  };
+
+  const count = items?.length ?? 0;
+  return (
+    <div className="border-t border-ink-700 pt-3">
+      <div className="flex items-center justify-between">
+        <div className="text-xs font-medium text-zinc-200">Finished agents</div>
+        {count > 0 && (
+          <button
+            onClick={reclaimAll}
+            disabled={cleaningAll}
+            className="rounded px-1.5 py-0.5 text-[10px] text-zinc-400 hover:text-zinc-200 disabled:opacity-50"
+          >
+            {cleaningAll ? "Cleaning up…" : `Clean up ${count}`}
+          </button>
+        )}
+      </div>
+      <p className="mt-1 text-[11px] leading-relaxed text-zinc-600">
+        Snapshots each finished agent's work into the repo
+        (refs/taime/archive/*) and reclaims its disposable checkout. The agent
+        stays fully reviewable and mergeable afterward — nothing is lost.
+      </p>
+      {items === null ? (
+        <p className="mt-1.5 text-[11px] text-zinc-600">
+          {inTauri() ? "loading…" : "unavailable outside the app"}
+        </p>
+      ) : count === 0 ? (
+        <p className="mt-1.5 text-[11px] text-zinc-600">
+          Nothing to clean up — every checkout is live or already reclaimed.
+        </p>
+      ) : (
+        <ul className="mt-1.5 flex flex-col gap-0.5">
+          {items.map((it) => (
+            <li
+              key={it.agent_id}
+              className="group/reclaim flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-ink-600/60"
+            >
+              <span className="shrink-0 font-mono text-xs text-zinc-200" title={it.agent_id}>
+                {it.agent_id}
+              </span>
+              <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-zinc-600">
+                {it.project_root ? basename(it.project_root) : ""}
+              </span>
+              <span className="shrink-0 text-[10px] text-zinc-600">
+                {agoLabel(it.created_at)}
+              </span>
+              <button
+                onClick={() => reclaimOne(it.agent_id)}
+                disabled={busy.has(it.agent_id)}
+                className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-zinc-500 opacity-0 hover:text-zinc-200 focus-visible:opacity-100 disabled:opacity-50 group-hover/reclaim:opacity-100"
+              >
+                {busy.has(it.agent_id) ? "…" : "Clean up"}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 

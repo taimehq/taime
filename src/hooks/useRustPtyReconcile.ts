@@ -58,7 +58,7 @@ export function useRustPtyReconcile() {
       for (const s of sessions) adopt(s);
       applyDaemonStatuses(sessions);
       // Hydrate durable review acks so "I already reviewed this" survives a
-      // UI/daemon restart (the guard state was frontend-only before).
+      // UI/daemon restart (the review-ack state was frontend-only before).
       const reviewed = await api.reviewedAgents();
       if (alive && reviewed.length) useStore.getState().hydrateReviewed(reviewed);
       bootDone = true;

@@ -10,6 +10,7 @@ import {
   FileText,
   GitMerge,
   Undo2,
+  Archive,
 } from "lucide-react";
 import {
   api,
@@ -415,12 +416,28 @@ export function DiffView() {
       <div className="flex items-center justify-between gap-3 border-b border-ink-600 bg-ink-800 px-4 py-2.5">
         <div className="flex min-w-0 items-center gap-3 text-sm">
           <span className="shrink-0 font-semibold text-zinc-100">{agentName}</span>
-          {worktree?.mode === "isolated" && worktree.branch && (
+          {worktree?.reclaimed ? (
+            <span
+              title="This agent's worktree was reclaimed — its work is preserved in the repo (refs/taime/archive/*), and this diff renders from that archive. Still fully reviewable and mergeable."
+              className="flex shrink-0 items-center gap-1.5 rounded-md border border-ink-600 px-2 py-0.5 font-mono text-[11px] text-zinc-400"
+            >
+              <Archive size={12} />
+              archived
+            </span>
+          ) : worktree?.mode === "isolated" && worktree.branch ? (
             <span className="flex shrink-0 items-center gap-1.5 rounded-md border border-ink-600 px-2 py-0.5 font-mono text-[11px] text-teal-300">
               <GitBranch size={12} />
               {worktree.branch}
             </span>
-          )}
+          ) : worktree?.mode === "isolated" ? (
+            <span
+              title="This agent runs in its own isolated worktree (detached from any branch); changes are attributed to it by file."
+              className="flex shrink-0 items-center gap-1.5 rounded-md border border-ink-600 px-2 py-0.5 font-mono text-[11px] text-zinc-400"
+            >
+              <GitBranch size={12} />
+              isolated
+            </span>
+          ) : null}
           {worktree?.mode === "shared" && (
             <span className="shrink-0 rounded-md border border-ink-600 px-2 py-0.5 text-[11px] text-zinc-500">
               shared dir (heuristic)
@@ -547,7 +564,8 @@ export function DiffView() {
             {!loading && files.length === 0 && !reviewTrusted ? (
               // Daemon down / load failed: the empty file list is a FALLBACK,
               // not a verified "no changes" — say so, and offer no Mark
-              // reviewed (acknowledging unseen changes would disarm the guard).
+              // reviewed (acknowledging unseen changes would falsely clear the
+              // review-needed state).
               <div className="flex h-full flex-col items-center justify-center px-6 text-center">
                 <GitMerge size={32} className="text-zinc-600" />
                 <p className="mt-3 text-sm text-zinc-300">
@@ -566,9 +584,11 @@ export function DiffView() {
                 <GitMerge size={32} className="text-zinc-600" />
                 <p className="mt-3 text-sm text-zinc-300">No changes to review</p>
                 <p className="mt-1 max-w-sm text-[12px] text-zinc-400">
-                  {worktree?.mode === "isolated"
-                    ? `This agent's worktree (${worktree.branch ?? "branch"}) has no changes vs its base yet.`
-                    : "No uncommitted changes in the shared working directory."}
+                  {worktree?.reclaimed
+                    ? "This agent's worktree was reclaimed and had no changes to preserve."
+                    : worktree?.mode === "isolated"
+                      ? `This agent's isolated worktree${worktree.branch ? ` (${worktree.branch})` : ""} has no changes vs its base yet.`
+                      : "No uncommitted changes in the shared working directory."}
                 </p>
                 <button
                   onClick={onMarkReviewed}

@@ -350,11 +350,12 @@ interface Store {
   sidebarCollapsed: boolean;
 
   // navigation
-  /** Switch the rail section — guarded: leaving the agents section with an
-   *  agent's unreviewed work raises the context-switch guard instead. */
+  /** Switch the rail section. Navigation is instant and unconditional — the
+   *  old context-switch guard (which blocked leaving agents with unreviewed
+   *  work) was removed; attribution is always-on, so nothing needs gating. */
   setSection: (section: Section) => void;
-  /** Navigate to a task (Tasks section), optionally deep-linking to a tab —
-   *  guarded the same way as setSection. */
+  /** Navigate to a task (Tasks section), optionally deep-linking to a tab.
+   *  Instant and unconditional, like setSection. */
   selectTask: (taskId: string, tab?: TaskTab) => void;
   /** The Task screen consumes the one-shot deep-link tab, then clears it. */
   clearTaskInitialTab: () => void;
@@ -1123,7 +1124,7 @@ export const useStore = create<Store>((set, get) => ({
     }
     // Deliberately NO clearDirty here: clearing also resets the DAEMON's
     // accumulated dirty set — the durable "this agent has unreviewed work"
-    // signal (badges, the switch guard, review notifications). Only review
+    // signal (badges, the merge gate, review notifications). Only review
     // actions (Mark reviewed) may reset it; closing a view is not a review.
   },
 

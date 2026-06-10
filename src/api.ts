@@ -291,6 +291,21 @@ export interface WorktreeInfo {
   member_of?: string | null;
   /** Task membership (null ⇒ Uncategorized). */
   task_id?: string | null;
+  /** Archive-then-reclaim state: true once the physical checkout has been
+   *  reclaimed and the diff renders from `refs/taime/archive/*`. */
+  reclaimed?: boolean;
+  archived_at?: number | null;
+  reclaimed_at?: number | null;
+}
+
+/** A finished agent whose worktree checkout is still on disk and can be reclaimed
+ *  (archived into `refs/taime/archive/*`, then the checkout removed). */
+export interface ReclaimableAgent {
+  agent_id: string;
+  project_root: string | null;
+  worktree_path: string;
+  created_at: number | null;
+  task_id: string | null;
 }
 
 export interface LaunchIsolation {
@@ -449,7 +464,7 @@ export const api = {
       error?: string;
     }>("workspace_delete", { workspace_root: workspaceRoot }, { ok: false, error: "daemon unavailable" }),
 
-  // ── Durable review acks (the safe-context-switch guard) ───────────────────
+  // ── Durable review acks (the daemon merge gate's ack) ─────────────────────
   /** Persist that the user acknowledged an agent's current changes — so the ack
    *  survives a UI/daemon restart (it was frontend-local before). Resolves
    *  `false` when the ack was NOT durably recorded (daemon down or persistence
@@ -458,10 +473,10 @@ export const api = {
   markReviewed: (agentId: string) =>
     daemonQuery<boolean>("mark_reviewed", { agent_id: agentId }, false),
   /** Drop an agent's standing ack: its dirty set grew past what was
-   *  acknowledged, so new changes must re-raise the guard. */
+   *  acknowledged, so new changes need a fresh ack. */
   clearReviewed: (agentId: string) =>
     daemonQuery<boolean>("clear_reviewed", { agent_id: agentId }, true),
-  /** Agent ids with a standing review ack — hydrates the guard on boot. */
+  /** Agent ids with a standing review ack — hydrates the ack state on boot. */
   reviewedAgents: () => daemonQuery<string[]>("reviewed", {}, []),
 
   /** The daemon's agents (its registry is the only roster); the tmux-shaped
@@ -489,6 +504,19 @@ export const api = {
 
   getWorktree: (id: string) =>
     daemonQueryStrict<WorktreeInfo | null>("worktree", { agent_id: id }),
+
+  // ── Worktree retention (archive-then-reclaim) ─────────────────────────────
+  /** Finished (not-live) agents whose worktree checkout is still on disk —
+   *  the cleanup panel's list. Reclaiming archives first, so nothing is lost. */
+  listReclaimable: () => daemonQuery<ReclaimableAgent[]>("reclaimable", {}, []),
+  /** Archive + reclaim one agent's checkout NOW. The agent stays fully
+   *  reviewable and mergeable from its archive afterwards. */
+  reclaimAgent: (agentId: string) =>
+    daemonQuery<{ ok: boolean; agent_id: string }>(
+      "reclaim_agent",
+      { agent_id: agentId },
+      { ok: false, agent_id: agentId },
+    ),
 
   /** Provision a daemon-owned worktree for an agent (Phase 3). */
   provisionWorktree: async (body: {
@@ -577,7 +605,8 @@ export const api = {
 
   // The review-surface reads are STRICT (reject on daemon-down, never a typed
   // fallback): an empty diff from a dead daemon is indistinguishable from "no
-  // changes", and rendering it as authoritative disarms the review guard.
+  // changes", and rendering it as authoritative would invite an ack of unseen
+  // changes.
   getFileDiffs: (id: string) =>
     daemonQueryStrict<FileDiffsResponse>("file_diffs", { agent_id: id }),
 

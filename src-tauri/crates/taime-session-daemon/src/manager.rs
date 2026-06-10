@@ -133,6 +133,61 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Read a `u64` tunable from the environment, falling back to `default`. Used for
+/// the worktree retention caps (grace / keep-recent / max-idle), so they're
+/// configurable without a config surface.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+}
+
+/// Pure victim-selection for the retention sweep (extracted so the cap/grace
+/// logic is unit-testable without git/fs/env). `physical` is the non-reclaimed
+/// ISOLATED worktrees newest-provisioned first (the recency rank the count cap
+/// protects). A worktree is reclaimed when it is dead (not in `live`), isolated,
+/// past the `grace`, AND either ranks beyond the `keep` most-recent checkouts OR
+/// is older than `max_idle` (0 ⇒ no age cap). Live agents and within-grace rows
+/// are never victims — and since archive-then-reclaim is non-lossy, an evicted
+/// agent stays fully reviewable from its archive.
+fn select_reclaim_victims<'a>(
+    physical: &'a [crate::store::WorktreeRow],
+    live: &std::collections::HashSet<String>,
+    now: u64,
+    grace: u64,
+    keep: usize,
+    max_idle: u64,
+) -> Vec<&'a crate::store::WorktreeRow> {
+    physical
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, w)| {
+            if live.contains(&w.terminal_id) {
+                return None;
+            }
+            if w.mode.as_deref() != Some("isolated") {
+                return None;
+            }
+            let age = now.saturating_sub(w.created_at.unwrap_or(0));
+            if age < grace {
+                return None;
+            }
+            let over_count = rank >= keep;
+            let over_age = max_idle > 0 && age >= max_idle;
+            (over_count || over_age).then_some(w)
+        })
+        .collect()
+}
+
+/// Where an agent's review/diff surfaces are rendered from (see
+/// [`Manager::review_source`]).
+enum ReviewSource {
+    /// The agent's live worktree checkout is on disk; diff it against `base`.
+    Live { cwd: String, base: Option<String> },
+    /// The checkout was reclaimed; render from the cached patch + archive ref.
+    Archive { repo_root: String, patch: crate::store::ReviewPatch },
+    /// The checkout was reclaimed and had no changes — there is no diff.
+    Empty,
+}
+
 /// Clears an `AtomicBool` single-flight latch on scope exit (even on early return
 /// or panic). Used to guard the gc tick + cron check against re-entry.
 struct FlagGuard<'a>(&'a AtomicBool);
@@ -461,9 +516,11 @@ impl Manager {
         for id in &pty_ids {
             self.kill(id);
         }
-        // Remove isolated worktree checkouts (force) + their rows + review acks.
-        // Shared-mode rows point at the user's real project dir — never fs-delete
-        // those here (the optional folder delete is a separate, guarded step).
+        // Remove isolated worktree checkouts (force) + their rows + review acks +
+        // any archive ref/cached patch (the workspace is being deleted outright,
+        // so the durable archive goes too). Shared-mode rows point at the user's
+        // real project dir — never fs-delete those here (the optional folder
+        // delete is a separate, guarded step).
         for wt in &agents {
             if wt.mode.as_deref() == Some("isolated") {
                 crate::worktree::remove_force(
@@ -471,7 +528,11 @@ impl Manager {
                     wt.repo_root.as_deref(),
                     wt.branch.as_deref(),
                 );
+                if let (Some(repo), Some(ar)) = (wt.repo_root.as_deref(), wt.archive_ref.as_deref()) {
+                    crate::worktree::drop_archive_ref(repo, ar);
+                }
             }
+            let _ = store.delete_review_patch(&wt.terminal_id);
             let _ = store.delete_worktree_row(&wt.terminal_id);
             let _ = store.clear_reviewed(&wt.terminal_id);
         }
@@ -692,6 +753,33 @@ impl Manager {
         (cwd, None)
     }
 
+    /// Where to render an agent's review surfaces from: its live worktree
+    /// checkout, or — once the checkout has been reclaimed — its archive (the
+    /// cached patch + `refs/taime/archive/*` ref). The diff surfaces dispatch on
+    /// this so a reclaimed agent stays fully reviewable and mergeable.
+    fn review_source(&self, agent_id: &str) -> ReviewSource {
+        if let Some(store) = &self.store {
+            if let Ok(Some(w)) = store.worktree_row(agent_id) {
+                if w.reclaimed_at.is_some() {
+                    // Reclaimed: render from the archive. A clean agent has no
+                    // cached patch (nothing was kept) ⇒ an empty diff.
+                    return match store.get_review_patch(agent_id) {
+                        Ok(Some(patch)) => ReviewSource::Archive {
+                            repo_root: w.repo_root.unwrap_or_default(),
+                            patch,
+                        },
+                        _ => ReviewSource::Empty,
+                    };
+                }
+                let base = if w.mode.as_deref() == Some("isolated") { w.base_sha } else { None };
+                return ReviewSource::Live { cwd: w.worktree_path, base };
+            }
+        }
+        // No worktree row: a shared / low-level agent — diff its live session cwd.
+        let cwd = self.session_by_attribution(agent_id).map(|s| s.cwd()).unwrap_or_default();
+        ReviewSource::Live { cwd, base: None }
+    }
+
     /// Whether the agent has a standing review ack — the merge gate's read.
     /// `None` store ⇒ `false`: the gate fails closed without persistence.
     fn has_review_ack(&self, agent_id: &str) -> bool {
@@ -753,24 +841,53 @@ impl Manager {
             serde_json::from_str(args_json).unwrap_or_else(|_| serde_json::json!({}));
         let tk = a.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
-            "terminal_diff" => {
-                let (cwd, base) = self.diff_context(tk);
-                crate::diff::terminal_diff(tk, &cwd, base.as_deref()).to_string()
-            }
-            "file_diffs" => {
-                let (cwd, base) = self.diff_context(tk);
-                crate::diff::file_diffs(tk, &cwd, base.as_deref()).to_string()
-            }
-            "hunked_diff" => {
-                let (cwd, base) = self.diff_context(tk);
-                crate::diff::hunked_diff(tk, &cwd, base.as_deref()).to_string()
-            }
+            "terminal_diff" => match self.review_source(tk) {
+                ReviewSource::Live { cwd, base } => {
+                    crate::diff::terminal_diff(tk, &cwd, base.as_deref()).to_string()
+                }
+                ReviewSource::Archive { patch, .. } => {
+                    crate::diff::terminal_diff_archived(tk, &patch.diff_blob).to_string()
+                }
+                ReviewSource::Empty => serde_json::json!({
+                    "agent_id": tk, "working_directory": null, "is_git": true,
+                    "diff": "", "files_changed": 0, "files": [], "error": null
+                })
+                .to_string(),
+            },
+            "file_diffs" => match self.review_source(tk) {
+                ReviewSource::Live { cwd, base } => {
+                    crate::diff::file_diffs(tk, &cwd, base.as_deref()).to_string()
+                }
+                ReviewSource::Archive { repo_root, patch } => {
+                    crate::diff::file_diffs_archived(tk, &repo_root, &patch.base_sha, &patch.archive_ref)
+                        .to_string()
+                }
+                ReviewSource::Empty => serde_json::json!({ "agent_id": tk, "files": [] }).to_string(),
+            },
+            "hunked_diff" => match self.review_source(tk) {
+                ReviewSource::Live { cwd, base } => {
+                    crate::diff::hunked_diff(tk, &cwd, base.as_deref()).to_string()
+                }
+                ReviewSource::Archive { patch, .. } => {
+                    crate::diff::hunked_diff_archived(tk, &patch.base_sha, &patch.diff_blob).to_string()
+                }
+                ReviewSource::Empty => serde_json::json!({
+                    "agent_id": tk, "base": null, "digest": null, "files": []
+                })
+                .to_string(),
+            },
             "apply_selection" => {
-                let (cwd, base) = self.diff_context(tk);
+                let src = self.review_source(tk);
                 let symbol = a.get("target_dir").and_then(|v| v.as_str()).unwrap_or("self");
                 let mode = a.get("mode").and_then(|v| v.as_str()).unwrap_or("merge");
                 let sel = a.get("selections").cloned().unwrap_or_else(|| serde_json::json!({}));
                 let digest = a.get("expected_digest").and_then(|v| v.as_str());
+                let err_json = |e: String| {
+                    serde_json::json!({
+                        "applied": false, "target_dir": symbol, "files": [], "conflicts": [], "error": e
+                    })
+                    .to_string()
+                };
                 // The merge gate, enforced where the merge happens — not by UI
                 // placement. Agents work autonomously and never auto-merge; this
                 // governs only the explicit, user-initiated merge of an agent's
@@ -787,7 +904,7 @@ impl Manager {
                 // An empty selection map is refused outright — "everything,
                 // implicitly" is never an explicit selection (the review surfaces
                 // always send explicit selections).
-                let resolved = if sel.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                let gate: Result<(), String> = if sel.as_object().map(|o| o.is_empty()).unwrap_or(true) {
                     Err("nothing selected — fetch hunked_diff and select hunks".to_string())
                 } else if mode == "revert" && symbol != "self" {
                     Err(format!("revert only applies to the agent's own worktree, not '{symbol}'"))
@@ -800,17 +917,49 @@ impl Manager {
                 } else if mode != "revert" && digest.is_none() {
                     Err("merge refused: missing expected_digest (the hunked_diff fingerprint of the reviewed changes)".to_string())
                 } else {
-                    self.resolve_apply_target(tk, &cwd, symbol)
+                    Ok(())
                 };
-                match resolved {
-                    Ok(target) => {
-                        crate::diff::apply_selection(&cwd, base.as_deref(), &target, mode, &sel, digest)
-                            .to_string()
-                    }
-                    Err(e) => serde_json::json!({
-                        "applied": false, "target_dir": symbol, "files": [], "conflicts": [], "error": e
-                    })
-                    .to_string(),
+                match gate {
+                    Err(e) => err_json(e),
+                    Ok(()) => match src {
+                        ReviewSource::Live { cwd, base } => {
+                            match self.resolve_apply_target(tk, &cwd, symbol) {
+                                Ok(target) => crate::diff::apply_selection(
+                                    &cwd, base.as_deref(), &target, mode, &sel, digest,
+                                )
+                                .to_string(),
+                                Err(e) => err_json(e),
+                            }
+                        }
+                        // A reclaimed agent has no checkout to revert into; its work
+                        // lives in the archive and can only be merged forward.
+                        ReviewSource::Archive { repo_root, patch } => {
+                            if mode == "revert" {
+                                err_json(
+                                    "revert is unavailable: this agent's worktree was reclaimed — its work lives in the archive. Merge it forward instead.".to_string(),
+                                )
+                            } else {
+                                // cwd is unused for 'main'/sibling targets (resolved
+                                // from the worktree row, not the gone checkout).
+                                match self.resolve_apply_target(tk, "", symbol) {
+                                    Ok(target) => crate::diff::apply_selection_archived(
+                                        &repo_root,
+                                        &patch.archive_ref,
+                                        &patch.diff_blob,
+                                        &target,
+                                        mode,
+                                        &sel,
+                                        digest,
+                                    )
+                                    .to_string(),
+                                    Err(e) => err_json(e),
+                                }
+                            }
+                        }
+                        ReviewSource::Empty => {
+                            err_json("nothing to apply: this agent made no changes".to_string())
+                        }
+                    },
                 }
             }
             "contention" => self.contention_json(a.get("session").and_then(|v| v.as_str()).unwrap_or("")),
@@ -825,16 +974,16 @@ impl Manager {
                     s.clear_fs_dirty();
                 }
                 // A reset dirty set begins a fresh review cycle — drop any standing
-                // review ack so subsequent changes re-raise the guard (durable
-                // review state; the in-memory flag used to just linger).
+                // review ack so subsequent changes re-flag the agent as needs-review
+                // (durable review state; the in-memory flag used to just linger).
                 if let Some(store) = &self.store {
                     let _ = store.clear_reviewed(tk);
                 }
                 "true".to_string()
             }
-            // Durable review acks (the safe-context-switch guard). The app
-            // records an ack when the user proceeds past the guard / marks reviewed,
-            // and hydrates `reviewed` on boot so the ack survives a restart.
+            // Durable review acks (the merge gate's ack). The app records an
+            // ack when the user marks an agent reviewed, and hydrates `reviewed`
+            // on boot so the ack survives a restart.
             "mark_reviewed" => {
                 // Honest result: an ack that wasn't durably recorded must not
                 // report success — the merge gate reads the store, so a client
@@ -849,7 +998,7 @@ impl Manager {
             }
             // Drop a standing ack without touching the watcher's dirty
             // accumulation (unlike clear_dirty): the agent changed more files
-            // after the ack, so the app re-arms the guard.
+            // after the ack, so the app re-flags it as needs-review.
             "clear_reviewed" => {
                 if let Some(store) = &self.store {
                     let _ = store.clear_reviewed(tk);
@@ -860,6 +1009,15 @@ impl Manager {
                 let ids =
                     self.store.as_ref().and_then(|s| s.reviewed_agents().ok()).unwrap_or_default();
                 serde_json::json!(ids).to_string()
+            }
+            // Worktree retention (archive-then-reclaim): the cleanup panel's read
+            // (reclaimable, not-live agents) + the explicit "clean up now" action.
+            // Reclaim archives first (non-lossy) — the agent stays fully reviewable
+            // and mergeable from the archive afterwards.
+            "reclaimable" => self.reclaimable_json(),
+            "reclaim_agent" => {
+                let ok = self.reclaim_agent(tk);
+                serde_json::json!({ "ok": ok, "agent_id": tk }).to_string()
             }
             // Workspace teardown: stop the workspace's agents + delete its tasks
             // (the "delete workspace" flow). Folder deletion is a separate,
@@ -1091,6 +1249,12 @@ impl Manager {
                     "provider": w.provider,
                     "member_of": w.member_of,
                     "task_id": w.task_id,
+                    // Archive-then-reclaim state: when `reclaimed` is true the
+                    // physical checkout is gone and the diff renders from the
+                    // archive — the UI shows a "reviewing from archive" hint.
+                    "archived_at": w.archived_at,
+                    "reclaimed_at": w.reclaimed_at,
+                    "reclaimed": w.reclaimed_at.is_some(),
                 })
                 .to_string();
             }
@@ -2351,16 +2515,119 @@ impl Manager {
         self.gc_running.store(false, Ordering::SeqCst);
     }
 
-    /// Garbage-collect dead agents' isolated worktrees (startup + every ~10min,
-    /// off the hot loop via spawn_blocking — this shells out to git). DELETION
-    /// IS CONSERVATIVE: only checkouts with a clean tree AND a branch still at
-    /// its provision base are removed (plus their `taime/…` branch). Anything
-    /// with uncommitted or committed work is the user's output and is kept —
-    /// the attribution trail (and any opt-in review before merge) depends on
-    /// it. Shared-mode rows (the
-    /// user's real project dir) and live agents are never touched. The
-    /// `taime_worktrees` ROW always survives: it's the durable Agent-ID anchor
-    /// for attribution history.
+    /// Archive-then-reclaim a dead agent's isolated worktree: snapshot its full
+    /// state into `refs/taime/archive/<id>`, cache the rendered review patch, then
+    /// remove the physical checkout. NON-LOSSY — every durable write lands BEFORE
+    /// the checkout is deleted, and a clean worktree (nothing to keep) skips
+    /// straight to removal. The `taime_worktrees` row survives as the Agent-ID
+    /// attribution anchor; its diff renders from the archive thereafter. Returns
+    /// `true` when the checkout was reclaimed. A snapshot failure keeps the
+    /// checkout (never reclaim what we couldn't preserve). Caller must have gated
+    /// on isolated mode + not-live.
+    fn archive_and_reclaim(&self, w: &crate::store::WorktreeRow) -> bool {
+        let Some(store) = &self.store else { return false };
+        let Some(repo) = w.repo_root.as_deref() else { return false };
+        let base = w.base_sha.as_deref().unwrap_or("");
+        let now = now_unix();
+        let outcome =
+            crate::worktree::archive_agent(&w.terminal_id, &w.worktree_path, repo, base);
+        match outcome {
+            crate::worktree::ArchiveOutcome::Archived(res) => {
+                // Durable record BEFORE deletion (crash-safe / idempotent).
+                let _ = store.put_review_patch(
+                    &crate::store::ReviewPatch {
+                        agent_id: w.terminal_id.clone(),
+                        base_sha: res.base_sha.clone(),
+                        archive_ref: res.archive_ref.clone(),
+                        digest: res.digest.clone(),
+                        diff_blob: res.diff_blob.clone(),
+                        files_changed: res.files_changed as i64,
+                    },
+                    now,
+                );
+                let _ = store.mark_archived(&w.terminal_id, Some(&res.archive_ref), now);
+                crate::worktree::reclaim_checkout(&w.worktree_path, repo, w.branch.as_deref());
+                let _ = store.mark_reclaimed(&w.terminal_id, now);
+                self.worktrees_gced.lock().unwrap().insert(w.terminal_id.clone());
+                true
+            }
+            crate::worktree::ArchiveOutcome::NoChanges => {
+                // Clean worktree: nothing to preserve, just reclaim.
+                let _ = store.mark_archived(&w.terminal_id, None, now);
+                crate::worktree::reclaim_checkout(&w.worktree_path, repo, w.branch.as_deref());
+                let _ = store.mark_reclaimed(&w.terminal_id, now);
+                self.worktrees_gced.lock().unwrap().insert(w.terminal_id.clone());
+                true
+            }
+            crate::worktree::ArchiveOutcome::Failed(e) => {
+                eprintln!(
+                    "[taime-daemon] archive {} failed, keeping checkout: {e}",
+                    w.terminal_id
+                );
+                false
+            }
+        }
+    }
+
+    /// Explicitly reclaim one agent's checkout NOW (the cleanup UI's "clean up
+    /// now" / dismiss). Archives first (non-lossy), bypasses the retention caps,
+    /// but still refuses a LIVE agent. Returns `true` if reclaimed.
+    pub fn reclaim_agent(&self, agent_id: &str) -> bool {
+        let Some(store) = &self.store else { return false };
+        let live = {
+            let map = self.sessions.lock().unwrap();
+            map.values().any(|s| s.attribution_key().as_deref() == Some(agent_id))
+        };
+        if live {
+            return false;
+        }
+        let Ok(Some(w)) = store.worktree_row(agent_id) else { return false };
+        if w.mode.as_deref() != Some("isolated") || w.reclaimed_at.is_some() {
+            return false;
+        }
+        let did = self.archive_and_reclaim(&w);
+        self.touch();
+        did
+    }
+
+    /// The reclaimable surface for the cleanup UI: every dead (not-live) isolated
+    /// agent whose checkout is still on disk, with how much it would free. Returns
+    /// `(agent_id, files_changed_estimate, reclaimed_already)` is overkill — we
+    /// expose JSON the panel consumes directly.
+    pub fn reclaimable_json(&self) -> String {
+        let Some(store) = &self.store else { return "[]".to_string() };
+        let live: std::collections::HashSet<String> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|s| s.attribution_key())
+            .collect();
+        let physical = store.physical_isolated_worktrees().unwrap_or_default();
+        let items: Vec<serde_json::Value> = physical
+            .iter()
+            .filter(|w| !live.contains(&w.terminal_id))
+            .map(|w| {
+                serde_json::json!({
+                    "agent_id": w.terminal_id,
+                    "project_root": w.project_root,
+                    "worktree_path": w.worktree_path,
+                    "created_at": w.created_at,
+                    "task_id": w.task_id,
+                })
+            })
+            .collect();
+        serde_json::json!(items).to_string()
+    }
+
+    /// Retention sweep (startup + every ~10min, off the hot loop via
+    /// spawn_blocking — shells out to git). The worktree is a disposable sandbox;
+    /// attribution is the archive. A dead agent's checkout is archived into
+    /// `refs/taime/archive/*` and then reclaimed — NON-LOSSY (the snapshot lands
+    /// first). Reclaim is driven by caps: keep the most-recent `KEEP_RECENT`
+    /// checkouts for fast live review, reclaim the rest, and age-evict any past
+    /// `MAX_IDLE`. Live agents, shared-mode rows, and worktrees within the grace
+    /// are never touched; the `taime_worktrees` ROW always survives.
     pub fn sweep_worktrees(&self) {
         let Some(store) = &self.store else { return };
         // Snapshot live keys under the sessions lock, then release (lock
@@ -2372,39 +2639,66 @@ impl Manager {
             .values()
             .filter_map(|s| s.attribution_key())
             .collect();
-        // Min-age gate (TOCTOU): a row exists one IPC round-trip before its
-        // agent registers as live — never consider rows younger than this.
-        const MIN_AGE_SECS: u64 = 600;
-        let rows = store
-            .gc_candidate_worktrees(now_unix().saturating_sub(MIN_AGE_SECS))
-            .unwrap_or_default();
-        let (mut removed, mut kept) = (0usize, 0usize);
-        for w in rows {
-            if live.contains(&w.terminal_id) {
-                continue;
-            }
+        let now = now_unix();
+        let grace = env_u64("TAIME_WORKTREE_RECLAIM_GRACE_SECS", 600);
+        let keep = env_u64("TAIME_WORKTREE_KEEP", 25) as usize;
+        let max_idle = env_u64("TAIME_WORKTREE_MAX_IDLE_DAYS", 14).saturating_mul(86_400);
+        // All physical (non-reclaimed) isolated checkouts, newest-provisioned
+        // first — the recency rank that the count cap protects.
+        let physical = store.physical_isolated_worktrees().unwrap_or_default();
+        let victims = select_reclaim_victims(&physical, &live, now, grace, keep, max_idle);
+        let mut reclaimed = 0usize;
+        for w in victims {
             if self.worktrees_gced.lock().unwrap().contains(&w.terminal_id) {
                 continue;
             }
-            let Some(repo) = w.repo_root.as_deref() else { continue };
-            match crate::worktree::gc_one(
-                &w.worktree_path,
-                repo,
-                w.branch.as_deref(),
-                w.base_sha.as_deref(),
-            ) {
-                crate::worktree::GcOutcome::Removed => {
-                    removed += 1;
-                    self.worktrees_gced.lock().unwrap().insert(w.terminal_id.clone());
-                }
-                crate::worktree::GcOutcome::KeptHasWork => kept += 1,
-                crate::worktree::GcOutcome::KeptUnverified(_) => {}
+            if self.archive_and_reclaim(w) {
+                reclaimed += 1;
             }
         }
-        if removed > 0 {
+        if reclaimed > 0 {
             eprintln!(
-                "[taime-daemon] worktree gc: removed {removed} clean checkout(s), \
-                 kept {kept} with work"
+                "[taime-daemon] worktree retention: archived + reclaimed {reclaimed} checkout(s)"
+            );
+        }
+    }
+
+    /// One-time collapse migration (archive-then-reclaim rollout): archive AND
+    /// reclaim EVERY existing dead isolated worktree, regardless of the retention
+    /// caps, so the historical pile of per-agent checkouts becomes
+    /// `refs/taime/archive/*` refs and `git branch` settles to main-only. Guarded
+    /// by a `taime_meta` marker so it runs exactly once. Live agents are skipped
+    /// (they'll be reclaimed by the normal sweep after they exit).
+    pub fn collapse_worktrees_once(&self) {
+        let Some(store) = &self.store else { return };
+        if store.meta_get("worktree_collapse_v12").ok().flatten().is_some() {
+            return;
+        }
+        let live: std::collections::HashSet<String> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|s| s.attribution_key())
+            .collect();
+        let physical = store.physical_isolated_worktrees().unwrap_or_default();
+        let mut reclaimed = 0usize;
+        for w in &physical {
+            if live.contains(&w.terminal_id) {
+                continue;
+            }
+            if w.mode.as_deref() != Some("isolated") {
+                continue;
+            }
+            if self.archive_and_reclaim(w) {
+                reclaimed += 1;
+            }
+        }
+        let _ = store.meta_set("worktree_collapse_v12", &now_unix().to_string());
+        if reclaimed > 0 {
+            eprintln!(
+                "[taime-daemon] one-time worktree collapse: archived + reclaimed {reclaimed} \
+                 pre-existing checkout(s) into refs/taime/archive/*"
             );
         }
     }
@@ -3532,5 +3826,159 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn reclaimed_agent_stays_reviewable_and_mergeable_from_archive() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        // A modification + a brand-new file — the agent's full change set.
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        std::fs::write(wt.join("generated.rs"), "fn agent_made_this() {}\n").unwrap();
+
+        // The live hunked surface, for a before/after comparison.
+        let live: serde_json::Value = serde_json::from_str(
+            &mgr.query("hunked_diff", &serde_json::json!({ "agent_id": "agent-a" }).to_string()),
+        )
+        .unwrap();
+        let live_paths: Vec<String> = live["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["path"].as_str().map(String::from))
+            .collect();
+        assert!(live_paths.iter().any(|p| p == "a.txt"));
+        assert!(live_paths.iter().any(|p| p == "generated.rs"));
+
+        // Reclaim: archive the worktree, then remove the physical checkout.
+        assert!(mgr.reclaim_agent("agent-a"), "reclaim should succeed for a dead agent");
+        assert!(!wt.exists(), "physical checkout reclaimed");
+        let wjson: serde_json::Value = serde_json::from_str(
+            &mgr.query("worktree", &serde_json::json!({ "agent_id": "agent-a" }).to_string()),
+        )
+        .unwrap();
+        assert_eq!(wjson["reclaimed"], true, "row marks the agent reclaimed");
+
+        // STILL reviewable — now rendered from the archive, with the same files.
+        let arch: serde_json::Value = serde_json::from_str(
+            &mgr.query("hunked_diff", &serde_json::json!({ "agent_id": "agent-a" }).to_string()),
+        )
+        .unwrap();
+        let arch_paths: Vec<String> = arch["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["path"].as_str().map(String::from))
+            .collect();
+        assert!(arch_paths.iter().any(|p| p == "a.txt"), "archived diff still shows the edit");
+        assert!(
+            arch_paths.iter().any(|p| p == "generated.rs"),
+            "archived diff still shows the new file"
+        );
+
+        // file_diffs (side-by-side) reconstructs both sides from the refs.
+        let fd: serde_json::Value = serde_json::from_str(
+            &mgr.query("file_diffs", &serde_json::json!({ "agent_id": "agent-a" }).to_string()),
+        )
+        .unwrap();
+        let a_entry = fd["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "a.txt")
+            .expect("a.txt present in archived file_diffs");
+        assert!(a_entry["original"].as_str().unwrap().contains("two"), "original side from base");
+        assert!(a_entry["modified"].as_str().unwrap().contains("TWO"), "modified side from archive");
+
+        // STILL mergeable — the selected hunks merge into 'main' from the archive,
+        // and the agent-created file lands in the project checkout.
+        let v = ui_merge(
+            &mgr,
+            "agent-a",
+            "main",
+            serde_json::json!({ "a.txt": [0], "generated.rs": [0] }),
+        );
+        assert_eq!(v["applied"], true, "merge-from-archive failed: {v}");
+        assert!(std::fs::read_to_string(proj.join("a.txt")).unwrap().contains("TWO"));
+        assert_eq!(
+            std::fs::read_to_string(proj.join("generated.rs")).unwrap(),
+            "fn agent_made_this() {}\n",
+        );
+
+        // Revert is unavailable post-reclaim (no checkout to revert into).
+        ack_review(&mgr, "agent-a");
+        let rev: serde_json::Value = serde_json::from_str(&mgr.query(
+            "apply_selection",
+            &serde_json::json!({
+                "agent_id": "agent-a", "target_dir": "self", "mode": "revert",
+                "selections": { "a.txt": [0] }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        assert_eq!(rev["applied"], false, "revert of a reclaimed agent is refused");
+
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn retention_caps_pick_oldest_eligible_victims() {
+        fn wt(id: &str, created: u64) -> crate::store::WorktreeRow {
+            crate::store::WorktreeRow {
+                terminal_id: id.into(),
+                project_root: Some("/p".into()),
+                repo_root: Some("/p".into()),
+                worktree_path: format!("/wt/{id}"),
+                branch: None,
+                base_sha: Some("base".into()),
+                mode: Some("isolated".into()),
+                provider: Some("claude_code".into()),
+                member_of: None,
+                task_id: None,
+                created_at: Some(created),
+                archived_at: None,
+                reclaimed_at: None,
+                archive_ref: None,
+            }
+        }
+        let ids = |v: Vec<&crate::store::WorktreeRow>| {
+            let mut s: Vec<String> = v.iter().map(|w| w.terminal_id.clone()).collect();
+            s.sort();
+            s
+        };
+        // Newest-provisioned first (the rank the count cap protects).
+        let physical = vec![wt("new", 900), wt("mid", 500), wt("old", 100)];
+        let now = 1000;
+        let none = std::collections::HashSet::new();
+
+        // Count cap: keep the 1 newest, reclaim the rest (no age cap, no grace).
+        assert_eq!(
+            ids(select_reclaim_victims(&physical, &none, now, 0, 1, 0)),
+            vec!["mid".to_string(), "old".to_string()]
+        );
+        // Age cap alone (keep all by count): only the one older than max_idle.
+        // ages: new=100, mid=500, old=900 ⇒ max_idle=600 evicts only `old`.
+        assert_eq!(
+            ids(select_reclaim_victims(&physical, &none, now, 0, 99, 600)),
+            vec!["old".to_string()]
+        );
+        // Grace protects the youngest even when the count cap would evict it.
+        // keep=0 ⇒ all over-count; grace=200 spares `new` (age 100 < 200).
+        assert_eq!(
+            ids(select_reclaim_victims(&physical, &none, now, 200, 0, 0)),
+            vec!["mid".to_string(), "old".to_string()]
+        );
+        // A live agent is never a victim (here `mid`).
+        let live: std::collections::HashSet<String> = ["mid".to_string()].into_iter().collect();
+        assert_eq!(
+            ids(select_reclaim_victims(&physical, &live, now, 0, 0, 0)),
+            vec!["new".to_string(), "old".to_string()]
+        );
+        // A shared-mode row is never a victim, even at rank beyond the cap.
+        let mut mixed = physical.clone();
+        mixed.push(crate::store::WorktreeRow { mode: Some("shared".into()), ..wt("shared", 1) });
+        let victims = ids(select_reclaim_victims(&mixed, &none, now, 0, 0, 0));
+        assert!(!victims.contains(&"shared".to_string()), "shared row spared: {victims:?}");
     }
 }

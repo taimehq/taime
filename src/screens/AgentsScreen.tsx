@@ -4,7 +4,7 @@ import { AgentDetail } from "./agents/AgentDetail";
 
 /**
  * The Agents section. Default view is the existing multi-terminal shell grid
- * (frames, guarded switching, reattach — unchanged). When exactly one agent
+ * (frames, frame switching, reattach — unchanged). When exactly one agent
  * is focused (the existing focus-mode semantics: layoutMode "focus" + the
  * active frame), the focused AgentDetail view takes over: identity header,
  * Terminal | Console | Diff | Activity. Pending/placeholder frames stay on

@@ -438,7 +438,7 @@ describe("closeFrame", () => {
     expect(closeView).toHaveBeenCalledWith("sess-1"); // detach — close ≠ kill
     expect(killSession).not.toHaveBeenCalled();
     // Closing a view is NOT a review: the daemon's accumulated dirty set (the
-    // unreviewed-work signal behind badges/guard/notifications) must survive,
+    // unreviewed-work signal behind badges/merge-gate/notifications) must survive,
     // and so must the local mirror.
     expect(clearDaemonDirty).not.toHaveBeenCalled();
     expect(s.dirty["term-1"]).toEqual({ count: 2, paths: ["a.ts", "b.ts"] });

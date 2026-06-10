@@ -32,6 +32,37 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
+/// Run a git command with extra environment (e.g. `GIT_INDEX_FILE` for a
+/// throwaway snapshot index, or a stable `GIT_*_NAME/EMAIL` so `commit-tree`
+/// works in a worktree that has no user identity configured).
+fn run_git_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> std::io::Result<std::process::Output> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(cwd).args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output()
+}
+
+/// `run_git_env` + trimmed-stdout-on-success (mirrors [`git_stdout`]).
+fn git_stdout_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Option<String> {
+    let out = run_git_env(cwd, args, env).ok()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    } else {
+        None
+    }
+}
+
+/// Whether `rel_path`'s basename is a transient temp/swap/backup file — the same
+/// rule the fs watcher and the diff surfaces use, so archive snapshots never
+/// capture write-churn noise (`foo.md.tmp.<pid>.<hash>`, `notes~`, …).
+fn is_transient(rel_path: &str) -> bool {
+    let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    crate::fswatch::is_transient_file(name)
+}
+
 fn fnv1a32(s: &str) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for b in s.bytes() {
@@ -74,86 +105,187 @@ fn shared(project_root: &str, agent_id: &str, error: Option<String>) -> Worktree
     }
 }
 
-/// Outcome of a GC attempt on one provisioned worktree.
-#[derive(Debug, PartialEq, Eq)]
-pub enum GcOutcome {
-    /// Checkout (+ branch) removed — provably worthless: clean tree, branch tip
-    /// still at the provision base.
-    Removed,
-    /// Kept: uncommitted changes or commits beyond base — that is the user's
-    /// in-progress work, preserved for attribution and any review before merge.
-    KeptHasWork,
-    /// Kept: state couldn't be verified (git error). Never delete what we
-    /// can't prove worthless.
-    KeptUnverified(String),
+/// What an agent's worktree held when we tried to archive it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveOutcome {
+    /// Snapshot written to `refs/taime/archive/<id>`; the cached render patch is
+    /// returned. The checkout is now safe to reclaim — nothing is lost.
+    Archived(ArchiveResult),
+    /// The worktree was clean at its provision base — there was nothing to keep.
+    /// Safe to reclaim directly (no ref, no patch).
+    NoChanges,
+    /// Could not snapshot (missing inputs / git error). The caller MUST keep the
+    /// checkout — we never reclaim what we couldn't preserve.
+    Failed(String),
 }
 
-/// Garbage-collect ONE dead agent's isolated worktree, conservatively.
-/// Removes the checkout and its `taime/…` branch ONLY when both are provably
-/// worthless: `git status --porcelain` is empty AND the branch tip still
-/// equals `base_sha`. Shared-mode rows must never reach here (the "worktree
-/// path" is the user's real project dir) — callers gate on `mode`.
-pub fn gc_one(
+/// The durable record an [`archive_agent`] produced: the keep-around ref + the
+/// cached, rendered review patch (and its digest) for the reclaimed agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveResult {
+    pub archive_ref: String,
+    pub base_sha: String,
+    pub digest: String,
+    pub diff_blob: String,
+    pub files_changed: usize,
+}
+
+/// Snapshot an agent's isolated worktree into `refs/taime/archive/<agent_id>` so
+/// the physical checkout can be reclaimed without losing anything. The snapshot
+/// is a real commit (parent = `base_sha`, tree = the full worktree state INCLUDING
+/// untracked files, transient temps filtered) built through a throwaway index, so
+/// it never touches the worktree's own index/HEAD and works on a detached
+/// (branchless) worktree. Gc-safe (a ref), perfect-fidelity, near-zero marginal
+/// disk (git dedupes objects).
+///
+/// Idempotent and crash-safe: every durable write (the ref + the returned cache)
+/// happens BEFORE the caller deletes anything, and a re-run rewrites the same ref.
+/// Shared-mode rows must never reach here — callers gate on `mode == "isolated"`.
+pub fn archive_agent(
+    agent_id: &str,
     worktree_path: &str,
     repo_root: &str,
-    branch: Option<&str>,
-    base_sha: Option<&str>,
-) -> GcOutcome {
+    base_sha: &str,
+) -> ArchiveOutcome {
     let wt = Path::new(worktree_path);
     let repo = Path::new(repo_root);
+    if base_sha.is_empty() {
+        return ArchiveOutcome::Failed("no base_sha to archive against".into());
+    }
     if !repo.is_dir() {
-        return GcOutcome::KeptUnverified("repo root missing".into());
+        return ArchiveOutcome::Failed("repo root missing".into());
     }
     if !wt.exists() {
-        // Checkout already gone (manual delete / lost disk): prune git's stale
-        // bookkeeping, and drop the branch only when it's still at base.
-        let _ = run_git(repo, &["worktree", "prune"]);
-        if let (Some(b), Some(base)) = (branch, base_sha) {
-            if git_stdout(repo, &["rev-parse", b]).as_deref() == Some(base) {
-                let _ = run_git(repo, &["branch", "-D", b]);
-            }
-        }
-        return GcOutcome::Removed;
+        return ArchiveOutcome::Failed("worktree checkout missing".into());
     }
-    // Uncommitted or untracked changes → user work; keep.
-    let status = match run_git(wt, &["status", "--porcelain"]) {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => return GcOutcome::KeptUnverified("git status failed".into()),
+
+    // A throwaway index so `add -A` (which stages untracked + modifications +
+    // deletions, respecting .gitignore) never disturbs the agent's real index.
+    let tmp_index = std::env::temp_dir()
+        .join(format!("taime-archive-{agent_id}-{:08x}.idx", rand::random::<u32>()));
+    let tmp_index_str = tmp_index.to_string_lossy().to_string();
+    let idx_env = [("GIT_INDEX_FILE", tmp_index_str.as_str())];
+    let cleanup_index = || {
+        let _ = std::fs::remove_file(&tmp_index);
     };
-    if !status.is_empty() {
-        return GcOutcome::KeptHasWork;
+
+    // Start the index at base, then stage the whole worktree, so the resulting
+    // tree diffed against base is exactly the agent's full change set.
+    if !ok(run_git_env(wt, &["read-tree", base_sha], &idx_env)) {
+        cleanup_index();
+        return ArchiveOutcome::Failed("read-tree base failed".into());
     }
-    // Commits beyond the provision base → user work; keep.
-    if let (Some(b), Some(base)) = (branch, base_sha) {
-        match git_stdout(repo, &["rev-parse", b]) {
-            Some(tip) if tip == base => {}
-            Some(_) => return GcOutcome::KeptHasWork,
-            None => return GcOutcome::KeptUnverified("branch tip unreadable".into()),
+    if !ok(run_git_env(wt, &["add", "-A"], &idx_env)) {
+        cleanup_index();
+        return ArchiveOutcome::Failed("git add -A failed".into());
+    }
+    // Drop transient temp/swap/backup files from the snapshot (match the live
+    // review filter so the archived diff is the same change set the user saw).
+    if let Some(staged) = git_stdout_env(wt, &["diff", "--cached", "--name-only", base_sha], &idx_env)
+    {
+        for path in staged.lines().filter(|p| !p.is_empty() && is_transient(p)) {
+            let _ = run_git_env(wt, &["rm", "--cached", "--quiet", "--", path], &idx_env);
         }
     }
-    if !matches!(run_git(repo, &["worktree", "remove", worktree_path]), Ok(o) if o.status.success())
+    let tree = match git_stdout_env(wt, &["write-tree"], &idx_env) {
+        Some(t) => t,
+        None => {
+            cleanup_index();
+            return ArchiveOutcome::Failed("write-tree failed".into());
+        }
+    };
+    cleanup_index();
+
+    // Clean worktree (tree identical to base's tree) ⇒ nothing to preserve.
+    let base_tree = git_stdout(repo, &["rev-parse", &format!("{base_sha}^{{tree}}")]);
+    if base_tree.as_deref() == Some(tree.as_str()) {
+        return ArchiveOutcome::NoChanges;
+    }
+
+    // Commit the tree. A stable identity so `commit-tree` works even when the
+    // worktree has no user.name/email configured.
+    let id_env = [
+        ("GIT_AUTHOR_NAME", "taime"),
+        ("GIT_AUTHOR_EMAIL", "archive@taime.local"),
+        ("GIT_COMMITTER_NAME", "taime"),
+        ("GIT_COMMITTER_EMAIL", "archive@taime.local"),
+    ];
+    let msg = format!("taime archive: agent {agent_id}");
+    let commit = match git_stdout_env(repo, &["commit-tree", &tree, "-p", base_sha, "-m", &msg], &id_env)
     {
-        return GcOutcome::KeptUnverified("git worktree remove failed".into());
+        Some(c) => c,
+        None => return ArchiveOutcome::Failed("commit-tree failed".into()),
+    };
+    let archive_ref = format!("refs/taime/archive/{agent_id}");
+    if !ok(run_git(repo, &["update-ref", &archive_ref, &commit])) {
+        return ArchiveOutcome::Failed("update-ref failed".into());
     }
-    if let Some(b) = branch {
-        // Tip == base verified above, so -D destroys nothing.
-        let _ = run_git(repo, &["branch", "-D", b]);
+
+    // The cached render patch: `git diff base..archive`, plain text (binaries as
+    // "Binary files differ" stubs, exactly like the live review surfaces). The
+    // ref is the system of record for re-merge fidelity; this is the render cache.
+    let diff_blob = run_git(repo, &["diff", base_sha, &commit])
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let files_changed = git_stdout(repo, &["diff", "--name-only", base_sha, &commit])
+        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0);
+    let digest = crate::diff::patch_digest(&diff_blob);
+
+    ArchiveOutcome::Archived(ArchiveResult {
+        archive_ref,
+        base_sha: base_sha.to_string(),
+        digest,
+        diff_blob,
+        files_changed,
+    })
+}
+
+/// Whether a git invocation succeeded.
+fn ok(out: std::io::Result<std::process::Output>) -> bool {
+    matches!(out, Ok(o) if o.status.success())
+}
+
+/// Reclaim a dead agent's physical checkout AFTER its work is archived (or it had
+/// none). Unlocks first (provision locks live worktrees), removes the worktree,
+/// drops any legacy per-agent branch, prunes git's bookkeeping. Best-effort —
+/// never errors. The `taime_worktrees` row and the archive ref survive; only the
+/// disposable checkout goes. NEVER pass a shared-mode path — callers gate on
+/// `mode == "isolated"`; the equality guard in [`remove_force`] also defends it.
+pub fn reclaim_checkout(worktree_path: &str, repo_root: &str, branch: Option<&str>) {
+    let repo = Path::new(repo_root);
+    if repo.is_dir() {
+        // A live worktree is git-locked; a single `--force` won't remove a locked
+        // tree, so unlock first (no-op / harmless error if it wasn't locked).
+        let _ = run_git(repo, &["worktree", "unlock", worktree_path]);
     }
-    GcOutcome::Removed
+    remove_force(worktree_path, Some(repo_root), branch);
+}
+
+/// Delete an agent's archive keep-around ref (`refs/taime/archive/<id>`), for the
+/// "delete workspace" teardown where the durable record is being discarded too.
+/// Best-effort. The snapshot commit becomes unreachable and is GC'd by git.
+pub fn drop_archive_ref(repo_root: &str, archive_ref: &str) {
+    let repo = Path::new(repo_root);
+    if repo.is_dir() {
+        let _ = run_git(repo, &["update-ref", "-d", archive_ref]);
+    }
 }
 
 /// Force-remove a provisioned ISOLATED worktree checkout + its branch, for the
-/// "delete workspace" teardown. Unlike [`gc_one`], this does NOT preserve dirty
-/// or forked work — the user asked to delete the whole workspace. Best-effort:
-/// never errors. NEVER pass a shared-mode `worktree_path` (that's the user's
-/// real project dir) — callers gate on `mode == "isolated"`; the equality guard
-/// below is a second line of defense.
+/// "delete workspace" teardown (and the reclaim path via [`reclaim_checkout`]).
+/// Best-effort: never errors. NEVER pass a shared-mode `worktree_path` (that's
+/// the user's real project dir) — callers gate on `mode == "isolated"`; the
+/// equality guard below is a second line of defense.
 pub fn remove_force(worktree_path: &str, repo_root: Option<&str>, branch: Option<&str>) {
     // Refuse to fs-delete a path that is the repo root itself (shared mode).
     let same_as_repo = repo_root.map(|r| Path::new(r) == Path::new(worktree_path)).unwrap_or(false);
     if let Some(repo) = repo_root {
         let repo = Path::new(repo);
         if repo.is_dir() {
+            // Unlock so `--force` removes even a still-locked live worktree.
+            let _ = run_git(repo, &["worktree", "unlock", worktree_path]);
             let _ = run_git(repo, &["worktree", "remove", "--force", worktree_path]);
             if let Some(b) = branch {
                 let _ = run_git(repo, &["branch", "-D", b]);
@@ -169,10 +301,18 @@ pub fn remove_force(worktree_path: &str, repo_root: Option<&str>, branch: Option
 }
 
 /// Provision (or idempotently resolve) an isolated worktree for `agent_id`.
-/// Branch is `taime/<provider>-<agent_id>`, matching CAO.
+///
+/// BRANCHLESS (the archive-then-reclaim model): the worktree is created with a
+/// DETACHED HEAD at `base_sha`, not on a `taime/<provider>-<agent_id>` branch.
+/// The per-agent branch was functionally inert — diffs use `base_sha`, `git apply`
+/// merges hunks, and attribution is keyed by `agent_id`, never the branch — so
+/// dropping it makes `git branch` show `main` (and only `main`) as a steady state,
+/// while the durable record lives in `refs/taime/archive/*`. We also `git worktree
+/// lock` the live checkout so neither the retention sweep nor an external `git
+/// worktree prune` can reap a running agent's tree.
 pub fn provision(
     project_root: &str,
-    provider: &str,
+    _provider: &str,
     isolate: bool,
     agent_id: &str,
 ) -> WorktreeInfo {
@@ -193,7 +333,6 @@ pub fn provision(
         None => return shared(project_root, agent_id, Some("no commits (empty repo)".into())),
     };
 
-    let branch = format!("taime/{provider}-{agent_id}");
     let wt_dir = worktrees_dir().join(project_slug(&repo_root)).join(agent_id);
     if let Some(parent) = wt_dir.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -205,7 +344,8 @@ pub fn provision(
         project_root: project_root.to_string(),
         repo_root: Some(repo_root.clone()),
         worktree_path: wt_path.clone(),
-        branch: Some(branch.clone()),
+        // Branchless: detached HEAD, no per-agent branch.
+        branch: None,
         base_sha: Some(base_sha.clone()),
         mode: "isolated".to_string(),
         error: None,
@@ -213,29 +353,27 @@ pub fn provision(
 
     // Idempotent reuse: an existing worktree checkout (relaunch on same key).
     if wt_dir.join(".git").exists() {
+        // Re-assert the live lock (a prior daemon may have unlocked it at exit).
+        let _ = run_git(repo, &["worktree", "lock", "--reason", "taime: live agent", &wt_path]);
         return ok;
     }
 
-    // Create a fresh worktree on a new branch; if the branch already exists
-    // (relaunch after a crash that lost the dir), attach to it.
-    let add = run_git(repo, &["worktree", "add", "-b", &branch, &wt_path, &base_sha]);
-    let created = matches!(&add, Ok(o) if o.status.success());
-    if !created {
-        let retry = run_git(repo, &["worktree", "add", &wt_path, &branch]);
+    // Create a fresh detached worktree at base. If git still has stale
+    // bookkeeping for this path (a crash that lost the dir), prune and retry once.
+    let add = run_git(repo, &["worktree", "add", "--detach", &wt_path, &base_sha]);
+    if !matches!(&add, Ok(o) if o.status.success()) {
+        let _ = run_git(repo, &["worktree", "prune"]);
+        let retry = run_git(repo, &["worktree", "add", "--detach", &wt_path, &base_sha]);
         if !matches!(&retry, Ok(o) if o.status.success()) {
             let err = retry
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
                 .unwrap_or_default();
-            // The `-b` attempt can leave a partially-created branch behind (review
-            // L14). It's uniquely ours (agent_id is fresh per provision), so
-            // best-effort delete it before falling back to shared — otherwise it
-            // leaks forever (worktree GC skips shared rows and only -D's a branch
-            // it still has a row for).
-            let _ = run_git(repo, &["branch", "-D", &branch]);
             return shared(project_root, agent_id, Some(format!("git worktree add failed: {err}")));
         }
     }
+    // Lock the live checkout so retention can't reap a running agent's tree.
+    let _ = run_git(repo, &["worktree", "lock", "--reason", "taime: live agent", &wt_path]);
     link_gitignored_deps(repo, &wt_dir);
     ok
 }
@@ -304,72 +442,101 @@ mod tests {
     }
 
     #[test]
-    fn git_repo_provisions_isolated_worktree() {
+    fn git_repo_provisions_branchless_isolated_worktree() {
         let repo = temp_repo();
         let info = provision(repo.to_str().unwrap(), "claude_code", true, "abc12345");
         assert_eq!(info.mode, "isolated", "error: {:?}", info.error);
-        assert_eq!(info.branch.as_deref(), Some("taime/claude_code-abc12345"));
+        // Branchless: no per-agent branch, and `git branch` stays main-only.
+        assert_eq!(info.branch, None, "provision is branchless (detached HEAD)");
         assert!(info.base_sha.is_some());
+        let branches = git_stdout(&repo, &["branch", "--list"]).unwrap_or_default();
+        assert!(
+            !branches.contains("taime/"),
+            "no per-agent branch leaks into `git branch`: {branches:?}"
+        );
+        // The worktree HEAD is detached at base (not on a branch).
         let wt = Path::new(&info.worktree_path);
         assert!(wt.join(".git").exists(), "worktree checkout created");
         assert!(wt.join("README.md").exists(), "tracked file present");
         assert!(wt.join(".env").exists(), ".env copied into worktree");
+        assert_eq!(
+            git_stdout(wt, &["rev-parse", "HEAD"]).as_deref(),
+            info.base_sha.as_deref(),
+            "detached HEAD sits at base"
+        );
 
         // Idempotent: re-provisioning the same key reuses it.
         let again = provision(repo.to_str().unwrap(), "claude_code", true, "abc12345");
         assert_eq!(again.mode, "isolated");
         assert_eq!(again.worktree_path, info.worktree_path);
 
-        // Cleanup.
-        let _ = run_git(&repo, &["worktree", "remove", "--force", &info.worktree_path]);
+        // Cleanup (reclaim unlocks the live lock, then removes).
+        reclaim_checkout(&info.worktree_path, repo.to_str().unwrap(), None);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(Path::new(&info.worktree_path).parent().unwrap());
     }
 
     #[test]
-    fn gc_removes_clean_keeps_dirty_and_forked() {
+    fn archive_then_reclaim_round_trips() {
         let repo = temp_repo();
         let root = repo.to_str().unwrap();
+        let info = provision(root, "claude_code", true, "ar111111");
+        let base = info.base_sha.clone().unwrap();
+        let wt = Path::new(&info.worktree_path);
+        // A modification + an untracked new file + a transient temp that must NOT
+        // be captured.
+        std::fs::write(wt.join("README.md"), "hi\nedited\n").unwrap();
+        std::fs::write(wt.join("new.txt"), "agent created\n").unwrap();
+        std::fs::write(wt.join("README.md.tmp.123.abcdef"), "scratch\n").unwrap();
 
-        // Clean + unforked → removed (checkout AND branch).
-        let a = provision(root, "claude_code", true, "gcaaaaaa");
-        assert_eq!(a.mode, "isolated");
-        assert_eq!(
-            gc_one(&a.worktree_path, root, a.branch.as_deref(), a.base_sha.as_deref()),
-            GcOutcome::Removed
-        );
-        assert!(!Path::new(&a.worktree_path).exists(), "clean checkout deleted");
-        assert!(
-            git_stdout(&repo, &["rev-parse", a.branch.as_deref().unwrap()]).is_none(),
-            "base-only branch deleted"
-        );
+        let res = match archive_agent("ar111111", &info.worktree_path, root, &base) {
+            ArchiveOutcome::Archived(r) => r,
+            other => panic!("expected Archived, got {other:?}"),
+        };
+        assert!(res.diff_blob.contains("new.txt"), "untracked file archived");
+        assert!(res.diff_blob.contains("edited"), "modification archived");
+        assert!(!res.diff_blob.contains(".tmp."), "transient temp filtered out");
+        assert!(res.files_changed >= 2);
+        // The keep-around ref exists and the digest matches the cached patch.
+        assert!(git_stdout(&repo, &["rev-parse", "--verify", &res.archive_ref]).is_some());
+        assert_eq!(res.digest, crate::diff::patch_digest(&res.diff_blob));
 
-        // Uncommitted changes → kept untouched.
-        let b = provision(root, "claude_code", true, "gcbbbbbb");
-        std::fs::write(Path::new(&b.worktree_path).join("wip.txt"), "unreviewed").unwrap();
-        assert_eq!(
-            gc_one(&b.worktree_path, root, b.branch.as_deref(), b.base_sha.as_deref()),
-            GcOutcome::KeptHasWork
-        );
-        assert!(Path::new(&b.worktree_path).join("wip.txt").exists(), "dirty work preserved");
+        // Reclaim: the checkout is gone, but the ref (and thus the work) survives,
+        // and re-diffing the ref reproduces the cached patch byte-for-byte.
+        reclaim_checkout(&info.worktree_path, root, info.branch.as_deref());
+        assert!(!wt.exists(), "physical checkout reclaimed");
+        let from_ref = run_git(&repo, &["diff", &base, &res.archive_ref]).unwrap();
+        let from_ref = String::from_utf8_lossy(&from_ref.stdout).to_string();
+        assert_eq!(from_ref, res.diff_blob, "diff rebuilds identically from the ref");
 
-        // Committed-beyond-base (clean tree) → kept: the branch IS the work.
-        let c = provision(root, "claude_code", true, "gccccccc");
-        let cwt = Path::new(&c.worktree_path);
-        std::fs::write(cwt.join("done.txt"), "committed").unwrap();
-        git(cwt, &["add", "-A"]);
-        git(cwt, &["commit", "-qm", "agent work"]);
-        assert_eq!(
-            gc_one(&c.worktree_path, root, c.branch.as_deref(), c.base_sha.as_deref()),
-            GcOutcome::KeptHasWork
-        );
-        assert!(cwt.exists(), "forked checkout preserved");
+        // Idempotent: archiving again after reclaim fails cleanly (checkout gone),
+        // and the ref is still intact for review/merge.
+        assert!(matches!(
+            archive_agent("ar111111", &info.worktree_path, root, &base),
+            ArchiveOutcome::Failed(_)
+        ));
+        assert!(git_stdout(&repo, &["rev-parse", "--verify", &res.archive_ref]).is_some());
 
-        // Cleanup.
-        for info in [&b, &c] {
-            let _ = run_git(&repo, &["worktree", "remove", "--force", &info.worktree_path]);
+        let wt_parent = wt.parent().map(|p| p.to_path_buf());
+        let _ = std::fs::remove_dir_all(&repo);
+        if let Some(p) = wt_parent {
+            let _ = std::fs::remove_dir_all(p);
         }
-        let wt_parent = Path::new(&b.worktree_path).parent().map(|p| p.to_path_buf());
+    }
+
+    #[test]
+    fn archive_clean_worktree_is_nochanges() {
+        let repo = temp_repo();
+        let root = repo.to_str().unwrap();
+        let info = provision(root, "claude_code", true, "clean000");
+        let base = info.base_sha.clone().unwrap();
+        assert_eq!(
+            archive_agent("clean000", &info.worktree_path, root, &base),
+            ArchiveOutcome::NoChanges,
+            "a clean worktree has nothing to keep"
+        );
+        reclaim_checkout(&info.worktree_path, root, None);
+        let wt_parent = Path::new(&info.worktree_path).parent().map(|p| p.to_path_buf());
         let _ = std::fs::remove_dir_all(&repo);
         if let Some(p) = wt_parent {
             let _ = std::fs::remove_dir_all(p);

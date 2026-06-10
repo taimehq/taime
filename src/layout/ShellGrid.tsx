@@ -36,7 +36,8 @@ export function ShellGrid() {
 
   // Tabs ARE the windows. The "Grid" tab tiles every window; a window tab
   // fullscreens that one frame. In focus, only the active frame is mounted
-  // (switching reconnects/replays). Switching is always guarded.
+  // (switching reconnects/replays). Switching routes through the single
+  // setActiveFrameGuarded entry point (instant — no gate).
   const active = frames.find((f) => f.key === activeFrameKey) ?? frames[0];
 
   return (
@@ -63,7 +64,7 @@ export function ShellGrid() {
 
 /** The shell tab bar — a "Grid" tab (all windows tiled) + one tab per window.
  *  A view over the frames, never a source of truth. Window-tab clicks route
- *  through the guarded switch and fullscreen that frame. */
+ *  through setActiveFrameGuarded and fullscreen that frame. */
 function ShellTabs({
   frames,
   layoutMode,

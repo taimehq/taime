@@ -281,11 +281,14 @@ async fn main() -> anyhow::Result<()> {
     // We hold the liveness lock, so nothing live is touched.
     reap::sweep_orphan_agents();
     manager.reconcile_cleanups_on_boot();
-    // Startup maintenance, off the accept path: GC clean dead worktrees (the
-    // pre-fix leak left checkouts behind forever) + prune aged history rows.
+    // Startup maintenance, off the accept path: a ONE-TIME collapse of the
+    // pre-existing per-agent worktree pile into refs/taime/archive/* (archive
+    // -then-reclaim rollout, guarded so it runs once), the steady-state retention
+    // sweep, then aged-history pruning.
     {
         let m = manager.clone();
         tokio::task::spawn_blocking(move || {
+            m.collapse_worktrees_once();
             m.sweep_worktrees();
             m.prune_history();
         });

@@ -26,7 +26,9 @@ use taime_protocol::{StoreHealth, WorktreeInfo};
 
 /// Current schema level, stamped into `PRAGMA user_version` after migrate (review
 /// L13). Bump when the schema changes so a future gating migration can branch.
-const SCHEMA_VERSION: i64 = 11;
+/// v12: worktree archive-then-reclaim — `taime_review_patches` + the
+/// `archive_ref`/`archived_at`/`reclaimed_at` columns on `taime_worktrees`.
+const SCHEMA_VERSION: i64 = 12;
 
 /// Whether an open-path error is corruption of the database FILE — the class
 /// where moving the file aside and starting fresh is the right recovery.
@@ -122,6 +124,33 @@ pub struct WorktreeRow {
     pub member_of: Option<String>,
     /// Task membership (`None` ⇒ Uncategorized). The durable Task anchor.
     pub task_id: Option<String>,
+    /// Provision time (unix seconds). Drives the retention age/count caps.
+    pub created_at: Option<u64>,
+    /// When this agent's worktree was snapshotted into `refs/taime/archive/*`
+    /// (`None` ⇒ never archived). The work is durable from this point on.
+    pub archived_at: Option<u64>,
+    /// When the physical checkout was reclaimed (`None` ⇒ still on disk). A
+    /// reclaimed row stays the Agent-ID anchor; its diff renders from the archive.
+    pub reclaimed_at: Option<u64>,
+    /// The keep-around ref holding the snapshot (`refs/taime/archive/<id>`),
+    /// `None` until archived (or for a clean worktree that had nothing to keep).
+    pub archive_ref: Option<String>,
+}
+
+/// The cached review patch for a reclaimed agent — the render side of the
+/// archive (the `refs/taime/archive/*` snapshot is the system of record; this is
+/// a rebuildable cache so the diff/review surfaces draw instantly with no
+/// checkout). `diff_blob` is the `git diff <base_sha> <archive_ref>` text and
+/// `digest` is its [`crate::diff::patch_digest`], so the merge gate's staleness
+/// check binds against immutable content.
+#[derive(Debug, Clone)]
+pub struct ReviewPatch {
+    pub agent_id: String,
+    pub base_sha: String,
+    pub archive_ref: String,
+    pub digest: String,
+    pub diff_blob: String,
+    pub files_changed: i64,
 }
 
 /// A schedule row (the `flows` table; user-facing term is "Schedule").
@@ -298,6 +327,13 @@ impl Store {
         add_column(&conn, "ALTER TABLE flows ADD COLUMN workspace_root TEXT")?;
         add_column(&conn, "ALTER TABLE flows ADD COLUMN task_mode TEXT")?;
         add_column(&conn, "ALTER TABLE flows ADD COLUMN task_id TEXT")?;
+        // Worktree archive-then-reclaim (v12): a dead agent's checkout is
+        // snapshotted into `refs/taime/archive/*` (durable work) and then the
+        // physical checkout is reclaimed. The row stays as the Agent-ID anchor;
+        // these columns record the archive ref + the archive/reclaim timestamps.
+        add_column(&conn, "ALTER TABLE taime_worktrees ADD COLUMN archive_ref TEXT")?;
+        add_column(&conn, "ALTER TABLE taime_worktrees ADD COLUMN archived_at INTEGER")?;
+        add_column(&conn, "ALTER TABLE taime_worktrees ADD COLUMN reclaimed_at INTEGER")?;
         // This index references the ALTER-added column, so it must run AFTER the
         // ALTERs (a pre-existing DB's SCHEMA batch ran before task_id existed).
         conn.execute(
@@ -768,24 +804,129 @@ impl Store {
         Ok(rows)
     }
 
-    /// GC-sweep candidates: ISOLATED worktree rows old enough to be safely
-    /// considered (created before `cutoff_unix`). The age gate closes the
-    /// provision→spawn TOCTOU — a row is persisted one IPC round-trip before
-    /// its agent registers as a live session, and a sweep landing in that gap
-    /// would see a fresh, clean, at-base checkout with no live agent and
-    /// delete the cwd the agent is about to spawn into. Legacy rows with NULL
-    /// created_at are treated as old.
-    pub fn gc_candidate_worktrees(&self, cutoff_unix: u64) -> rusqlite::Result<Vec<WorktreeRow>> {
+    /// Every ISOLATED worktree whose physical checkout is still on disk (not yet
+    /// reclaimed), newest-provisioned first. The retention engine's count/age cap
+    /// reads this to pick the oldest eligible victims to reclaim.
+    pub fn physical_isolated_worktrees(&self) -> rusqlite::Result<Vec<WorktreeRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {WORKTREE_COLS} FROM taime_worktrees \
-             WHERE mode IN ('isolated', 'worktree') \
-               AND (created_at IS NULL OR CAST(created_at AS INTEGER) <= ?1)"
+             WHERE mode IN ('isolated', 'worktree') AND reclaimed_at IS NULL \
+             ORDER BY CAST(COALESCE(created_at, '0') AS INTEGER) DESC"
         ))?;
         let rows = stmt
-            .query_map(rusqlite::params![cutoff_unix as i64], map_worktree)?
+            .query_map([], map_worktree)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    // ---- Archive-then-reclaim: the durable record of a reclaimed worktree ----
+
+    /// Record that an agent's worktree was snapshotted into `archive_ref`
+    /// (idempotent). The checkout may still be on disk at this point — reclaim
+    /// follows. `None` ref ⇒ a clean worktree archived with nothing to keep.
+    pub fn mark_archived(
+        &self,
+        agent_id: &str,
+        archive_ref: Option<&str>,
+        now_unix: u64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE taime_worktrees SET archive_ref = ?2, archived_at = ?3 WHERE terminal_id = ?1",
+            rusqlite::params![agent_id, archive_ref, now_unix as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Record that an agent's physical checkout has been reclaimed (removed). The
+    /// row survives as the Agent-ID attribution anchor; its diff now renders from
+    /// the archive.
+    pub fn mark_reclaimed(&self, agent_id: &str, now_unix: u64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE taime_worktrees SET reclaimed_at = ?2 WHERE terminal_id = ?1",
+            rusqlite::params![agent_id, now_unix as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Cache (or replace) the rendered review patch for a reclaimed agent.
+    pub fn put_review_patch(&self, p: &ReviewPatch, now_unix: u64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO taime_review_patches \
+               (agent_id, base_sha, archive_ref, digest, diff_blob, files_changed, created_at_unix) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(agent_id) DO UPDATE SET \
+               base_sha = excluded.base_sha, archive_ref = excluded.archive_ref, \
+               digest = excluded.digest, diff_blob = excluded.diff_blob, \
+               files_changed = excluded.files_changed, created_at_unix = excluded.created_at_unix",
+            rusqlite::params![
+                p.agent_id,
+                p.base_sha,
+                p.archive_ref,
+                p.digest,
+                p.diff_blob,
+                p.files_changed,
+                now_unix as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The cached review patch for a reclaimed agent, if any.
+    pub fn get_review_patch(&self, agent_id: &str) -> rusqlite::Result<Option<ReviewPatch>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT agent_id, base_sha, archive_ref, digest, diff_blob, files_changed \
+             FROM taime_review_patches WHERE agent_id = ?1",
+            rusqlite::params![agent_id],
+            |r| {
+                Ok(ReviewPatch {
+                    agent_id: r.get(0)?,
+                    base_sha: r.get(1)?,
+                    archive_ref: r.get(2)?,
+                    digest: r.get(3)?,
+                    diff_blob: r.get(4)?,
+                    files_changed: r.get(5)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    /// Drop a reclaimed agent's cached patch (the "delete workspace" teardown,
+    /// where the archive ref is also dropped).
+    pub fn delete_review_patch(&self, agent_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM taime_review_patches WHERE agent_id = ?1",
+            rusqlite::params![agent_id],
+        )?;
+        Ok(())
+    }
+
+    /// Read a `taime_meta` key (small daemon-scoped flags, e.g. one-time
+    /// migration markers). `None` if unset.
+    pub fn meta_get(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT value FROM taime_meta WHERE key = ?1",
+            rusqlite::params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+    }
+
+    /// Set a `taime_meta` key (upsert).
+    pub fn meta_set(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO taime_meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
     }
 
     /// Whether `key` is the agent of a currently-running workflow node run
@@ -1115,8 +1256,8 @@ impl Store {
         Ok(n)
     }
 
-    // ---- Durable review acknowledgments (the safe-context-switch guard's
-    // ---- state, persisted so it survives a UI/daemon restart) ----
+    // ---- Durable review acknowledgments (the merge gate's ack, persisted
+    // ---- so it survives a UI/daemon restart) ----
 
     /// Mark an agent's current changes acknowledged (idempotent upsert).
     pub fn mark_reviewed(&self, agent_id: &str, now_unix: u64) -> rusqlite::Result<()> {
@@ -1143,15 +1284,15 @@ impl Store {
     }
 
     /// Drop an agent's review ack — a fresh review cycle (its dirty set was
-    /// reset), so the next change re-raises the guard.
+    /// reset), so the next change requires a fresh ack before merge.
     pub fn clear_reviewed(&self, agent_id: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM taime_reviews WHERE agent_id = ?1", rusqlite::params![agent_id])?;
         Ok(())
     }
 
-    /// Every agent id with a standing review ack — hydrates the UI guard on boot
-    /// so acknowledgments aren't lost across a restart.
+    /// Every agent id with a standing review ack — hydrates the UI's review-ack
+    /// state on boot so acknowledgments aren't lost across a restart.
     pub fn reviewed_agents(&self) -> rusqlite::Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT agent_id FROM taime_reviews")?;
@@ -1581,7 +1722,8 @@ fn map_run(r: &rusqlite::Row) -> rusqlite::Result<WorkflowRunRow> {
 
 /// Column list for a `WorktreeRow` SELECT (kept in sync with [`map_worktree`]).
 const WORKTREE_COLS: &str = "terminal_id, project_root, repo_root, worktree_path, branch, \
-     base_sha, mode, provider, member_of, task_id";
+     base_sha, mode, provider, member_of, task_id, created_at, archived_at, reclaimed_at, \
+     archive_ref";
 
 /// Read-normalize a legacy worktree mode value: pre-v10 rows say `worktree`
 /// where the lexicon (and every app-facing surface) says `isolated`. The
@@ -1610,6 +1752,12 @@ fn map_worktree(r: &rusqlite::Row) -> rusqlite::Result<WorktreeRow> {
         provider: r.get(7)?,
         member_of: r.get(8)?,
         task_id: r.get(9)?,
+        // created_at is a unix-seconds STRING (the upsert stores it that way);
+        // archived_at/reclaimed_at are INTEGER. Parse defensively.
+        created_at: r.get::<_, Option<String>>(10)?.and_then(|s| s.trim().parse::<u64>().ok()),
+        archived_at: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+        reclaimed_at: r.get::<_, Option<i64>>(12)?.map(|v| v as u64),
+        archive_ref: r.get(13)?,
     })
 }
 
@@ -1847,8 +1995,8 @@ CREATE TABLE IF NOT EXISTS taime_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_root ON taime_tasks(workspace_root, status);
 
--- Durable review acknowledgments — the safe-context-switch guard's
--- state. Records which agents' current changes the user has acknowledged, so the
+-- Durable review acknowledgments — the merge gate's ack.
+-- Records which agents' current changes the user has acknowledged, so the
 -- "I already reviewed this" fact survives a UI/daemon restart (it was
 -- frontend-only `reviewedFrames` before, dying with the UI — the worst case for
 -- a long-running / generative session). Keyed by Agent ID; an ack is dropped
@@ -1856,6 +2004,22 @@ CREATE INDEX IF NOT EXISTS idx_tasks_root ON taime_tasks(workspace_root, status)
 CREATE TABLE IF NOT EXISTS taime_reviews (
     agent_id TEXT PRIMARY KEY,
     reviewed_at INTEGER NOT NULL
+);
+
+-- Cached review patch for a reclaimed agent (worktree archive-then-reclaim,
+-- v12). The system of record is the `refs/taime/archive/<id>` snapshot commit;
+-- this row caches the rendered `git diff <base_sha> <archive_ref>` text + its
+-- digest so Review draws instantly with no checkout, and the merge gate's
+-- staleness check binds against now-immutable content. Disposable — rebuildable
+-- from the ref. Keyed by Agent ID.
+CREATE TABLE IF NOT EXISTS taime_review_patches (
+    agent_id TEXT PRIMARY KEY,
+    base_sha TEXT NOT NULL,
+    archive_ref TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    diff_blob TEXT NOT NULL,
+    files_changed INTEGER NOT NULL DEFAULT 0,
+    created_at_unix INTEGER NOT NULL
 );
 "#;
 
@@ -2057,7 +2221,7 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["agent-a".to_string(), "agent-b".to_string()]);
 
-        // A fresh review cycle drops the ack so new changes re-raise the guard.
+        // A fresh review cycle drops the ack so new changes re-flag as needs-review.
         store.clear_reviewed("agent-a").unwrap();
         assert_eq!(store.reviewed_agents().unwrap(), vec!["agent-b".to_string()]);
         // Clearing an unknown id is a harmless no-op.

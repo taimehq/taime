@@ -12,7 +12,7 @@ import { useStore, type Section } from "../store";
  * The 48px icon rail — section navigation only. No agents item (agents are
  * reached through the sidebar / palette / dashboard), no bell, no profile, no
  * brand mark. Active = 2px accent pip + raised bg. All clicks route through
- * the guarded setSection so the context-switch gate applies.
+ * setSection; navigation is instant (no context-switch gate).
  */
 const ITEMS: {
   id: Section;

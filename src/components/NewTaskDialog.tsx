@@ -36,8 +36,7 @@ export function NewTaskDialog({ onClose }: { onClose: () => void }) {
         return; // keep the dialog open; nothing was created
       }
       onClose();
-      // Navigate to the new task (guard-routed — the context-switch gate
-      // still applies if an agent has unreviewed work).
+      // Navigate to the new task (instant — navigation is never gated).
       useStore.getState().selectTask(task.id);
     } finally {
       setBusy(false);

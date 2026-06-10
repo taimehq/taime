@@ -54,7 +54,7 @@ function matches(query: string, hay: string): boolean {
   return q.split(/\s+/).every((t) => h.includes(t));
 }
 
-/** Jump to an agent's terminal in the Agents section (guard-routed). */
+/** Jump to an agent's terminal in the Agents section. */
 function openAgentSession(ptySessionId: string): void {
   const s = useStore.getState();
   s.setSection("agents");
@@ -129,7 +129,7 @@ function PaletteBody() {
       },
     });
 
-    // ── Sections (guard-routed via setSection) ────────────────────────────
+    // ── Sections (routed via setSection) ──────────────────────────────────
     for (const sec of SECTIONS) {
       out.push({
         id: `section:${sec.id}`,
@@ -215,7 +215,7 @@ function PaletteBody() {
             close();
             const s = useStore.getState();
             // Console is a tab of the focused AgentDetail — persist the mode,
-            // then focus the agent (the guard still gates the switch).
+            // then focus the agent.
             s.setTermMode(m.terminalId, "console");
             s.setLayoutMode("focus");
             openAgentSession(m.ptySessionId);

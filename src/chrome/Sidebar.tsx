@@ -199,7 +199,7 @@ function TaskFirstPanel() {
 }
 
 /** One task row: title, lifecycle badge, member count. Click navigates
- *  (guarded) to the Tasks section with this task selected. */
+ *  to the Tasks section with this task selected. */
 function TaskRow({ task, dim }: { task: TaskInfo; dim: boolean }) {
   const selected = useStore(
     (s) => s.section === "tasks" && s.selectedTaskId === task.id,
@@ -359,7 +359,7 @@ function RunningCollapsible() {
 }
 
 /** One agent row: status dot · provider label · mono agent id · dirty chip.
- *  Click focuses (or reopens) the agent in the Agents section — guarded. */
+ *  Click focuses (or reopens) the agent in the Agents section. */
 function AgentRow({ meta }: { meta: RustPtyMeta }) {
   const frame = useStore((s) =>
     s.frames.find((f) => f.ptySessionId === meta.ptySessionId),

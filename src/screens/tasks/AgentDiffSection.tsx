@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   Check,
+  Archive,
   ChevronDown,
   ChevronRight,
   FileMinus,
@@ -267,14 +268,30 @@ export function AgentDiffSection({
         >
           {agentLabel(member.agent_id)}
         </span>
-        {worktree?.branch && (
+        {worktree?.reclaimed ? (
+          <span
+            title="Worktree reclaimed — work preserved in refs/taime/archive/*; this diff renders from the archive."
+            className="flex shrink-0 items-center gap-1 rounded border border-ink-600 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400"
+          >
+            <Archive size={10} />
+            archived
+          </span>
+        ) : worktree?.branch ? (
           <span className="flex shrink-0 items-center gap-1 rounded border border-ink-600 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">
             <GitBranch size={10} />
             <span title={worktree.branch} className="max-w-[180px] truncate whitespace-nowrap">
               {worktree.branch}
             </span>
           </span>
-        )}
+        ) : worktree?.mode === "isolated" ? (
+          <span
+            title="Isolated worktree (detached); changes attributed by file."
+            className="flex shrink-0 items-center gap-1 rounded border border-ink-600 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400"
+          >
+            <GitBranch size={10} />
+            isolated
+          </span>
+        ) : null}
         {worktree?.mode === "shared" && (
           <span className="shrink-0 rounded border border-ink-600 px-1.5 py-0.5 text-[10px] text-zinc-500">
             shared dir (heuristic)

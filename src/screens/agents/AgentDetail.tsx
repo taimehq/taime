@@ -360,7 +360,7 @@ export function AgentDetail({ frame }: { frame: Frame }) {
 
 /**
  * Compact window strip for focus mode: back-to-grid + one tab per frame —
- * the same store actions the shell-grid tabs drive (guarded switching), so
+ * the same store actions the shell-grid tabs drive (frame switching), so
  * keyboard (⌘1–9, ⌘⇧⏎) and mouse stay equivalent.
  */
 function FrameStrip({ activeKey }: { activeKey: string }) {

@@ -431,15 +431,35 @@ pub fn apply_selection(
         }
     }
     let parsed = parse_unified(&raw);
-
-    // Reassemble a patch from the selected hunks.
+    // Source-side content reader for the new-file content compare (live path: the
+    // worktree file on disk).
     let src_top = repo_toplevel(src);
+    let read_src = move |path: &str| std::fs::read(src_top.join(path)).ok();
+    assemble_and_apply(&parsed, &read_src, target_dir, mode, selections)
+}
+
+/// Reassemble a patch from the selected hunks of `parsed` and `git apply` it into
+/// `target_dir` (`--reverse` for revert). The ONLY source-dependent step is the
+/// new-file content compare (an agent-created file that already exists at the
+/// target): `read_src` returns the source-side bytes for a path, so this body
+/// serves BOTH a live worktree and a reclaimed agent's archive ref unchanged.
+/// `parse_unified` + the digest staleness check happen in the caller (they depend
+/// on which patch text the source provides). Returns `{applied, target_dir,
+/// files, conflicts, error}`.
+fn assemble_and_apply(
+    parsed: &[Value],
+    read_src: &dyn Fn(&str) -> Option<Vec<u8>>,
+    target_dir: &str,
+    mode: &str, // "merge" | "revert"
+    selections: &Value,
+) -> Value {
+    // Reassemble a patch from the selected hunks.
     let target_top = repo_toplevel(Path::new(target_dir));
     let mut patch = String::new();
     let mut applied_files: Vec<String> = Vec::new();
     let mut pre_conflicts: Vec<String> = Vec::new();
     let sel_obj = selections.as_object();
-    for file in &parsed {
+    for file in parsed {
         let path = file["path"].as_str().unwrap_or("");
         let want: Option<Vec<i64>> = sel_obj
             .and_then(|o| o.get(path))
@@ -473,7 +493,7 @@ pub fn apply_selection(
         if is_new_file && !is_binary_stub {
             let at_target = target_top.join(path);
             if mode == "merge" && at_target.exists() {
-                let same = std::fs::read(src_top.join(path)).ok() == std::fs::read(&at_target).ok();
+                let same = read_src(path) == std::fs::read(&at_target).ok();
                 if same {
                     applied_files.push(path.to_string()); // already there — no-op
                 } else {
@@ -577,6 +597,152 @@ pub fn apply_selection(
             json!({ "applied": false, "conflicted": false, "target_dir": target_dir, "files": [], "conflicts": [], "error": e.to_string() })
         }
     }
+}
+
+// ---- Archive-side rendering (Phase 2): the SAME review/merge surfaces, served
+// ---- from a reclaimed agent's cached patch + `refs/taime/archive/*` ref instead
+// ---- of a live worktree checkout. The cached patch is `git diff base archive`
+// ---- (so it parses identically to the live `review_patch`); both file sides come
+// ---- from the base/archive refs. ----
+
+/// `git show <ref>:<path>` as `(text, is_binary)` — the ref-backed twin of
+/// [`read_worktree_file`] (size-capped, non-UTF8 ⇒ binary).
+fn read_ref_file(repo: &Path, gitref: &str, path: &str) -> (String, bool) {
+    match git_raw(repo, &["show", &format!("{gitref}:{path}")]) {
+        Ok(o) if o.status.success() => {
+            if o.stdout.len() > MAX_CONTENT_BYTES {
+                (String::new(), false)
+            } else if let Ok(s) = String::from_utf8(o.stdout) {
+                (s, false)
+            } else {
+                (String::new(), true)
+            }
+        }
+        _ => (String::new(), false),
+    }
+}
+
+/// Raw bytes of `git show <ref>:<path>`, `None` if absent — the archive-side
+/// `read_src` for [`assemble_and_apply`]'s new-file content compare.
+fn show_ref_bytes(repo: &Path, gitref: &str, path: &str) -> Option<Vec<u8>> {
+    let out = git_raw(repo, &["show", &format!("{gitref}:{path}")]).ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// Combined diff + changed-file list for a reclaimed agent (the `terminal_diff`
+/// twin). The cached patch IS the diff; the file list is its parsed paths.
+pub fn terminal_diff_archived(agent_id: &str, cached_patch: &str) -> Value {
+    let files: Vec<String> = parse_unified(cached_patch)
+        .iter()
+        .filter_map(|f| f["path"].as_str().map(String::from))
+        .collect();
+    json!({
+        "agent_id": agent_id, "working_directory": null, "is_git": true,
+        "diff": cached_patch, "files_changed": files.len(), "files": files, "error": null
+    })
+}
+
+/// Per-hunk selectable diff for a reclaimed agent (the `hunked_diff` twin). The
+/// digest is the cached patch's — now immutable, so the merge gate's staleness
+/// check is stable across fetch→apply.
+pub fn hunked_diff_archived(agent_id: &str, base: &str, cached_patch: &str) -> Value {
+    json!({
+        "agent_id": agent_id, "base": base,
+        "digest": patch_digest(cached_patch),
+        "files": parse_unified(cached_patch)
+    })
+}
+
+/// Per-file both-sides reconstruction for a reclaimed agent (the `file_diffs`
+/// twin), drawn from the base + archive refs. Untracked files were committed into
+/// the snapshot, so they arrive as ordinary `added` entries — no separate
+/// untracked pass needed.
+pub fn file_diffs_archived(agent_id: &str, repo_root: &str, base: &str, archive_ref: &str) -> Value {
+    let repo = Path::new(repo_root);
+    if !is_git(repo) {
+        return json!({ "agent_id": agent_id, "files": [] });
+    }
+    use std::collections::HashMap;
+    let mut nums: HashMap<String, (i64, i64, bool)> = HashMap::new();
+    for line in git_ok(repo, &["diff", base, archive_ref, "--numstat", "-M"]).unwrap_or_default().lines()
+    {
+        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+        if parts.len() == 3 {
+            let binary = parts[0] == "-";
+            let add = parts[0].parse::<i64>().unwrap_or(0);
+            let del = parts[1].parse::<i64>().unwrap_or(0);
+            nums.insert(parts[2].to_string(), (add, del, binary));
+        }
+    }
+    let mut files: Vec<Value> = Vec::new();
+    for line in git_ok(repo, &["diff", base, archive_ref, "--name-status", "-M"]).unwrap_or_default().lines()
+    {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let code = parts[0];
+        let (status, old_path, new_path) = if code.starts_with('R') && parts.len() >= 3 {
+            ("renamed", Some(parts[1].to_string()), parts[2].to_string())
+        } else if parts.len() >= 2 {
+            let s = match code.chars().next() {
+                Some('A') => "added",
+                Some('D') => "deleted",
+                _ => "modified",
+            };
+            (s, None, parts[1].to_string())
+        } else {
+            continue;
+        };
+        if is_transient(&new_path) {
+            continue;
+        }
+        let (add, del, binary) = nums.get(&new_path).copied().unwrap_or((0, 0, false));
+        let original = if status == "added" {
+            String::new()
+        } else {
+            let from = old_path.as_deref().unwrap_or(&new_path);
+            read_ref_file(repo, base, from).0
+        };
+        let (modified, bin2) = if status == "deleted" {
+            (String::new(), false)
+        } else {
+            read_ref_file(repo, archive_ref, &new_path)
+        };
+        files.push(json!({
+            "path": new_path, "status": status, "old_path": old_path,
+            "original": original, "modified": modified,
+            "additions": add, "deletions": del, "binary": binary || bin2
+        }));
+    }
+    json!({ "agent_id": agent_id, "files": files })
+}
+
+/// Apply selected hunks of a reclaimed agent's cached patch into `target_dir`
+/// (the `apply_selection` twin). The new-file content compare reads the archive
+/// ref instead of a worktree file; everything else is the shared apply core.
+pub fn apply_selection_archived(
+    repo_root: &str,
+    archive_ref: &str,
+    cached_patch: &str,
+    target_dir: &str,
+    mode: &str,
+    selections: &Value,
+    expected_digest: Option<&str>,
+) -> Value {
+    if let Some(exp) = expected_digest {
+        if patch_digest(cached_patch) != exp {
+            return json!({
+                "applied": false, "stale": true, "target_dir": target_dir,
+                "files": [], "conflicts": [],
+                "error": "the diff changed since it was reviewed — reload and review the new changes"
+            });
+        }
+    }
+    let parsed = parse_unified(cached_patch);
+    let repo = Path::new(repo_root).to_path_buf();
+    let read_src = move |path: &str| show_ref_bytes(&repo, archive_ref, path);
+    assemble_and_apply(&parsed, &read_src, target_dir, mode, selections)
 }
 
 #[cfg(test)]

@@ -152,8 +152,8 @@ export class DaemonUnreachableError extends Error {
 /** Strict daemon query: like `daemonQuery`, but a dead daemon REJECTS
  *  (`DaemonUnreachableError`) instead of resolving a typed fallback that is
  *  indistinguishable from real data. The review/trust surfaces use this so
- *  daemon-down can never render as "No changes to review" (the flagship
- *  guard would be disarmed by a falsehood). */
+ *  daemon-down can never render as "No changes to review" (the review gate
+ *  would be defeated by a falsehood). */
 export async function daemonQueryStrict<T>(
   kind: string,
   args: Record<string, unknown>,
