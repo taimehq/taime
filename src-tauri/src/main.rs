@@ -37,6 +37,7 @@ fn main() {
             commands::daemon_ping,
             commands::daemon_incompatible,
             commands::daemon_restart,
+            commands::daemon_store_health,
             commands::daemon_spawn_agent,
             commands::daemon_provision_worktree,
             commands::daemon_send_message,

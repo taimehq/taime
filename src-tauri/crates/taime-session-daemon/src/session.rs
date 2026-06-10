@@ -714,7 +714,7 @@ fn start_fs_watch(inner: &Arc<SessionInner>) {
     }
 }
 
-fn now_unix_secs() -> u64 {
+pub(crate) fn now_unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 

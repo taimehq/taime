@@ -5,6 +5,9 @@
 //! wait/kill), it advertises a per-user Unix socket whose path the app re-derives
 //! deterministically. On relaunch the app adopts the still-running daemon and its
 //! sessions. See `docs/terminal-architecture-plan.md` (Step 2).
+//!
+//! Diagnostics: when spawned detached, stderr is re-pointed from /dev/null at
+//! `<data_dir>/taime/daemon.log` (see `redirect_stderr_to_log`).
 
 mod attribution;
 mod conn;
@@ -171,6 +174,63 @@ fn cleanup(paths: &Paths) {
     let _ = std::fs::remove_file(&paths.lock);
 }
 
+/// Rotation cap for `daemon.log`: at this size the boot path renames it to
+/// `daemon.log.1` (replacing the previous one), so the pair is bounded at
+/// ~2× this. Rotating only at boot is enough of a bound — idle shutdown makes
+/// daemon restarts routine.
+const LOG_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Re-point stderr at `<data_dir>/taime/daemon.log` — but ONLY when it currently
+/// points at /dev/null (the app's detached spawn dup2's all stdio there). Every
+/// `eprintln!` diagnostic in the daemon was literally discarded in production
+/// (the corrupt-store review finding: persistence could die with no trace
+/// anywhere). A foreground run (terminal) or the test harness (pipe) keeps its
+/// stderr — the redirect exists to stop diagnostics being thrown away, not to
+/// move them away from someone already watching.
+fn redirect_stderr_to_log() {
+    use std::os::unix::io::AsRawFd;
+
+    // SAFETY: fstat/stat write into locally-owned zeroed buffers; the path
+    // literal is NUL-terminated.
+    let stderr_is_devnull = unsafe {
+        let mut err_st: libc::stat = std::mem::zeroed();
+        let mut null_st: libc::stat = std::mem::zeroed();
+        libc::fstat(libc::STDERR_FILENO, &mut err_st) == 0
+            && libc::stat(c"/dev/null".as_ptr(), &mut null_st) == 0
+            && err_st.st_dev == null_st.st_dev
+            && err_st.st_ino == null_st.st_ino
+    };
+    if !stderr_is_devnull {
+        return;
+    }
+    // Best-effort throughout: stderr is /dev/null here, so a failure to set up
+    // the log has nowhere to report — just keep the discard behavior.
+    let Some(dir) = store::data_dir() else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("daemon.log");
+    if std::fs::metadata(&path).map(|m| m.len() > LOG_ROTATE_BYTES).unwrap_or(false) {
+        let _ = std::fs::rename(&path, dir.join("daemon.log.1"));
+    }
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    // O_APPEND + dup2 onto stderr; dropping `file` closes only its own fd (the
+    // stderr slot keeps the duplicate). Append mode means a racing second
+    // daemon (other socket path) interleaves lines instead of clobbering.
+    // SAFETY: dup2 of a freshly opened, owned fd onto a standard fd slot.
+    if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } == -1 {
+        return;
+    }
+    eprintln!(
+        "[taime-daemon] ---- boot {} (v{}, pid {}) ----",
+        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z"),
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Per-agent MCP stdio shim mode (Phase 5 transport): bridge the CLI's MCP
@@ -183,6 +243,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(cao_path) = parse_flag_value("--import-cao") {
         return run_import_cao(&cao_path);
     }
+
+    // Daemon proper from here on. Before anything can fail, give a discarded
+    // stderr a real destination — including the lock-conflict exit below.
+    redirect_stderr_to_log();
 
     let paths = match parse_socket_arg() {
         Some(p) => runtime::for_socket(p)?,

@@ -29,10 +29,12 @@ import {
   daemonPing,
   daemonIncompatible,
   daemonRestart,
+  daemonStoreHealth,
   daemonCheckpoint,
   daemonSendMessage,
   type TurnEvent,
   type DaemonSessionSummary,
+  type StoreHealth,
 } from "./pty";
 import { sendToTerminal } from "./lib/terminalInput";
 import { providerTitle, PROVIDER_ORDER } from "./lib/providerLabel";
@@ -245,6 +247,10 @@ interface Store {
   /** A poll saw an incompatible/unresponsive daemon (review M2): the UI offers a
    *  consent-gated restart instead of silently replacing it (which kills agents). */
   daemonIncompatible: boolean;
+  /** Durable-store health from the daemon handshake: `recovered`/`unavailable`
+   *  mean attribution is degraded — surfaced in the backend pill instead of the
+   *  pre-v11 silence. Null until the first healthy contact. */
+  storeHealth: StoreHealth | null;
   terminalStatuses: Record<string, string>;
 
   // navigation (the rail + per-section selection; selections persist across
@@ -536,6 +542,7 @@ export const useStore = create<Store>((set, get) => ({
   agents: [],
   connected: false,
   daemonIncompatible: false,
+  storeHealth: null,
   terminalStatuses: {},
 
   section: "dashboard",
@@ -752,9 +759,19 @@ export const useStore = create<Store>((set, get) => ({
     }
     try {
       const agents = await api.listAgents();
+      // Store health rides the same poll as a cheap cache read — but only AFTER
+      // listAgents settles: its connect may have re-handshaken (daemon swapped
+      // mid-poll), and the read must reflect the daemon that answered, not the
+      // one the ping above saw.
+      const storeHealth = await daemonStoreHealth();
       const prev = get();
-      if (!prev.connected || prev.daemonIncompatible || !jsonEqual(prev.agents, agents)) {
-        set({ agents, connected: true, daemonIncompatible: false });
+      if (
+        !prev.connected ||
+        prev.daemonIncompatible ||
+        !jsonEqual(prev.agents, agents) ||
+        !jsonEqual(prev.storeHealth, storeHealth)
+      ) {
+        set({ agents, connected: true, daemonIncompatible: false, storeHealth });
       }
     } catch {
       if (get().connected) set({ connected: false });

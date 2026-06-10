@@ -1,5 +1,6 @@
 import { inTauri, type BackendState } from "../backend";
 import { useStore } from "../store";
+import { storeHealthBanner } from "../lib/storeHealthBanner";
 
 const DOT: Record<BackendState["status"], string> = {
   healthy: "bg-emerald-400",
@@ -22,6 +23,7 @@ const LABEL: Record<BackendState["status"], string> = {
 export function BackendStatusPill({ state }: { state: BackendState }) {
   const connected = useStore((s) => s.connected);
   const daemonIncompatible = useStore((s) => s.daemonIncompatible);
+  const storeHealth = useStore((s) => s.storeHealth);
   const restartDaemon = useStore((s) => s.restartDaemon);
 
   // Review M2: a poll found an incompatible/unresponsive daemon and DID NOT
@@ -46,6 +48,30 @@ export function BackendStatusPill({ state }: { state: BackendState }) {
         <span className="h-2 w-2 shrink-0 rounded-full bg-red-500" />
         <span className="min-w-0 truncate whitespace-nowrap">Backend incompatible — Restart</span>
       </button>
+    );
+  }
+
+  // Degraded persistence (the corrupt-store finding): the daemon is up, but the
+  // durable store is gone or was recreated after corruption — attribution is
+  // not being recorded the way the user thinks. The daemon can't fix this
+  // mid-run (the store opens once at boot), so this is honest signage, not an
+  // action button.
+  const health = inTauri() && connected ? storeHealthBanner(storeHealth) : null;
+  if (health) {
+    return (
+      <div
+        title={health.title}
+        className={`no-drag flex h-[26px] min-w-0 items-center gap-2 rounded-full border px-2.5 text-[11px] ${
+          health.off
+            ? "border-red-500/60 bg-red-950/40 text-red-200"
+            : "border-amber/60 bg-ink-700 text-zinc-200"
+        }`}
+      >
+        <span
+          className={`h-2 w-2 shrink-0 rounded-full ${health.off ? "bg-red-500" : "bg-amber"}`}
+        />
+        <span className="min-w-0 truncate whitespace-nowrap">{health.label}</span>
+      </div>
     );
   }
 
