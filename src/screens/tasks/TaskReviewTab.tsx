@@ -38,6 +38,7 @@ export function TaskReviewTab({
   const [contended, setContended] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [loadedOnce, setLoadedOnce] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const seq = useRef(0);
   const sectionEls = useRef<Record<string, HTMLElement | null>>({});
 
@@ -51,6 +52,7 @@ export function TaskReviewTab({
       );
       // Contention is workspace-wide (same source DiffView reads) — flag files
       // also changed by another agent so cross-worktree merges aren't blind.
+      // Decoration only: its failure must not take down the loaded diffs.
       const cont = rootRef.current
         ? await api.getContention(rootRef.current).catch(() => [])
         : [];
@@ -58,6 +60,12 @@ export function TaskReviewTab({
       setBundles(Object.fromEntries(entries));
       setContended(new Set(cont.map((r) => r.path)));
       setLoadedOnce(true);
+      setLoadError(false);
+    } catch {
+      // Strict reads reject on daemon-down: keep whatever real bundles we have
+      // (stale beats fabricated-empty) and flag the failure so the tab never
+      // presents a fallback as a reviewed-clean state.
+      if (seq.current === mySeq) setLoadError(true);
     } finally {
       if (seq.current === mySeq) setLoading(false);
     }
@@ -196,6 +204,12 @@ export function TaskReviewTab({
         {!loadedOnce && loading ? (
           <p className="px-4 py-6 text-center text-xs text-zinc-500">
             loading diffs…
+          </p>
+        ) : !loadedOnce && loadError ? (
+          <p className="px-4 py-6 text-center text-xs text-zinc-500">
+            {connected
+              ? "couldn't load the member diffs — refresh to retry"
+              : "daemon unreachable — diffs can't be shown or reviewed until it answers"}
           </p>
         ) : (
           members.map((a) => (

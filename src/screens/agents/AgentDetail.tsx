@@ -74,9 +74,14 @@ export function AgentDetail({ frame }: { frame: Frame }) {
     let alive = true;
     setWt(null);
     if (!agentId) return;
-    api.getWorktree(agentId).then((w) => {
-      if (alive) setWt(w);
-    });
+    api
+      .getWorktree(agentId)
+      .then((w) => {
+        if (alive) setWt(w);
+      })
+      // Strict read: rejects on daemon-down. Keep wt null — the provenance
+      // line already renders "daemon unreachable · retrying" off `connected`.
+      .catch(() => {});
     return () => {
       alive = false;
     };

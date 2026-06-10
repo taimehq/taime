@@ -124,11 +124,14 @@ export interface AgentDiffBundle {
 }
 
 export async function loadAgentDiffBundle(agentId: string): Promise<AgentDiffBundle> {
+  // STRICT reads — a daemon-down rejection must propagate to the caller's
+  // error state. Swallowing it into empty shapes made the Review tab render
+  // an authoritative-looking "No changes vs base" off a dead daemon.
   const [fd, hk, wt, attr] = await Promise.all([
-    api.getFileDiffs(agentId).catch(() => ({ agent_id: agentId, files: [] })),
-    api.getHunks(agentId).catch(() => ({ agent_id: agentId, base: null, files: [] })),
-    api.getWorktree(agentId).catch(() => null),
-    api.getAttribution(agentId).catch(() => ({ team: [], files: {} })),
+    api.getFileDiffs(agentId),
+    api.getHunks(agentId),
+    api.getWorktree(agentId),
+    api.getAttribution(agentId),
   ]);
   return { files: fd.files, hunks: hk.files, worktree: wt, attribution: attr };
 }

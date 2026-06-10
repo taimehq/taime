@@ -27,12 +27,21 @@ export function DiffPanel({ agentId }: { agentId: string | null }) {
   const load = useCallback(async () => {
     if (!agentId) return;
     setRefreshing(true);
-    // daemonQuery never rejects (fallback = empty); daemon-down is surfaced
-    // via the store's `connected` probe below.
-    const r = await api.getFileDiffs(agentId);
-    setFiles(r.files);
-    setRefreshing(false);
-  }, [agentId]);
+    try {
+      // Strict read: rejects on daemon-down instead of serving an empty
+      // fallback, so a dead daemon can't render as "no changes vs base".
+      const r = await api.getFileDiffs(agentId);
+      setFiles(r.files);
+    } catch {
+      // Keep files null — the body renders the `connected`-gated states
+      // (unreachable / loading) instead of a fabricated empty diff.
+      setFiles(null);
+    } finally {
+      setRefreshing(false);
+    }
+    // Re-load when the daemon comes back so the tab heals without a manual
+    // refresh (mirrors AgentDetail's worktree probe).
+  }, [agentId, connected]);
 
   useEffect(() => {
     setFiles(null);

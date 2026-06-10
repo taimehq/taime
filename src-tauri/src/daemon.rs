@@ -302,12 +302,24 @@ impl DaemonClient {
     }
 
     /// Generic daemon query RPC (Phase 6 route layer): `kind` + JSON `args` →
-    /// a JSON string in the frontend's shape. Connect-only (returns `fallback`
-    /// without spawning a daemon when none is running).
-    pub async fn query(&self, kind: String, args: String, fallback: &str) -> Result<String, String> {
+    /// a JSON string in the frontend's shape. Connect-only (never spawns a
+    /// daemon). With `Some(fallback)` a dead daemon yields the fallback; with
+    /// `None` it yields `Err("daemon unreachable")` — the strict mode trust
+    /// surfaces use so a fallback can never render as authoritative data.
+    pub async fn query(
+        &self,
+        kind: String,
+        args: String,
+        fallback: Option<&str>,
+    ) -> Result<String, String> {
         let mut conn = match self.try_connect_handshake().await? {
             Some(c) => c,
-            None => return Ok(fallback.to_string()),
+            None => {
+                return match fallback {
+                    Some(fb) => Ok(fb.to_string()),
+                    None => Err("daemon unreachable".to_string()),
+                }
+            }
         };
         let req_id = self.next_req();
         send(&mut conn, &ClientMsg::Query { req_id, kind, args }).await?;

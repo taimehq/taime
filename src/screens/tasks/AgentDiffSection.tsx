@@ -86,6 +86,7 @@ export function AgentDiffSection({
   const clearDirty = useStore((s) => s.clearDirty);
   const markReviewed = useStore((s) => s.markReviewed);
   const showSnackbar = useStore((s) => s.showSnackbar);
+  const connected = useStore((s) => s.connected);
 
   const [sel, setSel] = useState<Record<string, number[]>>({});
   const [target, setTarget] = useState("main");
@@ -196,6 +197,11 @@ export function AgentDiffSection({
     markReviewed(member.agent_id);
   };
 
+  // The diff below is authoritative only while the daemon answers and this
+  // agent's bundle actually loaded — acknowledging changes that were never
+  // shown would silently disarm the review guard.
+  const reviewTrusted = connected && bundle !== undefined;
+
   const toggleFileCollapsed = (path: string) =>
     setCollapsedFiles((s) => {
       const next = new Set(s);
@@ -293,8 +299,13 @@ export function AgentDiffSection({
         </button>
         <button
           onClick={onMarkReviewed}
-          title="Acknowledge this agent's changes (clears its dirty set)"
-          className="flex shrink-0 items-center gap-1 rounded-md bg-emerald-600/90 px-2 py-1 text-[11px] font-medium text-white hover:brightness-110"
+          disabled={!reviewTrusted}
+          title={
+            reviewTrusted
+              ? "Acknowledge this agent's changes (clears its dirty set)"
+              : "Daemon unreachable — the changes can't be verified, so they can't be acknowledged"
+          }
+          className="flex shrink-0 items-center gap-1 rounded-md bg-emerald-600/90 px-2 py-1 text-[11px] font-medium text-white hover:brightness-110 disabled:cursor-default disabled:opacity-40"
         >
           <Check size={11} />
           Mark reviewed
@@ -302,7 +313,12 @@ export function AgentDiffSection({
       </div>
 
       {/* Body: per-file hunks with selection + attribution chips. */}
-      {!bundle ? (
+      {!connected ? (
+        <p className="px-4 py-3 text-[11px] text-zinc-600">
+          daemon unreachable — this worktree&apos;s changes can&apos;t be shown
+          or reviewed until it answers.
+        </p>
+      ) : !bundle ? (
         <p className="px-4 py-3 text-[11px] text-zinc-600">loading diff…</p>
       ) : files.length === 0 ? (
         <p className="px-4 py-3 text-[11px] text-zinc-600">

@@ -62,6 +62,7 @@ export function DiffView() {
   const frames = useStore((s) => s.frames);
   const pendingSwitch = useStore((s) => s.pendingSwitch);
   const resolveSwitch = useStore((s) => s.resolveSwitch);
+  const connected = useStore((s) => s.connected);
 
   const [files, setFiles] = useState<FileDiffEntry[]>([]);
   const [hunks, setHunks] = useState<HunkedFileEntry[]>([]);
@@ -82,11 +83,14 @@ export function DiffView() {
     setLoading(true);
     setError(null);
     try {
+      // STRICT reads: daemon-down REJECTS (DaemonUnreachableError) instead of
+      // resolving empty shapes — so a dead daemon can never render as an
+      // authoritative "No changes to review" with a working Mark reviewed.
       const [fd, hk, wt, attr] = await Promise.all([
-        api.getFileDiffs(terminalId).catch(() => ({ agent_id: terminalId, files: [] })),
-        api.getHunks(terminalId).catch(() => ({ agent_id: terminalId, base: null, files: [] })),
-        api.getWorktree(terminalId).catch(() => null),
-        api.getAttribution(terminalId).catch(() => ({ team: [], files: {} })),
+        api.getFileDiffs(terminalId),
+        api.getHunks(terminalId),
+        api.getWorktree(terminalId),
+        api.getAttribution(terminalId),
       ]);
       setFiles(fd.files);
       setHunks(hk.files);
@@ -95,7 +99,8 @@ export function DiffView() {
       setSelected((prev) => prev ?? fd.files[0]?.path ?? null);
       if (wt?.mode === "shared" || wt?.mode === "isolated") {
         // Contention is workspace-wide: key off the worktree's project root
-        // (the workspace-grouping id), not a frame label.
+        // (the workspace-grouping id), not a frame label. Decoration only —
+        // a contention failure must not take down the loaded diff.
         const root = wt?.project_root;
         if (root) {
           const c = await api.getContention(root).catch(() => []);
@@ -103,12 +108,14 @@ export function DiffView() {
         }
       }
     } catch (e) {
-      setError(String(e));
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
+    // Re-load when the daemon connection flips (down → error state shown; back
+    // up → the surface heals without reopening). Mirrors AgentDetail's probe.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [terminalId]);
+  }, [terminalId, connected]);
 
   useEffect(() => {
     setSel({});
@@ -325,6 +332,11 @@ export function DiffView() {
     if (pendingSwitch) resolveSwitch(true);
   };
 
+  // The diff on screen is authoritative only while the daemon is answering and
+  // the last load succeeded. Acknowledging changes that were never truly shown
+  // would disarm the switch guard on a falsehood — so Mark reviewed gates here.
+  const reviewTrusted = connected && !error;
+
   const totalAdd = files.reduce((n, f) => n + f.additions, 0);
   const totalDel = files.reduce((n, f) => n + f.deletions, 0);
   const currentHunks = current ? (hunksByPath[current.path]?.hunks ?? []) : [];
@@ -397,7 +409,13 @@ export function DiffView() {
           <div className="mx-1 h-5 w-px bg-ink-600" />
           <button
             onClick={onMarkReviewed}
-            className={`flex items-center gap-1.5 rounded-md bg-emerald-600/90 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 ${FOCUS_RING}`}
+            disabled={!reviewTrusted || loading}
+            title={
+              reviewTrusted
+                ? undefined
+                : "Daemon unreachable — the changes can't be verified, so they can't be acknowledged"
+            }
+            className={`flex items-center gap-1.5 rounded-md bg-emerald-600/90 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
           >
             <Check size={14} />
             Mark reviewed
@@ -452,7 +470,22 @@ export function DiffView() {
         {/* Diff + hunk selection */}
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="min-h-0 flex-1">
-            {!loading && files.length === 0 ? (
+            {!loading && files.length === 0 && !reviewTrusted ? (
+              // Daemon down / load failed: the empty file list is a FALLBACK,
+              // not a verified "no changes" — say so, and offer no Mark
+              // reviewed (acknowledging unseen changes would disarm the guard).
+              <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+                <GitMerge size={32} className="text-zinc-600" />
+                <p className="mt-3 text-sm text-zinc-300">
+                  {connected ? "Couldn't load this agent's changes" : "Daemon unreachable"}
+                </p>
+                <p className="mt-1 max-w-sm text-[12px] text-zinc-400">
+                  {connected
+                    ? (error ?? "The diff query failed.")
+                    : "This agent's changes can't be shown or reviewed until the daemon answers — retrying."}
+                </p>
+              </div>
+            ) : !loading && files.length === 0 ? (
               // Nothing changed: a single centered empty state spans the body so
               // we never render a bare bg-ink-900 void.
               <div className="flex h-full flex-col items-center justify-center px-6 text-center">

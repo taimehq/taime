@@ -139,6 +139,36 @@ export async function daemonQuery<T>(
   }
 }
 
+/** The daemon did not answer (none running / handshake failed): the strict
+ *  query refused to serve a fallback. Trust surfaces render "daemon
+ *  unreachable" on this — never an authoritative-looking empty state. */
+export class DaemonUnreachableError extends Error {
+  constructor() {
+    super("daemon unreachable");
+    this.name = "DaemonUnreachableError";
+  }
+}
+
+/** Strict daemon query: like `daemonQuery`, but a dead daemon REJECTS
+ *  (`DaemonUnreachableError`) instead of resolving a typed fallback that is
+ *  indistinguishable from real data. The review/trust surfaces use this so
+ *  daemon-down can never render as "No changes to review" (the flagship
+ *  guard would be disarmed by a falsehood). */
+export async function daemonQueryStrict<T>(
+  kind: string,
+  args: Record<string, unknown>,
+): Promise<T> {
+  if (!inTauri()) throw new DaemonUnreachableError();
+  try {
+    // fallback: null tells the command's strict mode to error on a dead
+    // daemon rather than serve a fallback.
+    return await invoke<T>("daemon_query", { kind, args, fallback: null });
+  } catch (e) {
+    if (String(e).includes("daemon unreachable")) throw new DaemonUnreachableError();
+    throw e instanceof Error ? e : new Error(String(e));
+  }
+}
+
 /** The daemon-side activity graph (Phase 6): agents + inter-agent edges
  *  (assign/handoff/message), read from the durable store — complete even with the
  *  UI closed. The frontend route switch to this lands with the diff move. */
