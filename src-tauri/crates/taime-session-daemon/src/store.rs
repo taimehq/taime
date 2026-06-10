@@ -212,8 +212,8 @@ impl Store {
     ///
     /// On a corruption-class failure the bad `taime.sqlite` (and its `-wal`/
     /// `-shm` — a fresh DB next to the OLD wal would try to replay it) is
-    /// renamed aside to `taime.sqlite.corrupt-<unix-secs>*` and the open is
-    /// retried once on a clean slate. Non-corruption failures (disk full,
+    /// renamed aside to `taime.sqlite.corrupt-<unix-secs>-<pid>*` and the open
+    /// is retried once on a clean slate. Non-corruption failures (disk full,
     /// permissions, a transient lock) do NOT move the file aside: recovery
     /// must never destroy a healthy DB that merely failed to open.
     pub fn open_or_recover() -> (Option<Store>, StoreHealth) {
@@ -235,7 +235,10 @@ impl Store {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let moved_to = format!("taime.sqlite.corrupt-{ts}");
+        // The pid suffix keeps the name collision-free: `rename` OVERWRITES an
+        // existing target, and two alternate-socket daemons share this data dir
+        // — a same-second double recovery must not destroy the first snapshot.
+        let moved_to = format!("taime.sqlite.corrupt-{ts}-{}", std::process::id());
         if let Err(e) = std::fs::rename(dir.join("taime.sqlite"), dir.join(&moved_to)) {
             return (None, StoreHealth::Unavailable {
                 error: format!("{first_err}; move-aside failed: {e}"),

@@ -742,9 +742,12 @@ export const useStore = create<Store>((set, get) => ({
       return;
     }
     try {
-      // Store health rides the same poll: the ping above already refreshed the
-      // app-side cache from its handshake, so this is a cheap state read.
-      const [agents, storeHealth] = await Promise.all([api.listAgents(), daemonStoreHealth()]);
+      const agents = await api.listAgents();
+      // Store health rides the same poll as a cheap cache read — but only AFTER
+      // listAgents settles: its connect may have re-handshaken (daemon swapped
+      // mid-poll), and the read must reflect the daemon that answered, not the
+      // one the ping above saw.
+      const storeHealth = await daemonStoreHealth();
       const prev = get();
       if (
         !prev.connected ||
