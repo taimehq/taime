@@ -203,9 +203,11 @@ export function AgentDiffSection({
 
   // The diff below is authoritative only while the daemon answers, this
   // agent's bundle actually loaded, AND the last refresh succeeded (a kept-
-  // stale bundle reads fine but may no longer reflect the worktree) —
-  // acknowledging changes that were never truly shown would silently disarm
-  // the review guard.
+  // stale bundle reads fine but may no longer reflect the worktree). This
+  // gates Mark reviewed AND Merge/Revert: selections are POSITIONAL hunk
+  // indices that the daemon re-resolves against the live worktree at apply
+  // time — applying a selection built on a stale snapshot would merge or
+  // revert different lines than the user reviewed.
   const reviewTrusted = connected && bundle !== undefined && !stale;
 
   const toggleFileCollapsed = (path: string) =>
@@ -288,16 +290,18 @@ export function AgentDiffSection({
           </select>
         </label>
         <button
-          disabled={busy !== null || selectionCount === 0}
+          disabled={busy !== null || selectionCount === 0 || !reviewTrusted}
           onClick={() => void apply("merge")}
+          title={reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could merge the wrong lines"}
           className="flex shrink-0 items-center gap-1 rounded-md bg-primary px-2 py-1 text-[11px] font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40"
         >
           <GitMerge size={11} />
           {busy === "merge" ? "Merging…" : `Merge${selectionCount > 0 ? ` ${selectionCount}` : ""}`}
         </button>
         <button
-          disabled={busy !== null || selectionCount === 0}
+          disabled={busy !== null || selectionCount === 0 || !reviewTrusted}
           onClick={() => void apply("revert")}
+          title={reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could revert the wrong lines"}
           className="flex shrink-0 items-center gap-1 rounded-md border border-rose-500/50 px-2 py-1 text-[11px] text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40"
         >
           <Undo2 size={11} />
@@ -327,7 +331,11 @@ export function AgentDiffSection({
           or reviewed until it answers.
         </p>
       ) : !bundle ? (
-        <p className="px-4 py-3 text-[11px] text-zinc-600">loading diff…</p>
+        // No bundle ever loaded: an honest split between "in flight" and "the
+        // load failed" — an eternal fake loading label is a mislabeled error.
+        <p className="px-4 py-3 text-[11px] text-zinc-600">
+          {stale ? "couldn't load this worktree's diff — refresh to retry" : "loading diff…"}
+        </p>
       ) : files.length === 0 ? (
         <p className="px-4 py-3 text-[11px] text-zinc-600">
           No changes vs base

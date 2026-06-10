@@ -82,9 +82,15 @@ export function DiffView() {
   // hunk indices, so they survive a reload ONLY while the payload is
   // byte-identical (e.g. a daemon blip with no worktree change).
   const lastHunksRef = useRef<string | null>(null);
+  // Load sequencing: load() re-fires on `connected` flips and after apply(),
+  // so two loads can be in flight at once — only the NEWEST may write state,
+  // or a slow stale payload would land over a fresh one and render as the
+  // authoritative diff (DiffView has no poll to self-correct).
+  const loadSeq = useRef(0);
 
   const load = useCallback(async () => {
     if (!terminalId) return;
+    const mySeq = ++loadSeq.current;
     setLoading(true);
     setError(null);
     try {
@@ -97,6 +103,7 @@ export function DiffView() {
         api.getWorktree(terminalId),
         api.getAttribution(terminalId),
       ]);
+      if (loadSeq.current !== mySeq) return; // superseded — a newer load owns the state
       setFiles(fd.files);
       setHunks(hk.files);
       setWorktree(wt);
@@ -117,13 +124,13 @@ export function DiffView() {
         const root = wt?.project_root;
         if (root) {
           const c = await api.getContention(root).catch(() => []);
-          setContended(new Set(c.map((r) => r.path)));
+          if (loadSeq.current === mySeq) setContended(new Set(c.map((r) => r.path)));
         }
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (loadSeq.current === mySeq) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (loadSeq.current === mySeq) setLoading(false);
     }
     // Re-load when the daemon connection flips (down → error state shown; back
     // up → the surface heals without reopening). Mirrors AgentDetail's probe.
@@ -355,8 +362,11 @@ export function DiffView() {
   };
 
   // The diff on screen is authoritative only while the daemon is answering and
-  // the last load succeeded. Acknowledging changes that were never truly shown
-  // would disarm the switch guard on a falsehood — so Mark reviewed gates here.
+  // the last load succeeded. This gates Mark reviewed (acknowledging changes
+  // never truly shown would disarm the switch guard on a falsehood) AND
+  // Merge/Revert (selections are positional hunk indices re-resolved against
+  // the live worktree at apply time — a selection built on a stale or
+  // mid-reload payload could merge/revert the wrong lines).
   const reviewTrusted = connected && !error;
 
   const totalAdd = files.reduce((n, f) => n + f.additions, 0);
@@ -413,16 +423,22 @@ export function DiffView() {
             </select>
           </label>
           <button
-            disabled={busy || selectionCount === 0}
+            disabled={busy || selectionCount === 0 || !reviewTrusted || loading}
             onClick={() => apply("merge")}
+            title={
+              reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could merge the wrong lines"
+            }
             className={`flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
           >
             <GitMerge size={14} />
             Merge {selectionCount > 0 ? `${selectionCount}` : ""}
           </button>
           <button
-            disabled={busy || selectionCount === 0}
+            disabled={busy || selectionCount === 0 || !reviewTrusted || loading}
             onClick={() => apply("revert")}
+            title={
+              reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could revert the wrong lines"
+            }
             className={`flex items-center gap-1.5 rounded-md border border-rose-500/50 px-3 py-1.5 text-sm text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
           >
             <Undo2 size={14} />

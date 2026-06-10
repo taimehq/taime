@@ -38,7 +38,11 @@ export function TaskReviewTab({
   const [contended, setContended] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [loadedOnce, setLoadedOnce] = useState(false);
-  const [loadError, setLoadError] = useState(false);
+  /** Members whose last bundle load FAILED (strict reads reject): their kept
+   *  bundles are stale and their sections review-disabled — per member, so one
+   *  failing worktree (a >60s diff, a daemon-side error) never poisons the
+   *  healthy siblings' freshly loaded sections. */
+  const [failedIds, setFailedIds] = useState<Set<string>>(new Set());
   const seq = useRef(0);
   const sectionEls = useRef<Record<string, HTMLElement | null>>({});
 
@@ -47,7 +51,10 @@ export function TaskReviewTab({
     const ms = membersRef.current;
     setLoading(true);
     try {
-      const entries = await Promise.all(
+      // Per-member settle: each member's bundle loads independently. Fulfilled
+      // bundles land; rejected ones keep their previous bundle (stale beats
+      // fabricated-empty) and are flagged so their sections gate review.
+      const results = await Promise.allSettled(
         ms.map(async (a) => [a.agent_id, await loadAgentDiffBundle(a.agent_id)] as const),
       );
       // Contention is workspace-wide (same source DiffView reads) — flag files
@@ -57,15 +64,16 @@ export function TaskReviewTab({
         ? await api.getContention(rootRef.current).catch(() => [])
         : [];
       if (seq.current !== mySeq) return; // stale — membership changed mid-load
-      setBundles(Object.fromEntries(entries));
+      const fresh: Record<string, AgentDiffBundle> = {};
+      const failed = new Set<string>();
+      results.forEach((r, i) => {
+        if (r.status === "fulfilled") fresh[r.value[0]] = r.value[1];
+        else failed.add(ms[i].agent_id);
+      });
+      setBundles((prev) => ({ ...prev, ...fresh }));
+      setFailedIds(failed);
       setContended(new Set(cont.map((r) => r.path)));
       setLoadedOnce(true);
-      setLoadError(false);
-    } catch {
-      // Strict reads reject on daemon-down: keep whatever real bundles we have
-      // (stale beats fabricated-empty) and flag the failure so the tab never
-      // presents a fallback as a reviewed-clean state.
-      if (seq.current === mySeq) setLoadError(true);
     } finally {
       if (seq.current === mySeq) setLoading(false);
     }
@@ -171,13 +179,15 @@ export function TaskReviewTab({
           The task aggregates — it does not own the diff. Merge runs per agent
           worktree.
         </p>
-        {loadedOnce && loadError && (
-          // A failed refresh after data has rendered: the sections below are
-          // STALE, not current — say so, and the per-agent Mark reviewed gates
-          // on this via the `stale` prop.
+        {loadedOnce && failedIds.size > 0 && (
+          // A failed refresh after data has rendered: the affected sections are
+          // STALE, not current — say so; each one's Mark reviewed/Merge/Revert
+          // gates on the per-member `stale` prop.
           <p className="mt-1 text-[10px] text-amber">
             {connected
-              ? "last refresh failed — the diffs below may be stale; reviewing is disabled until a refresh succeeds"
+              ? `${failedIds.size} member diff${failedIds.size === 1 ? "" : "s"} failed to refresh — ${
+                  failedIds.size === 1 ? "that section is" : "those sections are"
+                } stale and review-disabled until a refresh succeeds`
               : "daemon unreachable — the diffs below may be stale; reviewing is disabled until it answers"}
           </p>
         )}
@@ -219,12 +229,6 @@ export function TaskReviewTab({
           <p className="px-4 py-6 text-center text-xs text-zinc-500">
             loading diffs…
           </p>
-        ) : !loadedOnce && loadError ? (
-          <p className="px-4 py-6 text-center text-xs text-zinc-500">
-            {connected
-              ? "couldn't load the member diffs — refresh to retry"
-              : "daemon unreachable — diffs can't be shown or reviewed until it answers"}
-          </p>
         ) : (
           members.map((a) => (
             <AgentDiffSection
@@ -232,7 +236,7 @@ export function TaskReviewTab({
               member={a}
               siblings={members.filter((m) => m.agent_id !== a.agent_id)}
               bundle={bundles[a.agent_id]}
-              stale={loadError}
+              stale={failedIds.has(a.agent_id)}
               contended={contended}
               onApplied={onApplied}
               sectionRef={(el) => {
