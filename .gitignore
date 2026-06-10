@@ -1,37 +1,101 @@
-# --- Build artifacts / dependencies (never commit) ---
+# =============================================================================
+# Taime — Tauri v2 (Rust) + React/Vite/TypeScript (pnpm). macOS-first.
+# Lockfiles (Cargo.lock, pnpm-lock.yaml) are DELIBERATELY tracked — Taime ships
+# as an application, so reproducible builds want them committed. Do not ignore.
+# =============================================================================
+
+# --- Secrets / local environment (NEVER commit; public repo) -----------------
+.env
+.env.*
+!.env.example
+!.env.sample
+*.local
+secrets.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa
+id_ed25519
+*.cert
+*.crt
+
+# --- Node / pnpm / JS deps ---------------------------------------------------
 **/node_modules/
+.pnp
+.pnp.*
+.yarn/*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.eslintcache
+.stylelintcache
+
+# --- Vite / frontend build ---------------------------------------------------
 dist/
+dist-ssr/
+**/.vite/
+*.tsbuildinfo
+.cache/
+
+# --- Rust / Cargo / Tauri ----------------------------------------------------
+**/target/
 src-tauri/target/
 src-tauri/gen/
-**/.vite/
+**/*.rs.bk
+# Daemon staging dir: ignore the staged binary, keep the dir (.gitkeep) so the
+# tauri-build resource check passes for bare `cargo build`.
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
 
-# Python
+# --- Python (helper scripts / venvs) -----------------------------------------
 **/__pycache__/
 *.py[cod]
 **/.venv/
 **/venv/
 *.egg-info/
 
-# Rust
-**/target/
-
-# Logs / OS
-*.log
-.DS_Store
-
-# Local tooling state
-.claude/scheduled_tasks.lock
-
-# Playwright/test artifacts
+# --- Test / coverage artifacts -----------------------------------------------
+coverage/
+.nyc_output/
+.vitest/
 .playwright-mcp/
+playwright-report/
+test-results/
 loop-*.png
 ws-*.png
 taime-*.png
 
-# Daemon staging dir: ignore the staged binary, keep the dir (.gitkeep) so the
-# tauri-build resource check passes for bare `cargo build`.
-src-tauri/binaries/*
-!src-tauri/binaries/.gitkeep
+# --- Editors / IDEs ----------------------------------------------------------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.code-workspace
+*.swp
+*.swo
+*~
+.history/
 
-# Local scratch (UI mockups, demo repos) — never commit
+# --- Claude Code local state (worktrees + machine-local settings) ------------
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+
+# --- OS noise ----------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --- Logs / local scratch ----------------------------------------------------
+*.log
+logs/
 tmp/
