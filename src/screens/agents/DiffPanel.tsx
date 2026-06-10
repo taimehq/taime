@@ -20,8 +20,9 @@ function statusChip(status: string): { ch: string; cls: string } {
 export function DiffPanel({ agentId }: { agentId: string | null }) {
   const connected = useStore((s) => s.connected);
   const openDiff = useStore((s) => s.openDiff);
-  // null = first load in flight.
+  // null = first load in flight (or the last load failed — see `failed`).
   const [files, setFiles] = useState<FileDiffEntry[] | null>(null);
+  const [failed, setFailed] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(async () => {
@@ -32,10 +33,13 @@ export function DiffPanel({ agentId }: { agentId: string | null }) {
       // fallback, so a dead daemon can't render as "no changes vs base".
       const r = await api.getFileDiffs(agentId);
       setFiles(r.files);
+      setFailed(false);
     } catch {
-      // Keep files null — the body renders the `connected`-gated states
-      // (unreachable / loading) instead of a fabricated empty diff.
+      // Keep files null and flag the failure — the body must distinguish a
+      // daemon-UP query error from "still loading" (an eternal fake loading
+      // label is a mislabeled error state on a trust surface).
       setFiles(null);
+      setFailed(true);
     } finally {
       setRefreshing(false);
     }
@@ -45,6 +49,7 @@ export function DiffPanel({ agentId }: { agentId: string | null }) {
 
   useEffect(() => {
     setFiles(null);
+    setFailed(false);
     void load();
   }, [load]);
 
@@ -97,7 +102,12 @@ export function DiffPanel({ agentId }: { agentId: string | null }) {
             daemon unreachable · retrying
           </p>
         )}
-        {connected && files === null && (
+        {connected && files === null && failed && (
+          <p className="px-2 py-2 text-xs text-rose-400/80">
+            couldn&apos;t load the diff — use refresh to retry
+          </p>
+        )}
+        {connected && files === null && !failed && (
           <p className="px-2 py-2 text-xs text-zinc-600">loading diff…</p>
         )}
         {connected && files !== null && files.length === 0 && (
