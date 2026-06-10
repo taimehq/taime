@@ -231,10 +231,7 @@ impl Store {
         if !is_corruption(&first_err) {
             return (None, StoreHealth::Unavailable { error: first_err.to_string() });
         }
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let ts = crate::session::now_unix_secs();
         // The pid suffix keeps the name collision-free: `rename` OVERWRITES an
         // existing target, and two alternate-socket daemons share this data dir
         // — a same-second double recovery must not destroy the first snapshot.
