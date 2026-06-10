@@ -171,6 +171,18 @@ fn write_git_note(repo: &str, commit: &str, json: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Best-effort `git push` of the target's current branch after a provenance
+/// commit (the opt-in `push` flag). Returns `(pushed, error)`: a missing remote /
+/// no upstream / rejected push is `(false, Some(reason))` and NEVER undoes the
+/// commit — provenance is already durable in the commit and its note.
+fn git_push(repo: &str) -> (bool, Option<String>) {
+    match std::process::Command::new("git").current_dir(repo).args(["push"]).output() {
+        Ok(o) if o.status.success() => (true, None),
+        Ok(o) => (false, Some(String::from_utf8_lossy(&o.stderr).trim().to_string())),
+        Err(e) => (false, Some(e.to_string())),
+    }
+}
+
 /// A recorded merge → the JSON shape the app reads (merge history + attribution
 /// export). Field names align with the commit trailer / git note.
 fn merge_record_json(m: &crate::store::MergeRecord) -> serde_json::Value {
@@ -1133,6 +1145,7 @@ impl Manager {
         reviewed: bool,
         selected: usize,
         total: usize,
+        push: bool,
     ) -> String {
         let mut res = res;
         if res["committed"].as_bool() != Some(true) {
@@ -1144,6 +1157,8 @@ impl Manager {
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
         let scope = if total > 0 && selected >= total { "full" } else { "partial" };
+        // Opt-in push of the target branch — best-effort, recorded, never fatal.
+        let (pushed, push_error) = if push { git_push(target_repo) } else { (false, None) };
         let (provider, task_id) = self
             .store
             .as_ref()
@@ -1176,6 +1191,7 @@ impl Manager {
             "hunks_total": total,
             "turns": turns,
             "files": files,
+            "pushed": pushed,
             "merged_at": now,
         });
         let note_written =
@@ -1195,13 +1211,17 @@ impl Manager {
                 hunks_selected: selected as i64,
                 hunks_total: total as i64,
                 reviewed,
-                pushed: false,
+                pushed,
                 pr_url: None,
                 files,
                 created_at_unix: now,
             });
         }
         res["note_written"] = serde_json::json!(note_written);
+        res["pushed"] = serde_json::json!(pushed);
+        if let Some(e) = push_error {
+            res["push_error"] = serde_json::json!(e);
+        }
         res.to_string()
     }
 
@@ -1391,6 +1411,7 @@ impl Manager {
                 let symbol = a.get("target_dir").and_then(|v| v.as_str()).unwrap_or("main");
                 let sel = a.get("selections").cloned().unwrap_or_else(|| serde_json::json!({}));
                 let digest = a.get("expected_digest").and_then(|v| v.as_str());
+                let push = a.get("push").and_then(|v| v.as_bool()).unwrap_or(false);
                 let err_json = |e: String| {
                     serde_json::json!({
                         "committed": false, "applied": false, "target_dir": symbol,
@@ -1429,7 +1450,7 @@ impl Manager {
                                     );
                                     self.finalize_merge(
                                         res, tk, symbol, &target, base.as_deref(), ar.as_deref(),
-                                        digest, reviewed, s, t,
+                                        digest, reviewed, s, t, push,
                                     )
                                 }
                             }
@@ -1461,7 +1482,7 @@ impl Manager {
                                     );
                                     self.finalize_merge(
                                         res, tk, symbol, &target, Some(&patch.base_sha),
-                                        Some(&patch.archive_ref), digest, reviewed, s, t,
+                                        Some(&patch.archive_ref), digest, reviewed, s, t, push,
                                     )
                                 }
                             }
@@ -4651,6 +4672,20 @@ mod tests {
         o.to_string()
     }
 
+    fn commit_merge_args_push(
+        agent: &str,
+        target: &str,
+        selections: serde_json::Value,
+        digest: &str,
+        push: bool,
+    ) -> String {
+        serde_json::json!({
+            "agent_id": agent, "target_dir": target, "selections": selections,
+            "expected_digest": digest, "push": push
+        })
+        .to_string()
+    }
+
     #[test]
     fn commit_merge_records_an_autonomous_provenance_commit() {
         let mgr = mem_manager();
@@ -4808,6 +4843,58 @@ mod tests {
         assert_eq!(exp["provider"], "claude_code");
         assert_eq!(exp["merges"].as_array().unwrap().len(), 1);
         assert_eq!(exp["merges"][0]["commit"], commit);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn commit_merge_pushes_to_an_upstream_when_requested() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        // A bare remote, with the project's branch tracking it.
+        let remote = std::env::temp_dir().join(format!("taime-remote-{:08x}", rand::random::<u32>()));
+        std::fs::create_dir_all(&remote).unwrap();
+        git_in(&remote, &["init", "-q", "--bare"]);
+        git_in(&proj, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git_in(&proj, &["push", "-q", "-u", "origin", "HEAD"]);
+
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let digest = fetch_digest(&mgr, "agent-a");
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "commit_merge",
+            &commit_merge_args_push("agent-a", "main", serde_json::json!({ "a.txt": [0] }), &digest, true),
+        ))
+        .unwrap();
+        assert_eq!(v["committed"], true, "{v}");
+        assert_eq!(v["pushed"], true, "push to a tracked upstream: {v}");
+        // The bare remote now has the provenance commit.
+        let local_head = git_in(&proj, &["rev-parse", "HEAD"]);
+        let remote_head = git_in(&remote, &["rev-parse", "HEAD"]);
+        assert_eq!(local_head, remote_head, "remote received the commit");
+        assert_eq!(v["push_error"], serde_json::Value::Null, "no push error: {v}");
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn commit_merge_push_failure_never_undoes_the_commit() {
+        let mgr = mem_manager();
+        let proj = project_repo(); // NO remote configured
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let digest = fetch_digest(&mgr, "agent-a");
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "commit_merge",
+            &commit_merge_args_push("agent-a", "main", serde_json::json!({ "a.txt": [0] }), &digest, true),
+        ))
+        .unwrap();
+        // The commit stands; only the push reports a structured failure.
+        assert_eq!(v["committed"], true, "commit must stand without a remote: {v}");
+        assert_eq!(v["pushed"], false, "{v}");
+        assert!(v["push_error"].as_str().is_some(), "names the push failure: {v}");
+        assert!(std::fs::read_to_string(proj.join("a.txt")).unwrap().contains("TWO"));
         let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&proj);
     }
