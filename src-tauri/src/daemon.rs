@@ -441,13 +441,23 @@ impl DaemonClient {
         tauri::async_runtime::spawn(async move {
             let (mut sink, mut stream) = conn.split();
             let mut clean_exit = false;
+            let mut deliberate_detach = false;
             loop {
                 tokio::select! {
                     out = input_rx.recv() => {
                         // A closed input channel (handle dropped on detach / re-attach)
                         // is terminal — BREAK, don't `continue`, or this arm would
                         // busy-spin at 100% CPU (recv() resolves to None on every poll).
-                        let Some(out) = out else { break };
+                        // This is a DELIBERATE detach (close view / tab switch /
+                        // re-attach replacing the handle), not a connection failure:
+                        // remember that so we don't push "disconnected" below — the
+                        // JS channel callback outlives the view's unmount, and the
+                        // push was being read as an exit, falsely flipping running
+                        // detached agents to "exited" (2026-06 review).
+                        let Some(out) = out else {
+                            deliberate_detach = true;
+                            break;
+                        };
                         if let Ok(bytes) = encode_client(&out) {
                             if sink.send(bytes).await.is_err() {
                                 break;
@@ -486,11 +496,13 @@ impl DaemonClient {
                     }
                 }
             }
-            // The pump ended. A clean process exit already sent {type:"exit"}; any
-            // other break means the daemon connection dropped (crash / codec
-            // error), so surface it instead of leaving a silently-frozen terminal
-            // (review M5). A failed send just means the webview is already gone.
-            if !clean_exit {
+            // The pump ended. A clean process exit already sent {type:"exit"}; a
+            // deliberate detach must stay SILENT (detach ≠ exit — the agent keeps
+            // running). Only the remaining breaks mean the daemon connection
+            // dropped (crash / codec error), so surface those instead of leaving a
+            // silently-frozen terminal (review M5). A failed send just means the
+            // webview is already gone.
+            if !clean_exit && !deliberate_detach {
                 let _ = channel.send(InvokeResponseBody::Json(
                     serde_json::json!({ "type": "disconnected" }).to_string(),
                 ));

@@ -225,8 +225,9 @@ export function TerminalViewRustPty({
           sniffModel(bytes);
         },
         () => {
+          // A REAL process exit (the daemon's Exited control) — authoritative
+          // regardless of mount state, so the lifecycle flip is unconditional.
           if (alive) term.write("\r\n\x1b[33m[process exited]\x1b[0m\r\n");
-          // Reflect lifecycle: the agent's process is gone (running → exited).
           useStore.getState().markRustPtyExited(sessionId);
           onConnectionChange?.("closed");
         },
@@ -236,6 +237,15 @@ export function TerminalViewRustPty({
         (status) => useStore.getState().setDaemonSessionStatus(sessionId, status),
         // Phase 6 fs push → mark the agent's terminal dirty (its diff is stale).
         (paths) => useStore.getState().markDaemonFsDirty(sessionId, paths),
+        // The daemon CONNECTION dropped without a process exit (daemon crash /
+        // codec error — deliberate detaches are silent). The agent may still be
+        // running: never flip it to exited here (detach ≠ kill, the safe
+        //-context-switching invariant); the reconcile poll owns the lifecycle.
+        () => {
+          if (!alive) return; // post-unmount push — nothing to surface
+          term.write("\r\n\x1b[33m[daemon connection lost — reattach to resume]\x1b[0m\r\n");
+          onConnectionChange?.("closed");
+        },
       );
       if (!alive) {
         // Unmounted while the attach was in flight: detach so we don't leave a
@@ -259,7 +269,9 @@ export function TerminalViewRustPty({
       el.removeEventListener("wheel", onWheel, wheelOpts);
       cleanupClipboard();
       unregisterInput();
-      // Drop the channel ref (its onmessage stops); detach keeps the agent alive.
+      // Drop our ref. NOTE: the channel's callback is NOT dead yet — Tauri keeps
+      // it registered until the app-side pump drops the Channel (the in-order
+      // "end" message), so every attach callback above must stay alive-gated.
       channelRef.current = null;
       // Closing the view detaches — it does NOT kill the agent.
       daemonCloseView(sessionId);

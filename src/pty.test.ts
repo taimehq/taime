@@ -27,7 +27,9 @@ import { inTauri } from "./backend";
 import {
   daemonQuery,
   daemonQueryStrict,
+  daemonAttach,
   DaemonUnreachableError,
+  type TurnEvent,
 } from "./pty";
 
 const invokeMock = vi.mocked(invoke);
@@ -98,5 +100,83 @@ describe("daemonQueryStrict", () => {
     await expect(daemonQueryStrict("file_diffs", {})).rejects.toThrow(
       "parse query result: bad json",
     );
+  });
+});
+
+describe("daemonAttach channel dispatch", () => {
+  const handlers = () => ({
+    onBytes: vi.fn(),
+    onExit: vi.fn(),
+    onTurn: vi.fn(),
+    onStatus: vi.fn(),
+    onFsDirty: vi.fn(),
+    onDisconnected: vi.fn(),
+  });
+
+  /** Attach with mocked invoke and return the channel + spies. */
+  async function attach() {
+    invokeMock.mockResolvedValueOnce(undefined);
+    const h = handlers();
+    const ch = await daemonAttach(
+      "sess-1",
+      24,
+      80,
+      h.onBytes,
+      h.onExit,
+      h.onTurn,
+      h.onStatus,
+      h.onFsDirty,
+      h.onDisconnected,
+    );
+    expect(ch).not.toBeNull();
+    // The channel passed to invoke is the one whose onmessage dispatches.
+    const sent = invokeMock.mock.calls[0][1] as { onData: { onmessage: (m: unknown) => void } };
+    return { dispatch: sent.onData.onmessage, ...h };
+  }
+
+  it("routes raw bytes to onBytes", async () => {
+    const t = await attach();
+    t.dispatch(new Uint8Array([104, 105]).buffer);
+    expect(t.onBytes).toHaveBeenCalledTimes(1);
+    expect([...t.onBytes.mock.calls[0][0]]).toEqual([104, 105]);
+  });
+
+  it("routes a process exit to onExit with its code", async () => {
+    const t = await attach();
+    t.dispatch({ type: "exit", code: 0 });
+    expect(t.onExit).toHaveBeenCalledWith(0);
+    expect(t.onDisconnected).not.toHaveBeenCalled();
+  });
+
+  it("routes 'disconnected' to onDisconnected — NEVER onExit (detach/crash ≠ exit)", async () => {
+    const t = await attach();
+    t.dispatch({ type: "disconnected" });
+    expect(t.onDisconnected).toHaveBeenCalledTimes(1);
+    expect(t.onExit).not.toHaveBeenCalled();
+  });
+
+  it("routes turn/status/fs_dirty pushes to their handlers", async () => {
+    const t = await attach();
+    const turn: Partial<TurnEvent> & { type: string } = {
+      type: "turn",
+      epoch: 1,
+      startOffset: 0,
+      endOffset: 10,
+      fsDirtyPaths: [],
+    };
+    t.dispatch(turn);
+    t.dispatch({ type: "status", status: "IDLE" });
+    t.dispatch({ type: "fs_dirty", paths: ["a.ts"] });
+    expect(t.onTurn).toHaveBeenCalledTimes(1);
+    expect(t.onStatus).toHaveBeenCalledWith("IDLE");
+    expect(t.onFsDirty).toHaveBeenCalledWith(["a.ts"]);
+    expect(t.onExit).not.toHaveBeenCalled();
+  });
+
+  it("returns null without invoking when the attach fails", async () => {
+    invokeMock.mockRejectedValueOnce("no such session");
+    const h = handlers();
+    const ch = await daemonAttach("sess-x", 24, 80, h.onBytes, h.onExit);
+    expect(ch).toBeNull();
   });
 });

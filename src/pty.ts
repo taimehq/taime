@@ -315,7 +315,9 @@ export async function daemonList(): Promise<DaemonSessionSummary[]> {
  * Attach to a daemon session. The grid repaint (at the supplied viewport) +
  * live output arrive as `ArrayBuffer` via `onBytes`; control objects arrive as
  * JSON: `exit` → `onExit`, `turn` → `onTurn`, `status` → `onStatus` (Phase 4
- * push), `fs_dirty` → `onFsDirty` (Phase 6 push). Returns the `Channel` — the
+ * push), `fs_dirty` → `onFsDirty` (Phase 6 push), `disconnected` →
+ * `onDisconnected` (the daemon CONNECTION dropped without a process exit — the
+ * agent may well still be running; never an exit). Returns the `Channel` — the
  * caller must keep it alive (GC of it silently stops output).
  */
 export async function daemonAttach(
@@ -327,6 +329,7 @@ export async function daemonAttach(
   onTurn?: (turn: TurnEvent) => void,
   onStatus?: (status: string) => void,
   onFsDirty?: (paths: string[]) => void,
+  onDisconnected?: () => void,
 ): Promise<Channel<PtyChannelMessage> | null> {
   if (!inTauri()) return null;
   const onData = new Channel<PtyChannelMessage>();
@@ -350,12 +353,14 @@ export async function daemonAttach(
       // Phase 6 push: daemon's per-session watcher saw paths change → mark dirty.
       else if (m.type === "fs_dirty" && onFsDirty && m.paths) onFsDirty(m.paths);
       // Review M5: the daemon connection dropped (crash / codec error) WITHOUT a
-      // clean process exit. Surface it instead of leaving a silently-frozen
-      // terminal — end the view (the reconcile poll re-syncs; the agent may still
-      // be alive in the daemon and reopenable). Distinct from a process `exit`.
+      // clean process exit. NEVER routed to onExit — the agent is likely still
+      // alive in the daemon (deliberate detaches don't even push this anymore);
+      // treating it as an exit falsely flipped running detached agents to
+      // "exited" and made them unreattachable (2026-06 review). The view shows a
+      // connection-lost note; the reconcile poll re-syncs the real lifecycle.
       else if (m.type === "disconnected") {
         console.warn("[taime] daemon connection lost for session", sessionId);
-        onExit(null);
+        onDisconnected?.();
       } else if (m.type === "error") console.warn("[taime] daemon error", msg);
     }
   };
