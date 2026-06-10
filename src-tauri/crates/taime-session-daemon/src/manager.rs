@@ -722,6 +722,15 @@ impl Manager {
                 }
                 "true".to_string()
             }
+            // Drop a standing ack without touching the watcher's dirty
+            // accumulation (unlike clear_dirty): the agent changed more files
+            // after the ack, so the app re-arms the guard.
+            "clear_reviewed" => {
+                if let Some(store) = &self.store {
+                    let _ = store.clear_reviewed(tk);
+                }
+                "true".to_string()
+            }
             "reviewed" => {
                 let ids =
                     self.store.as_ref().and_then(|s| s.reviewed_agents().ok()).unwrap_or_default();

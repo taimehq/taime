@@ -514,6 +514,21 @@ function hasUnreviewedWork(
   return !!d && d.count > 0 && !s.reviewedFrames[frame.terminalId];
 }
 
+/** Are these two agents touching any of the same files? The real cross-agent
+ *  collision signal — a same-task switch is still guarded when it fires. */
+function contendedBetween(
+  s: Pick<Store, "dirty">,
+  aTid: string | null | undefined,
+  bTid: string | null | undefined,
+): boolean {
+  if (!aTid || !bTid) return false;
+  const a = s.dirty[aTid];
+  const b = s.dirty[bTid];
+  if (!a || !b) return false;
+  const bPaths = new Set(b.paths);
+  return a.paths.some((p) => bPaths.has(p));
+}
+
 const bootWorkspaceDir = loadWorkspaceDir();
 const bootRecents = loadRecentProjects();
 
@@ -591,10 +606,11 @@ export const useStore = create<Store>((set, get) => ({
   selectTask: (taskId, tab) => {
     const s = get();
     if (s.pendingSwitch) return;
-    if (
-      s.section === "agents" &&
-      hasUnreviewedWork(s, s.frames.find((f) => f.key === s.activeFrameKey))
-    ) {
+    const current = s.frames.find((f) => f.key === s.activeFrameKey);
+    // Navigating to the task this agent belongs to is not a context switch —
+    // it's the path to the agent's own Review tab; never guard it.
+    const sameTask = (current?.taskId ?? null) === taskId;
+    if (s.section === "agents" && !sameTask && hasUnreviewedWork(s, current)) {
       set({ pendingSwitch: { kind: "task", taskId, tab: tab ?? null } });
       return;
     }
@@ -1152,9 +1168,17 @@ export const useStore = create<Store>((set, get) => ({
     const current = s.frames.find((f) => f.key === s.activeFrameKey);
     // If the agent we're switching AWAY from left unreviewed changes, raise the
     // guard instead of switching. The UI resolves it (review or proceed).
+    // The Task is the unit of safe context switching: moving between agents of
+    // the same Task (incl. both Uncategorized) is supervision of parallel
+    // work, not a context switch — exempt, UNLESS the two agents have dirty
+    // paths in common (a real collision, task membership notwithstanding).
     if (hasUnreviewedWork(s, current)) {
-      set({ pendingSwitch: { kind: "frame", key } });
-      return;
+      const next = s.frames.find((f) => f.key === key);
+      const sameTask = !!next && (next.taskId ?? null) === (current?.taskId ?? null);
+      if (!sameTask || contendedBetween(s, current?.terminalId, next.terminalId)) {
+        set({ pendingSwitch: { kind: "frame", key } });
+        return;
+      }
     }
     set({ activeFrameKey: key });
   },
@@ -1167,15 +1191,15 @@ export const useStore = create<Store>((set, get) => ({
       set({ pendingSwitch: null });
       return;
     }
-    // Proceeding past the guard acknowledges the current agent's changes
-    // (keyed by agent id — review state outlives this frame).
+    // Proceeding past the guard acknowledges the current agent's changes for
+    // this session only (keyed by agent id — review state outlives this frame).
+    // Deliberately NOT persisted as a durable review ack: proceeding is a
+    // skip, not a review. New dirty paths re-arm the guard (markDaemonFsDirty)
+    // and an app restart re-raises it once — only Mark reviewed is durable.
     const from = s.frames.find((f) => f.key === s.activeFrameKey);
     const reviewedFrames = from?.terminalId
       ? { ...s.reviewedFrames, [from.terminalId]: true }
       : s.reviewedFrames;
-    // Persist the ack (durable review state) — same as markReviewed, so the
-    // acknowledgment isn't lost on the next app/daemon restart.
-    if (from?.terminalId) api.markReviewed(from.terminalId).catch(() => {});
     if (target.kind === "frame") {
       set({ activeFrameKey: target.key, pendingSwitch: null, reviewedFrames });
     } else if (target.kind === "section") {
@@ -1203,6 +1227,11 @@ export const useStore = create<Store>((set, get) => ({
       let changed = false;
       const next = { ...s.reviewedFrames };
       for (const id of agentIds) {
+        // A durable ack only covers work up to the review that set it. The
+        // daemon resets its dirty accumulation at that same review, so a
+        // non-empty dirty set here means changes arrived AFTER the ack — the
+        // ack is stale; don't let a hydrate tick disarm the guard.
+        if (s.dirty[id] && s.dirty[id].count > 0) continue;
         if (!next[id]) {
           next[id] = true;
           changed = true;
@@ -1326,32 +1355,48 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  markDaemonFsDirty: (sessionId, paths) =>
-    set((s) => {
-      const tid = s.rustPtySessions[sessionId]?.terminalId;
-      if (!tid || paths.length === 0) return s;
-      const prev = s.dirty[tid];
-      if (prev && prev.count === paths.length && prev.paths.join(" ") === paths.join(" ")) {
-        return s;
-      }
+  markDaemonFsDirty: (sessionId, paths) => {
+    const s = get();
+    const tid = s.rustPtySessions[sessionId]?.terminalId;
+    if (!tid || paths.length === 0) return;
+    const prev = s.dirty[tid];
+    if (prev && prev.count === paths.length && prev.paths.join(" ") === paths.join(" ")) {
+      return;
+    }
+    // A standing ack covers the set that was acknowledged. Pushes are
+    // cumulative (the full set since the last review-clear), so any path the
+    // ack didn't cover re-arms the guard — locally and in the daemon's
+    // durable ack (best-effort), so a hydrate tick can't re-disarm it.
+    const known = new Set(prev?.paths ?? []);
+    const ackStale = !!s.reviewedFrames[tid] && paths.some((p) => !known.has(p));
+    if (ackStale) api.clearReviewed(tid).catch(() => {});
+    set((cur) => {
       // First dirty since launch / last review-clear → one attention item.
       // Subsequent pushes only grow the set; they don't re-notify.
-      const m = s.rustPtySessions[sessionId];
-      const notifications = !prev
-        ? appendNotification(s.notifications, {
-            kind: "review",
-            agentId: tid,
-            taskId: m.taskId ?? null,
-            text: `${providerTitle(m.provider)} · ${paths.length} path${
-              paths.length === 1 ? "" : "s"
-            } changed`,
-          })
-        : undefined;
+      const m = cur.rustPtySessions[sessionId];
+      const notifications =
+        !prev && m
+          ? appendNotification(cur.notifications, {
+              kind: "review",
+              agentId: tid,
+              taskId: m.taskId ?? null,
+              text: `${providerTitle(m.provider)} · ${paths.length} path${
+                paths.length === 1 ? "" : "s"
+              } changed`,
+            })
+          : undefined;
+      let reviewedFrames = cur.reviewedFrames;
+      if (ackStale && reviewedFrames[tid]) {
+        reviewedFrames = { ...reviewedFrames };
+        delete reviewedFrames[tid];
+      }
       return {
-        dirty: { ...s.dirty, [tid]: { count: paths.length, paths } },
+        dirty: { ...cur.dirty, [tid]: { count: paths.length, paths } },
+        reviewedFrames,
         ...(notifications ? { notifications } : {}),
       };
-    }),
+    });
+  },
 
   setFrameModel: (key, model) =>
     set((s) => {

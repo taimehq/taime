@@ -17,6 +17,7 @@ vi.mock("./api", () => ({
     listAgents: vi.fn(async () => []),
     clearDaemonDirty: vi.fn(async () => true),
     markReviewed: vi.fn(async () => true),
+    clearReviewed: vi.fn(async () => true),
     reviewedAgents: vi.fn(async () => []),
   },
 }));
@@ -81,6 +82,7 @@ import { sendToTerminal } from "./lib/terminalInput";
 const provisionWorktree = vi.mocked(api.provisionWorktree);
 const listAgents = vi.mocked(api.listAgents);
 const markReviewedApi = vi.mocked(api.markReviewed);
+const clearReviewedApi = vi.mocked(api.clearReviewed);
 const spawnAgent = vi.mocked(daemonSpawnAgent);
 const ping = vi.mocked(daemonPing);
 const checkpoint = vi.mocked(daemonCheckpoint);
@@ -748,10 +750,11 @@ describe("section navigation", () => {
 
   it("frame switches still guard (pendingSwitch kind frame) and honor agent-id review state", () => {
     seedUnreviewedAgent();
+    // Different tasks — the guarded case (same-task switches are exempt below).
     useStore.setState({
       frames: [
-        makeFrame({ key: "f1", terminalId: "term-1" }),
-        makeFrame({ key: "f2", terminalId: "term-2", ptySessionId: "sess-2" }),
+        makeFrame({ key: "f1", terminalId: "term-1", taskId: "task-1" }),
+        makeFrame({ key: "f2", terminalId: "term-2", ptySessionId: "sess-2", taskId: "task-2" }),
       ],
     });
 
@@ -763,6 +766,67 @@ describe("section navigation", () => {
     const s = useStore.getState();
     expect(s.activeFrameKey).toBe("f2");
     expect(s.reviewedFrames["term-1"]).toBe(true);
+  });
+
+  it("frame switches inside the same task are supervision, not a context switch — no guard", () => {
+    seedUnreviewedAgent();
+    useStore.setState({
+      frames: [
+        makeFrame({ key: "f1", terminalId: "term-1", taskId: "task-1" }),
+        makeFrame({ key: "f2", terminalId: "term-2", ptySessionId: "sess-2", taskId: "task-1" }),
+      ],
+    });
+
+    useStore.getState().setActiveFrameGuarded("f2");
+    const s = useStore.getState();
+    expect(s.pendingSwitch).toBeNull();
+    expect(s.activeFrameKey).toBe("f2");
+  });
+
+  it("two Uncategorized agents share the null partition cell — no guard between them", () => {
+    seedUnreviewedAgent();
+    useStore.setState({
+      frames: [
+        makeFrame({ key: "f1", terminalId: "term-1" }),
+        makeFrame({ key: "f2", terminalId: "term-2", ptySessionId: "sess-2" }),
+      ],
+    });
+
+    useStore.getState().setActiveFrameGuarded("f2");
+    expect(useStore.getState().pendingSwitch).toBeNull();
+    expect(useStore.getState().activeFrameKey).toBe("f2");
+  });
+
+  it("a same-task switch is still guarded when the two agents contend on a file", () => {
+    seedUnreviewedAgent();
+    useStore.setState({
+      frames: [
+        makeFrame({ key: "f1", terminalId: "term-1", taskId: "task-1" }),
+        makeFrame({ key: "f2", terminalId: "term-2", ptySessionId: "sess-2", taskId: "task-1" }),
+      ],
+      // term-1 (seeded) has a.ts + b.ts dirty; term-2 also touched b.ts.
+      dirty: {
+        "term-1": { count: 2, paths: ["a.ts", "b.ts"] },
+        "term-2": { count: 1, paths: ["b.ts"] },
+      },
+    });
+
+    useStore.getState().setActiveFrameGuarded("f2");
+    expect(useStore.getState().pendingSwitch).toEqual({ kind: "frame", key: "f2" });
+    expect(useStore.getState().activeFrameKey).toBe("f1");
+  });
+
+  it("selectTask to the dirty agent's own task isn't guarded (it's the path to Review)", () => {
+    seedUnreviewedAgent();
+    useStore.setState({
+      frames: [makeFrame({ key: "f1", terminalId: "term-1", taskId: "task-1" })],
+    });
+
+    useStore.getState().selectTask("task-1", "review");
+    const s = useStore.getState();
+    expect(s.pendingSwitch).toBeNull();
+    expect(s.section).toBe("tasks");
+    expect(s.selectedTaskId).toBe("task-1");
   });
 });
 
@@ -1088,18 +1152,48 @@ describe("durable review acks", () => {
     expect(markReviewedApi).toHaveBeenCalledWith("agent-z");
   });
 
-  it("resolveSwitch(true) persists the proceeded-past agent's ack", () => {
+  it("resolveSwitch(true) is a session-local skip — ack set locally, NOT persisted", () => {
     seedUnreviewedAgent();
     useStore.getState().setSection("dashboard"); // raises the guard
     useStore.getState().resolveSwitch(true);
     expect(useStore.getState().reviewedFrames["term-1"]).toBe(true);
-    expect(markReviewedApi).toHaveBeenCalledWith("term-1");
+    // Proceeding is a skip, not a review — only Mark reviewed persists an ack.
+    expect(markReviewedApi).not.toHaveBeenCalled();
+  });
+
+  it("a new dirty path re-arms the guard: local ack dropped, daemon ack cleared", () => {
+    useStore.setState({
+      rustPtySessions: { "sess-1": makeMeta() },
+      dirty: { "term-1": { count: 1, paths: ["a.ts"] } },
+      reviewedFrames: { "term-1": true },
+    });
+
+    // Identical cumulative re-push (e.g. reattach replay) keeps the ack…
+    useStore.getState().markDaemonFsDirty("sess-1", ["a.ts"]);
+    expect(useStore.getState().reviewedFrames["term-1"]).toBe(true);
+    expect(clearReviewedApi).not.toHaveBeenCalled();
+
+    // …but a path outside the acknowledged set re-arms the guard.
+    useStore.getState().markDaemonFsDirty("sess-1", ["a.ts", "c.ts"]);
+    expect(useStore.getState().reviewedFrames["term-1"]).toBeUndefined();
+    expect(clearReviewedApi).toHaveBeenCalledWith("term-1");
   });
 
   it("hydrateReviewed unions daemon acks without clobbering local ones", () => {
     useStore.setState({ reviewedFrames: { local: true } });
     useStore.getState().hydrateReviewed(["a", "b", "local"]);
     expect(useStore.getState().reviewedFrames).toEqual({ local: true, a: true, b: true });
+  });
+
+  it("hydrateReviewed won't disarm an agent that's dirty again (stale daemon ack)", () => {
+    useStore.setState({
+      dirty: { a: { count: 1, paths: ["x.ts"] } },
+      reviewedFrames: {},
+    });
+    useStore.getState().hydrateReviewed(["a", "b"]);
+    const s = useStore.getState();
+    expect(s.reviewedFrames["a"]).toBeUndefined();
+    expect(s.reviewedFrames["b"]).toBe(true);
   });
 
   it("hydrateReviewed is an identity no-op when nothing new", () => {

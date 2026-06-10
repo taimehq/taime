@@ -442,6 +442,10 @@ export const api = {
    *  survives a UI/daemon restart (it was frontend-local before). */
   markReviewed: (agentId: string) =>
     daemonQuery<boolean>("mark_reviewed", { agent_id: agentId }, true),
+  /** Drop an agent's standing ack: its dirty set grew past what was
+   *  acknowledged, so new changes must re-raise the guard. */
+  clearReviewed: (agentId: string) =>
+    daemonQuery<boolean>("clear_reviewed", { agent_id: agentId }, true),
   /** Agent ids with a standing review ack — hydrates the guard on boot. */
   reviewedAgents: () => daemonQuery<string[]>("reviewed", {}, []),
 
