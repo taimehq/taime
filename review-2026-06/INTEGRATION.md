@@ -10,7 +10,7 @@ knows exactly what was resolved and why.
 | --- | --- | --- |
 | `fix/p0-review-gate` | P0 1–3: symbolic merge/revert target resolution, daemon-enforced merge gate (ack + digest binding), untracked-file merge/revert | **Complete & correct** |
 | `fix/p0-frontend-trust` | P0 7–10, 15 (+ ~10 hardening commits): strict review reads, frame-close keeps daemon dirty, detach≠exit, Console→inbox, Task Activity by workspace_root | **Complete & correct** |
-| `chore/hygiene` | CI, LICENSE (FSL-1.1-ALv2), daemon.log, P0 16 (corrupt-store recovery + StoreHealth pill) | **Complete & correct** |
+| `chore/hygiene` | CI, LICENSE (AGPL-3.0-only), daemon.log, P0 16 (corrupt-store recovery + StoreHealth pill) | **Complete & correct** |
 
 P0 done after this lands: **1, 2, 3, 6, 7, 8, 9, 10, 15, 16** (item 6 = the
 earlier guard fix on main). Remaining P0: 4, 5, 11 (attribution/watcher), 12,
