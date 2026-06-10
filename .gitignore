@@ -80,10 +80,8 @@ taime-*.png
 *~
 .history/
 
-# --- Claude Code local state (worktrees + machine-local settings) ------------
-.claude/worktrees/
-.claude/scheduled_tasks.lock
-.claude/settings.local.json
+# --- Claude Code local state (entire dir: worktrees, settings, scratch) ------
+.claude/
 
 # --- OS noise ----------------------------------------------------------------
 .DS_Store
