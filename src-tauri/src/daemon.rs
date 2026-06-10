@@ -349,7 +349,11 @@ impl DaemonClient {
 
     /// Enqueue an inbox message for a live agent (Phase 5 message bus). The
     /// daemon delivers it into the receiver's stdin when it next goes idle.
-    /// Returns the monotonic inbox id.
+    /// Returns the monotonic inbox id. Connect-only: with no daemon running
+    /// there is no receiver — spawning a fresh daemon here would durably
+    /// enqueue to an agent id that died with the old daemon and can never
+    /// reappear (new launches mint new ids), a silent dead-letter behind a
+    /// confident "queued" UI.
     pub async fn send_message(
         &self,
         sender: String,
@@ -357,7 +361,10 @@ impl DaemonClient {
         message: String,
     ) -> Result<i64, String> {
         let req_id = self.next_req();
-        let mut conn = self.connect_handshake().await?;
+        let mut conn = match self.try_connect_handshake().await? {
+            Some(c) => c,
+            None => return Err("daemon unreachable".to_string()),
+        };
         send(&mut conn, &ClientMsg::SendMessage { req_id, sender, receiver, message }).await?;
         match read_server(&mut conn).await? {
             ServerMsg::MessageQueued { id, .. } => Ok(id),

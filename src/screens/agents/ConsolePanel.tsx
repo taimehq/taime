@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ChevronDown, ChevronRight, CornerDownLeft } from "lucide-react";
 import type { GraphTurn } from "../../api";
-import { daemonSendMessage } from "../../pty";
+import { useStore } from "../../store";
+import { submitConsoleMessage } from "./consoleSubmit";
 import { fmtClock, fmtClockMs } from "./format";
 
 /**
@@ -67,6 +68,10 @@ export function ConsolePanel({
   const [echoes, setEchoes] = useState<Echo[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
+  // With the daemon unreachable there is no inbox to enqueue on — disable the
+  // form instead of letting a submit boot a fresh daemon that has never heard
+  // of this agent (the message would dead-letter behind a confident echo).
+  const connected = useStore((s) => s.connected);
 
   // Autoscroll to the newest block (console reads bottom-up like a terminal).
   useEffect(() => {
@@ -84,25 +89,23 @@ export function ConsolePanel({
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     const v = input.trim();
-    if (!v || exited || sending || !agentId) return;
+    if (!v || exited || sending || !agentId || !connected) return;
     setSending(true);
-    try {
-      // Enqueue on the daemon inbox: the daemon types + submits it (with the
-      // attribution boundary) when the agent next goes idle — no dependency on
-      // a terminal attachment this view never has.
-      await daemonSendMessage("user", agentId, v);
+    // Enqueue on the daemon inbox: the daemon types + submits it when the
+    // agent next goes idle — no dependency on a terminal attachment this view
+    // never has. A failed enqueue is surfaced — a false "queued" echo is
+    // exactly the bug this path replaced.
+    const r = await submitConsoleMessage(agentId, v);
+    if (r.ok) {
       setSendError(null);
       setEchoes((es) =>
         [...es, { id: ++echoSeq, at: Date.now(), text: v }].slice(-20),
       );
       setInput("");
-    } catch (err) {
-      // The enqueue itself failed (daemon unreachable / refused): say so —
-      // a false "delivered" echo here is exactly the bug this path replaced.
-      setSendError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSending(false);
+    } else {
+      setSendError(r.error);
     }
+    setSending(false);
   };
 
   const empty = turns.length === 0 && echoes.length === 0;
@@ -233,20 +236,22 @@ export function ConsolePanel({
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          disabled={exited || sending || !agentId}
+          disabled={exited || sending || !agentId || !connected}
           placeholder={
             exited
               ? "agent exited · stdin closed"
-              : !agentId
-                ? "no agent id yet — use the Terminal tab"
-                : `message ${anchorId} · delivered when it goes idle…`
+              : !connected
+                ? "daemon unreachable · retrying"
+                : !agentId
+                  ? "no agent id yet — use the Terminal tab"
+                  : `message ${anchorId} · delivered when it goes idle…`
           }
           title="Enqueues on the daemon inbox; the daemon types + submits it into the agent's stdin when the agent next goes idle"
           className="min-w-0 flex-1 bg-transparent font-mono text-[12px] text-zinc-200 placeholder:text-zinc-700 focus:outline-none disabled:opacity-50"
         />
         <button
           type="submit"
-          disabled={!input.trim() || exited || sending || !agentId}
+          disabled={!input.trim() || exited || sending || !agentId || !connected}
           className="flex shrink-0 items-center gap-1 rounded-md border border-ink-500 px-2 py-0.5 text-[11px] text-zinc-300 enabled:hover:bg-ink-600 disabled:cursor-default disabled:opacity-40"
         >
           <CornerDownLeft size={11} />
