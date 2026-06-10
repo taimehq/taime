@@ -72,6 +72,10 @@ export function TerminalViewRustPty({
   const applyResizeRef = useRef<() => void>(() => {});
   // Held so the channel's onmessage isn't GC'd while the view is mounted.
   const channelRef = useRef<Channel<unknown> | null>(null);
+  // The attach generation (from daemonAttach) — scopes our daemonCloseView so
+  // this view's cleanup can never detach a NEWER view's live attachment if our
+  // attach lost a close-and-reopen race. Null until the attach resolves.
+  const attachGenRef = useRef<number | null>(null);
   const fontSize = useStore((s) => s.terminalFontSize);
   const {
     searchRef,
@@ -210,7 +214,7 @@ export function TerminalViewRustPty({
       safeFit();
       // Attach: registers the channel sink + replays scrollback (in-app) or sends
       // the grid repaint at the attach size (daemon), then streams live output.
-      const ch = await daemonAttach(
+      const attached = await daemonAttach(
         sessionId,
         term.rows,
         term.cols,
@@ -225,8 +229,9 @@ export function TerminalViewRustPty({
           sniffModel(bytes);
         },
         () => {
+          // A REAL process exit (the daemon's Exited control) — authoritative
+          // regardless of mount state, so the lifecycle flip is unconditional.
           if (alive) term.write("\r\n\x1b[33m[process exited]\x1b[0m\r\n");
-          // Reflect lifecycle: the agent's process is gone (running → exited).
           useStore.getState().markRustPtyExited(sessionId);
           onConnectionChange?.("closed");
         },
@@ -236,15 +241,37 @@ export function TerminalViewRustPty({
         (status) => useStore.getState().setDaemonSessionStatus(sessionId, status),
         // Phase 6 fs push → mark the agent's terminal dirty (its diff is stale).
         (paths) => useStore.getState().markDaemonFsDirty(sessionId, paths),
+        // The daemon CONNECTION dropped without a process exit (daemon crash /
+        // codec error — deliberate detaches are silent). The agent may still be
+        // running: never flip it to exited here (detach ≠ kill, the safe
+        //-context-switching invariant). Flag the lost connection so the
+        // reconcile poll may demote this session against the daemon roster even
+        // while framed — without the flag, the framed exemption would wedge a
+        // crashed daemon's agent as "running · PTY attached" forever.
+        () => {
+          // alive-gated: a superseded pump's LATE push (the channel callback
+          // outlives unmount) must not re-flag a session whose newer attach
+          // already cleared the flag. Post-unmount, either the frame closed
+          // (unframed → the normal demotion path) or a newer view owns the
+          // session's connection state.
+          if (!alive) return;
+          useStore.getState().setRustPtyConnectionLost(sessionId, true);
+          term.write("\r\n\x1b[33m[daemon connection lost — reattach to resume]\x1b[0m\r\n");
+          onConnectionChange?.("closed");
+        },
       );
       if (!alive) {
-        // Unmounted while the attach was in flight: detach so we don't leave a
-        // phantom attachment with no acker (which would stall the agent at the
-        // backpressure watermark).
-        daemonCloseView(sessionId);
+        // Unmounted while the attach was in flight: detach OUR attachment (gen-
+        // scoped — a newer view may already hold the session) so we don't leave
+        // a phantom attachment with no acker, which would stall the agent at
+        // the backpressure watermark. Nothing to close if the attach failed.
+        if (attached) daemonCloseView(sessionId, attached.gen);
         return;
       }
-      channelRef.current = ch as Channel<unknown> | null;
+      channelRef.current = (attached?.channel ?? null) as Channel<unknown> | null;
+      attachGenRef.current = attached?.gen ?? null;
+      // A live attach supersedes any earlier connection-lost flag.
+      if (attached) useStore.getState().setRustPtyConnectionLost(sessionId, false);
       onConnectionChange?.("open");
       // Nudge a redraw so a reattached TUI repaints cleanly at the current size.
       safeFit();
@@ -259,10 +286,14 @@ export function TerminalViewRustPty({
       el.removeEventListener("wheel", onWheel, wheelOpts);
       cleanupClipboard();
       unregisterInput();
-      // Drop the channel ref (its onmessage stops); detach keeps the agent alive.
+      // Drop our ref. NOTE: the channel's callback is NOT dead yet — Tauri keeps
+      // it registered until the app-side pump drops the Channel (the in-order
+      // "end" message), so every attach callback above must stay alive-gated.
       channelRef.current = null;
-      // Closing the view detaches — it does NOT kill the agent.
-      daemonCloseView(sessionId);
+      // Closing the view detaches — it does NOT kill the agent. Gen-scoped to
+      // OUR attach; if the attach is still in flight, its continuation above
+      // closes it instead (nothing to close yet here).
+      if (attachGenRef.current != null) daemonCloseView(sessionId, attachGenRef.current);
       offResults.dispose();
       searchRef.current = null;
       termRef.current = null;

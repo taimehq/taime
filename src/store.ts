@@ -162,6 +162,12 @@ export interface RustPtyMeta {
   startedAt: number;
   /** Lifecycle: "running" (reattachable) or "exited" (process gone; dismiss only). */
   status: RustPtyStatus;
+  /** The attach connection died WITHOUT a process exit (daemon crash/restart —
+   *  deliberate detaches don't set this). While true, the session's exit can no
+   *  longer arrive over the channel, so the reconcile tick may demote it even
+   *  though it's framed (the framed exemption only covers the just-launched
+   *  race). Cleared by the next successful attach. */
+  connectionLost?: boolean;
   /** Task membership (null ⇒ Uncategorized). Daemon-reported from the worktree
    *  row; the reconcile tick keeps it fresh after reassignment. */
   taskId?: string | null;
@@ -448,6 +454,10 @@ interface Store {
   reopenRustPty: (ptySessionId: string, opts?: { focus?: boolean }) => void;
   /** Mark a Rust-PTY session exited (process gone) — keeps it visible as such. */
   markRustPtyExited: (ptySessionId: string) => void;
+  /** Record whether a session's attach connection was lost without an exit
+   *  (daemon crash/restart). Set by the view's onDisconnected; cleared by the
+   *  next successful attach. Gates the reconcile tick's framed exemption. */
+  setRustPtyConnectionLost: (ptySessionId: string, lost: boolean) => void;
   /** Adopt a daemon session discovered at boot (crash survival): populate the
    *  registry so it appears in the detached panel and can be reopened. */
   adoptDaemonSession: (summary: DaemonSessionSummary) => void;
@@ -996,6 +1006,18 @@ export const useStore = create<Store>((set, get) => ({
       };
     }),
 
+  setRustPtyConnectionLost: (ptySessionId, lost) =>
+    set((s) => {
+      const m = s.rustPtySessions[ptySessionId];
+      if (!m || !!m.connectionLost === lost) return s;
+      return {
+        rustPtySessions: {
+          ...s.rustPtySessions,
+          [ptySessionId]: { ...m, connectionLost: lost },
+        },
+      };
+    }),
+
   adoptDaemonSession: (summary) =>
     set((s) => {
       // Don't clobber a session we already track (this run or a prior adopt).
@@ -1098,9 +1120,16 @@ export const useStore = create<Store>((set, get) => ({
       const frames = s.frames.filter((f) => f.key !== key);
       const rustPtySessions = { ...s.rustPtySessions };
       if (sid) delete rustPtySessions[sid];
+      // Dropping the agent drops its LOCAL dirty mirror too — with the agent
+      // gone there is no review surface left to clear it, and an orphaned
+      // entry shows a phantom "needs review" count forever. (Local only:
+      // the daemon's session state dies with the kill.)
+      const dirty = { ...s.dirty };
+      if (frame?.terminalId) delete dirty[frame.terminalId];
       return {
         frames,
         rustPtySessions,
+        dirty,
         activeFrameKey:
           s.activeFrameKey === key ? (frames[frames.length - 1]?.key ?? null) : s.activeFrameKey,
       };
@@ -1112,8 +1141,12 @@ export const useStore = create<Store>((set, get) => ({
     await daemonKill(ptySessionId);
     set((s) => {
       const rustPtySessions = { ...s.rustPtySessions };
+      const tid = rustPtySessions[ptySessionId]?.terminalId;
       delete rustPtySessions[ptySessionId];
-      return { rustPtySessions };
+      // Same phantom-dirty cleanup as killRustPty: no agent, no review surface.
+      const dirty = { ...s.dirty };
+      if (tid) delete dirty[tid];
+      return { rustPtySessions, dirty };
     });
   },
 
@@ -1143,8 +1176,10 @@ export const useStore = create<Store>((set, get) => ({
     if (isDaemonTransport(frame?.transport) && frame?.ptySessionId) {
       await daemonCloseView(frame.ptySessionId);
     }
-    // Best-effort clear dirty marker for the closed terminal.
-    if (frame?.terminalId) get().clearDirty(frame.terminalId);
+    // Deliberately NO clearDirty here: clearing also resets the DAEMON's
+    // accumulated dirty set — the durable "this agent has unreviewed work"
+    // signal (badges, the switch guard, review notifications). Only review
+    // actions (Mark reviewed) may reset it; closing a view is not a review.
   },
 
   dismissTerminal: (id) =>

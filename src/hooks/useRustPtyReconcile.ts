@@ -1,9 +1,27 @@
 import { useEffect } from "react";
 import { inTauri } from "../backend";
-import { useStore } from "../store";
+import { useStore, type RustPtyMeta } from "../store";
 import { api } from "../api";
 import { daemonList, type DaemonSessionSummary } from "../pty";
 import { providerTitle } from "../lib/providerLabel";
+
+/** Which tracked sessions the tick should demote to exited: running sessions
+ *  the daemon no longer reports alive — EXCEPT framed ones (a just-launched
+ *  frame may briefly precede list visibility), UNLESS the frame's attach
+ *  connection was lost without an exit (daemon crash/restart): then the exit
+ *  can never arrive over the channel and the roster is the only truth left,
+ *  so the framed exemption must not wedge the agent as "running" forever. */
+export function sessionsToDemote(
+  meta: Record<string, RustPtyMeta>,
+  framed: Set<string>,
+  live: Set<string>,
+): string[] {
+  return Object.keys(meta).filter((id) => {
+    if (meta[id].status !== "running") return false;
+    if (framed.has(id) && !meta[id].connectionLost) return false;
+    return !live.has(id);
+  });
+}
 
 /** Mirror daemon-reported status (Phase 4) into the shared terminalStatuses map,
  *  keyed by the agent id the StatusBadge already reads — so a daemon agent's
@@ -34,7 +52,7 @@ export function useRustPtyReconcile() {
     // spawning a daemon when none is running.
     let bootDone = false;
     (async () => {
-      const sessions = await daemonList();
+      const sessions = (await daemonList()) ?? [];
       if (!alive) return;
       const adopt = useStore.getState().adoptDaemonSession;
       for (const s of sessions) adopt(s);
@@ -49,6 +67,10 @@ export function useRustPtyReconcile() {
     const tick = async () => {
       const daemonSessions = await daemonList();
       if (!alive) return;
+      // A FAILED enumeration is not an empty roster: skip the whole tick
+      // (adoption, status mirror, and especially the exit demotion below)
+      // rather than treat the error as "every agent is gone".
+      if (daemonSessions === null) return;
       applyDaemonStatuses(daemonSessions);
       // Mirror daemon-side Task membership (task_assign / delete demotion) into
       // the tracked metas so the sidebar grouping stays fresh.
@@ -84,11 +106,10 @@ export function useRustPtyReconcile() {
         }
       }
 
-      // Demote sessions the daemon no longer reports alive (and that aren't framed —
-      // a just-launched frame may briefly precede list visibility) as exited.
+      // Demote sessions the daemon no longer reports alive (see sessionsToDemote
+      // for the framed/connection-lost rules) as exited.
       const meta = useStore.getState().rustPtySessions;
-      const ids = Object.keys(meta);
-      if (ids.length === 0) return;
+      if (Object.keys(meta).length === 0) return;
       const live = new Set(
         daemonSessions.filter((s) => s.alive !== false).map((s) => s.id),
       );
@@ -99,10 +120,7 @@ export function useRustPtyReconcile() {
           .filter(Boolean) as string[],
       );
       const markExited = useStore.getState().markRustPtyExited;
-      for (const id of ids) {
-        if (meta[id].status !== "running" || framed.has(id)) continue;
-        if (!live.has(id)) markExited(id);
-      }
+      for (const id of sessionsToDemote(meta, framed, live)) markExited(id);
     };
 
     const interval = setInterval(tick, 4000);

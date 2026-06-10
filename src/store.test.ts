@@ -75,6 +75,8 @@ import {
   daemonPing,
   daemonCheckpoint,
   daemonSendMessage,
+  daemonCloseView,
+  daemonKill,
   type DaemonSessionSummary,
 } from "./pty";
 import { inTauri } from "./backend";
@@ -84,6 +86,9 @@ const provisionWorktree = vi.mocked(api.provisionWorktree);
 const listAgents = vi.mocked(api.listAgents);
 const markReviewedApi = vi.mocked(api.markReviewed);
 const clearReviewedApi = vi.mocked(api.clearReviewed);
+const clearDaemonDirty = vi.mocked(api.clearDaemonDirty);
+const closeView = vi.mocked(daemonCloseView);
+const killSession = vi.mocked(daemonKill);
 const spawnAgent = vi.mocked(daemonSpawnAgent);
 const ping = vi.mocked(daemonPing);
 const checkpoint = vi.mocked(daemonCheckpoint);
@@ -310,6 +315,28 @@ describe("markRustPtyExited", () => {
   });
 });
 
+describe("setRustPtyConnectionLost", () => {
+  it("sets and clears the flag, no-oping when unchanged", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().setRustPtyConnectionLost("sess-1", true);
+    expect(useStore.getState().rustPtySessions["sess-1"].connectionLost).toBe(true);
+
+    const afterSet = useStore.getState();
+    useStore.getState().setRustPtyConnectionLost("sess-1", true);
+    expect(useStore.getState()).toBe(afterSet); // identity no-op
+
+    useStore.getState().setRustPtyConnectionLost("sess-1", false);
+    expect(useStore.getState().rustPtySessions["sess-1"].connectionLost).toBe(false);
+  });
+
+  it("no-ops on an unknown session id", () => {
+    const before = useStore.getState();
+    useStore.getState().setRustPtyConnectionLost("nope", true);
+    expect(useStore.getState()).toBe(before);
+  });
+});
+
 // ── reopenRustPty ───────────────────────────────────────────────────────────
 
 describe("reopenRustPty", () => {
@@ -390,6 +417,183 @@ describe("reopenRustPty", () => {
     const s = useStore.getState();
     expect(s.frames).toHaveLength(2);
     expect(s.activeFrameKey).toBe("f-current");
+  });
+});
+
+// ── closeFrame / clearDirty (view lifecycle vs the daemon dirty signal) ─────
+
+describe("closeFrame", () => {
+  it("removes the frame, detaches (never kills), and PRESERVES the dirty signal", async () => {
+    useStore.setState({
+      frames: [makeFrame()],
+      activeFrameKey: "frame-test",
+      rustPtySessions: { "sess-1": makeMeta() },
+      dirty: { "term-1": { count: 2, paths: ["a.ts", "b.ts"] } },
+    });
+
+    await useStore.getState().closeFrame("frame-test");
+
+    const s = useStore.getState();
+    expect(s.frames).toHaveLength(0);
+    expect(closeView).toHaveBeenCalledWith("sess-1"); // detach — close ≠ kill
+    expect(killSession).not.toHaveBeenCalled();
+    // Closing a view is NOT a review: the daemon's accumulated dirty set (the
+    // unreviewed-work signal behind badges/guard/notifications) must survive,
+    // and so must the local mirror.
+    expect(clearDaemonDirty).not.toHaveBeenCalled();
+    expect(s.dirty["term-1"]).toEqual({ count: 2, paths: ["a.ts", "b.ts"] });
+  });
+
+  it("does not dismiss daemon frames (they have the detached-agent lifecycle)", async () => {
+    useStore.setState({ frames: [makeFrame()] });
+
+    await useStore.getState().closeFrame("frame-test");
+
+    expect(useStore.getState().dismissedTerminalIds.has("term-1")).toBe(false);
+  });
+
+  it("falls back the active frame to the last remaining frame", async () => {
+    useStore.setState({
+      frames: [
+        makeFrame({ key: "f-1", ptySessionId: "sess-1" }),
+        makeFrame({ key: "f-2", ptySessionId: "sess-2", terminalId: "term-2" }),
+      ],
+      activeFrameKey: "f-2",
+    });
+
+    await useStore.getState().closeFrame("f-2");
+
+    expect(useStore.getState().activeFrameKey).toBe("f-1");
+  });
+
+  it("keeps the active frame when closing an inactive one", async () => {
+    useStore.setState({
+      frames: [
+        makeFrame({ key: "f-1", ptySessionId: "sess-1" }),
+        makeFrame({ key: "f-2", ptySessionId: "sess-2", terminalId: "term-2" }),
+      ],
+      activeFrameKey: "f-2",
+    });
+
+    await useStore.getState().closeFrame("f-1");
+
+    expect(useStore.getState().activeFrameKey).toBe("f-2");
+  });
+});
+
+describe("clearDirty (the review action)", () => {
+  it("clears the local entry AND resets the daemon's accumulated set", () => {
+    useStore.setState({ dirty: { "term-1": { count: 1, paths: ["a.ts"] } } });
+
+    useStore.getState().clearDirty("term-1");
+
+    expect(clearDaemonDirty).toHaveBeenCalledWith("term-1");
+    expect(useStore.getState().dirty["term-1"]).toBeUndefined();
+  });
+
+  it("tells the daemon even without a local entry (the daemon owns the watch)", () => {
+    useStore.getState().clearDirty("term-x");
+    expect(clearDaemonDirty).toHaveBeenCalledWith("term-x");
+  });
+});
+
+describe("setDirty", () => {
+  it("stores the dirty state and no-ops on an identical payload", () => {
+    useStore.getState().setDirty("term-1", { count: 1, paths: ["a.ts"] });
+    const after = useStore.getState();
+    expect(after.dirty["term-1"]).toEqual({ count: 1, paths: ["a.ts"] });
+
+    useStore.getState().setDirty("term-1", { count: 1, paths: ["a.ts"] });
+    expect(useStore.getState()).toBe(after); // referential no-op
+  });
+});
+
+// ── killRustPty / forgetRustPty (explicit termination, distinct from close) ─
+
+describe("killRustPty", () => {
+  it("kills the session and removes the frame AND the registry entry", async () => {
+    useStore.setState({
+      frames: [makeFrame()],
+      activeFrameKey: "frame-test",
+      rustPtySessions: { "sess-1": makeMeta() },
+    });
+
+    await useStore.getState().killRustPty("frame-test");
+
+    const s = useStore.getState();
+    expect(killSession).toHaveBeenCalledWith("sess-1");
+    expect(s.frames).toHaveLength(0);
+    expect(s.rustPtySessions["sess-1"]).toBeUndefined();
+    expect(s.activeFrameKey).toBeNull();
+  });
+
+  it("falls back the active frame to the last remaining frame", async () => {
+    useStore.setState({
+      frames: [
+        makeFrame({ key: "f-1", ptySessionId: "sess-1" }),
+        makeFrame({ key: "f-2", ptySessionId: "sess-2", terminalId: "term-2" }),
+      ],
+      activeFrameKey: "f-2",
+      rustPtySessions: { "sess-1": makeMeta(), "sess-2": makeMeta({ ptySessionId: "sess-2" }) },
+    });
+
+    await useStore.getState().killRustPty("f-2");
+
+    expect(useStore.getState().activeFrameKey).toBe("f-1");
+  });
+
+  it("no-ops the daemon kill for an unknown frame key", async () => {
+    await useStore.getState().killRustPty("nope");
+    expect(killSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("forgetRustPty", () => {
+  it("kills (if alive) and drops the registry entry, leaving frames alone", async () => {
+    useStore.setState({
+      rustPtySessions: { "sess-1": makeMeta({ status: "exited" }) },
+      frames: [makeFrame({ key: "f-other", ptySessionId: "sess-other", terminalId: "t-x" })],
+    });
+
+    await useStore.getState().forgetRustPty("sess-1");
+
+    const s = useStore.getState();
+    expect(killSession).toHaveBeenCalledWith("sess-1");
+    expect(s.rustPtySessions["sess-1"]).toBeUndefined();
+    expect(s.frames).toHaveLength(1);
+  });
+});
+
+// ── recordTurn ──────────────────────────────────────────────────────────────
+
+describe("recordTurn", () => {
+  const turn = (epoch: number) => ({
+    epoch,
+    startOffset: 0,
+    endOffset: 1,
+    startedCause: "Submit",
+    endedCause: "Quiet",
+    commandExit: null,
+    fsDirtyPaths: [],
+  });
+
+  it("appends turns per frame key", () => {
+    useStore.getState().recordTurn("f-1", turn(1));
+    useStore.getState().recordTurn("f-1", turn(2));
+    useStore.getState().recordTurn("f-2", turn(3));
+
+    const s = useStore.getState();
+    expect(s.frameTurns["f-1"].map((t) => t.epoch)).toEqual([1, 2]);
+    expect(s.frameTurns["f-2"].map((t) => t.epoch)).toEqual([3]);
+  });
+
+  it("caps retained turns at 100 per frame (oldest evicted)", () => {
+    for (let i = 1; i <= 105; i++) useStore.getState().recordTurn("f-1", turn(i));
+
+    const turns = useStore.getState().frameTurns["f-1"];
+    expect(turns).toHaveLength(100);
+    expect(turns[0].epoch).toBe(6); // 1–5 evicted
+    expect(turns[99].epoch).toBe(105);
   });
 });
 

@@ -139,6 +139,36 @@ export async function daemonQuery<T>(
   }
 }
 
+/** The daemon did not answer (none running / handshake failed): the strict
+ *  query refused to serve a fallback. Trust surfaces render "daemon
+ *  unreachable" on this — never an authoritative-looking empty state. */
+export class DaemonUnreachableError extends Error {
+  constructor() {
+    super("daemon unreachable");
+    this.name = "DaemonUnreachableError";
+  }
+}
+
+/** Strict daemon query: like `daemonQuery`, but a dead daemon REJECTS
+ *  (`DaemonUnreachableError`) instead of resolving a typed fallback that is
+ *  indistinguishable from real data. The review/trust surfaces use this so
+ *  daemon-down can never render as "No changes to review" (the flagship
+ *  guard would be disarmed by a falsehood). */
+export async function daemonQueryStrict<T>(
+  kind: string,
+  args: Record<string, unknown>,
+): Promise<T> {
+  if (!inTauri()) throw new DaemonUnreachableError();
+  try {
+    // fallback: null tells the command's strict mode to error on a dead
+    // daemon rather than serve a fallback.
+    return await invoke<T>("daemon_query", { kind, args, fallback: null });
+  } catch (e) {
+    if (String(e).includes("daemon unreachable")) throw new DaemonUnreachableError();
+    throw e instanceof Error ? e : new Error(String(e));
+  }
+}
+
 /** The daemon-side activity graph (Phase 6): agents + inter-agent edges
  *  (assign/handoff/message), read from the durable store — complete even with the
  *  UI closed. The frontend route switch to this lands with the diff move. */
@@ -271,11 +301,15 @@ export async function daemonCheckpoint(sessionId: string, cause: string): Promis
   }
 }
 
-/** Detach the view — the daemon keeps the agent running (close ≠ kill). */
-export async function daemonCloseView(sessionId: string): Promise<void> {
+/** Detach the view — the daemon keeps the agent running (close ≠ kill).
+ *  `gen` (from `daemonAttach`) scopes the detach to the caller's own attach:
+ *  a stale view's cleanup must never detach a newer view's live attachment
+ *  (close-and-reopen races are real — an attach can wait seconds on a daemon
+ *  spawn). Omit it for an explicit, unconditional close (frame close). */
+export async function daemonCloseView(sessionId: string, gen?: number): Promise<void> {
   if (!inTauri()) return;
   try {
-    await invoke("daemon_close_view", { sessionId });
+    await invoke("daemon_close_view", { sessionId, gen: gen ?? null });
   } catch {
     /* ignore */
   }
@@ -291,13 +325,16 @@ export async function daemonKill(sessionId: string): Promise<void> {
 }
 
 /** Enumerate the detached daemon's sessions. Returns [] (without spawning a
- *  daemon) when none is running — safe to call on every boot. */
-export async function daemonList(): Promise<DaemonSessionSummary[]> {
+ *  daemon) when none is running — safe to call on every boot. Returns NULL
+ *  when the enumeration itself failed (invoke/RPC error): an errored list is
+ *  not an authoritative empty roster, and treating it as one would let the
+ *  reconcile tick falsely demote live agents to exited (sticky). */
+export async function daemonList(): Promise<DaemonSessionSummary[] | null> {
   if (!inTauri()) return [];
   try {
     return await invoke<DaemonSessionSummary[]>("daemon_list");
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -305,8 +342,11 @@ export async function daemonList(): Promise<DaemonSessionSummary[]> {
  * Attach to a daemon session. The grid repaint (at the supplied viewport) +
  * live output arrive as `ArrayBuffer` via `onBytes`; control objects arrive as
  * JSON: `exit` → `onExit`, `turn` → `onTurn`, `status` → `onStatus` (Phase 4
- * push), `fs_dirty` → `onFsDirty` (Phase 6 push). Returns the `Channel` — the
- * caller must keep it alive (GC of it silently stops output).
+ * push), `fs_dirty` → `onFsDirty` (Phase 6 push), `disconnected` →
+ * `onDisconnected` (the daemon CONNECTION dropped without a process exit — the
+ * agent may well still be running; never an exit). Returns the `Channel` (the
+ * caller must keep it alive — GC of it silently stops output) plus the attach
+ * generation to pass back to `daemonCloseView`.
  */
 export async function daemonAttach(
   sessionId: string,
@@ -317,7 +357,8 @@ export async function daemonAttach(
   onTurn?: (turn: TurnEvent) => void,
   onStatus?: (status: string) => void,
   onFsDirty?: (paths: string[]) => void,
-): Promise<Channel<PtyChannelMessage> | null> {
+  onDisconnected?: () => void,
+): Promise<{ channel: Channel<PtyChannelMessage>; gen: number } | null> {
   if (!inTauri()) return null;
   const onData = new Channel<PtyChannelMessage>();
   onData.onmessage = (msg) => {
@@ -340,20 +381,22 @@ export async function daemonAttach(
       // Phase 6 push: daemon's per-session watcher saw paths change → mark dirty.
       else if (m.type === "fs_dirty" && onFsDirty && m.paths) onFsDirty(m.paths);
       // Review M5: the daemon connection dropped (crash / codec error) WITHOUT a
-      // clean process exit. Surface it instead of leaving a silently-frozen
-      // terminal — end the view (the reconcile poll re-syncs; the agent may still
-      // be alive in the daemon and reopenable). Distinct from a process `exit`.
+      // clean process exit. NEVER routed to onExit — the agent is likely still
+      // alive in the daemon (deliberate detaches don't even push this anymore);
+      // treating it as an exit falsely flipped running detached agents to
+      // "exited" and made them unreattachable (2026-06 review). The view shows a
+      // connection-lost note; the reconcile poll re-syncs the real lifecycle.
       else if (m.type === "disconnected") {
         console.warn("[taime] daemon connection lost for session", sessionId);
-        onExit(null);
+        onDisconnected?.();
       } else if (m.type === "error") console.warn("[taime] daemon error", msg);
     }
   };
   try {
     // rows/cols let the daemon resize the PTY + emulator BEFORE the grid repaint,
     // so the repaint matches the real viewport (handoff step 1).
-    await invoke("daemon_attach", { sessionId, rows, cols, onData });
-    return onData;
+    const gen = await invoke<number>("daemon_attach", { sessionId, rows, cols, onData });
+    return { channel: onData, gen };
   } catch (e) {
     console.warn("[taime] daemon_attach failed", e);
     return null;

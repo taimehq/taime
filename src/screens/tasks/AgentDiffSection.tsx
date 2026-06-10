@@ -67,6 +67,7 @@ export function AgentDiffSection({
   member,
   siblings,
   bundle,
+  stale,
   contended,
   onApplied,
   sectionRef,
@@ -76,6 +77,9 @@ export function AgentDiffSection({
    *  (DiffView's rule: only same-task agents cross-link; Uncategorized never). */
   siblings: TaskAgent[];
   bundle: AgentDiffBundle | undefined;
+  /** The aggregate's last refresh failed: `bundle` is a kept-stale snapshot,
+   *  not current — Mark reviewed must not acknowledge it. */
+  stale: boolean;
   /** Workspace-wide contention: files also changed by another agent. */
   contended: Set<string>;
   onApplied: () => void;
@@ -86,6 +90,7 @@ export function AgentDiffSection({
   const clearDirty = useStore((s) => s.clearDirty);
   const markReviewed = useStore((s) => s.markReviewed);
   const showSnackbar = useStore((s) => s.showSnackbar);
+  const connected = useStore((s) => s.connected);
 
   const [sel, setSel] = useState<Record<string, number[]>>({});
   const [target, setTarget] = useState("main");
@@ -230,6 +235,15 @@ export function AgentDiffSection({
     markReviewed(member.agent_id);
   };
 
+  // The diff below is authoritative only while the daemon answers, this
+  // agent's bundle actually loaded, AND the last refresh succeeded (a kept-
+  // stale bundle reads fine but may no longer reflect the worktree). This
+  // gates Mark reviewed AND Merge/Revert: selections are POSITIONAL hunk
+  // indices that the daemon re-resolves against the live worktree at apply
+  // time — applying a selection built on a stale snapshot would merge or
+  // revert different lines than the user reviewed.
+  const reviewTrusted = connected && bundle !== undefined && !stale;
+
   const toggleFileCollapsed = (path: string) =>
     setCollapsedFiles((s) => {
       const next = new Set(s);
@@ -310,16 +324,18 @@ export function AgentDiffSection({
           </select>
         </label>
         <button
-          disabled={busy !== null || selectionCount === 0}
+          disabled={busy !== null || selectionCount === 0 || !reviewTrusted}
           onClick={() => void apply("merge")}
+          title={reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could merge the wrong lines"}
           className="flex shrink-0 items-center gap-1 rounded-md bg-primary px-2 py-1 text-[11px] font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40"
         >
           <GitMerge size={11} />
           {busy === "merge" ? "Merging…" : `Merge${selectionCount > 0 ? ` ${selectionCount}` : ""}`}
         </button>
         <button
-          disabled={busy !== null || selectionCount === 0}
+          disabled={busy !== null || selectionCount === 0 || !reviewTrusted}
           onClick={() => void apply("revert")}
+          title={reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could revert the wrong lines"}
           className="flex shrink-0 items-center gap-1 rounded-md border border-rose-500/50 px-2 py-1 text-[11px] text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40"
         >
           <Undo2 size={11} />
@@ -327,8 +343,15 @@ export function AgentDiffSection({
         </button>
         <button
           onClick={onMarkReviewed}
-          title="Acknowledge this agent's changes (clears its dirty set)"
-          className="flex shrink-0 items-center gap-1 rounded-md bg-emerald-600/90 px-2 py-1 text-[11px] font-medium text-white hover:brightness-110"
+          disabled={!reviewTrusted}
+          title={
+            reviewTrusted
+              ? "Acknowledge this agent's changes (clears its dirty set)"
+              : stale && connected
+                ? "Last refresh failed — this diff may be stale, so it can't be acknowledged"
+                : "Daemon unreachable — the changes can't be verified, so they can't be acknowledged"
+          }
+          className="flex shrink-0 items-center gap-1 rounded-md bg-emerald-600/90 px-2 py-1 text-[11px] font-medium text-white hover:brightness-110 disabled:cursor-default disabled:opacity-40"
         >
           <Check size={11} />
           Mark reviewed
@@ -336,8 +359,17 @@ export function AgentDiffSection({
       </div>
 
       {/* Body: per-file hunks with selection + attribution chips. */}
-      {!bundle ? (
-        <p className="px-4 py-3 text-[11px] text-zinc-600">loading diff…</p>
+      {!connected ? (
+        <p className="px-4 py-3 text-[11px] text-zinc-600">
+          daemon unreachable — this worktree&apos;s changes can&apos;t be shown
+          or reviewed until it answers.
+        </p>
+      ) : !bundle ? (
+        // No bundle ever loaded: an honest split between "in flight" and "the
+        // load failed" — an eternal fake loading label is a mislabeled error.
+        <p className="px-4 py-3 text-[11px] text-zinc-600">
+          {stale ? "couldn't load this worktree's diff — refresh to retry" : "loading diff…"}
+        </p>
       ) : files.length === 0 ? (
         <p className="px-4 py-3 text-[11px] text-zinc-600">
           No changes vs base

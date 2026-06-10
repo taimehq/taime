@@ -36,7 +36,9 @@ export function useAgentTurns(anchorId: string | null): AgentTurnsState {
       try {
         // The graph query is agent-roster wide; project to this agent's row.
         // Pass "" (daemon-wide) — anchorId is an agent id, not a workspace root,
-        // so it must not be used to scope the roster.
+        // so it must not be used to scope the roster. Strict read: daemon-down
+        // rejects into the error branch below (the Console/Activity projections
+        // then say "daemon unreachable" instead of "no turns yet").
         const g = await api.getGraph("");
         if (!alive) return;
         const row = g.agents.find((a) => a.agent_id === anchorId);

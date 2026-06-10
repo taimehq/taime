@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import { daemonQuery, daemonProvisionWorktree, type DaemonActivityGraph } from "./pty";
+import {
+  daemonQuery,
+  daemonQueryStrict,
+  daemonProvisionWorktree,
+  type DaemonActivityGraph,
+} from "./pty";
 import { inTauri } from "./backend";
 
 /**
@@ -483,7 +488,7 @@ export const api = {
     }),
 
   getWorktree: (id: string) =>
-    daemonQuery<WorktreeInfo | null>("worktree", { agent_id: id }, null),
+    daemonQueryStrict<WorktreeInfo | null>("worktree", { agent_id: id }),
 
   /** Provision a daemon-owned worktree for an agent (Phase 3). */
   provisionWorktree: async (body: {
@@ -570,19 +575,17 @@ export const api = {
    *  the Task Review surface. */
   getTaskDetail: (id: string) => daemonQuery<TaskDetail | null>("task_detail", { id }, null),
 
+  // The review-surface reads are STRICT (reject on daemon-down, never a typed
+  // fallback): an empty diff from a dead daemon is indistinguishable from "no
+  // changes", and rendering it as authoritative disarms the review guard.
   getFileDiffs: (id: string) =>
-    daemonQuery<FileDiffsResponse>("file_diffs", { agent_id: id }, { agent_id: id, files: [] }),
+    daemonQueryStrict<FileDiffsResponse>("file_diffs", { agent_id: id }),
 
   getHunks: (id: string) =>
-    daemonQuery<HunkedDiffResponse>("hunked_diff", { agent_id: id }, {
-      agent_id: id,
-      base: null,
-      digest: null,
-      files: [],
-    }),
+    daemonQueryStrict<HunkedDiffResponse>("hunked_diff", { agent_id: id }),
 
   getAttribution: (id: string) =>
-    daemonQuery<AttributionResponse>("attribution", { agent_id: id }, { team: [], files: {} }),
+    daemonQueryStrict<AttributionResponse>("attribution", { agent_id: id }),
 
   applySelection: (
     id: string,
@@ -608,18 +611,17 @@ export const api = {
     ),
 
   getContention: (session: string) =>
-    daemonQuery<{ path: string; terminals: string[] }[]>("contention", { session }, []),
+    daemonQueryStrict<{ path: string; terminals: string[] }[]>("contention", { session }),
 
   /** The activity graph: daemon agents + inter-agent edges, mapped to the shape
    *  the ActivityGraph component expects. Pass the active workspace root to scope
    *  the team to that workspace; pass `""` for the daemon-wide roster (used by
-   *  agent-row lookups that just project to a single agent). */
+   *  agent-row lookups that just project to a single agent). STRICT: rejects on
+   *  daemon-down (an empty roster must mean "no agents", not "no daemon"). */
   getGraph: async (workspaceRoot: string): Promise<ActivityGraph> => {
-    const g = await daemonQuery<DaemonActivityGraph>(
-      "graph",
-      { workspace_root: workspaceRoot },
-      { agents: [], edges: [], contention: [] },
-    );
+    const g = await daemonQueryStrict<DaemonActivityGraph>("graph", {
+      workspace_root: workspaceRoot,
+    });
     return {
       session: workspaceRoot,
       agents: g.agents.map((a) => ({

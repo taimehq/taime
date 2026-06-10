@@ -74,9 +74,14 @@ export function AgentDetail({ frame }: { frame: Frame }) {
     let alive = true;
     setWt(null);
     if (!agentId) return;
-    api.getWorktree(agentId).then((w) => {
-      if (alive) setWt(w);
-    });
+    api
+      .getWorktree(agentId)
+      .then((w) => {
+        if (alive) setWt(w);
+      })
+      // Strict read: rejects on daemon-down. Keep wt null — the provenance
+      // line already renders "daemon unreachable · retrying" off `connected`.
+      .catch(() => {});
     return () => {
       alive = false;
     };
@@ -291,11 +296,23 @@ export function AgentDetail({ frame }: { frame: Frame }) {
             Activity
           </button>
           <span className="flex-1" />
-          {/* PTY status — locked lexicon copy, from the session lifecycle. */}
+          {/* PTY status — locked lexicon copy, from the session lifecycle.
+              connectionLost is the third state: the attach channel died
+              without an exit (the agent may be alive) — claiming "attached ·
+              live" then would assert a stream that's dead and silently eat
+              keystrokes. */}
           {exited ? (
             <span className="flex shrink-0 items-center gap-1.5 pr-1 text-[10px] text-zinc-600">
               <span className="h-1.5 w-1.5 rounded-full bg-zinc-700" />
               re-attached · last screen
+            </span>
+          ) : meta?.connectionLost ? (
+            <span
+              className="flex shrink-0 items-center gap-1.5 pr-1 text-[10px] text-amber"
+              title="The view's connection to the daemon dropped without the agent exiting — close and reopen this view to reattach"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-amber" />
+              connection lost · reopen to reattach
             </span>
           ) : (
             <span className="flex shrink-0 items-center gap-1.5 pr-1 text-[10px] text-emerald-400">
@@ -317,7 +334,7 @@ export function AgentDetail({ frame }: { frame: Frame }) {
           {tab === "console" && (
             <ConsolePanel
               key={sessionId}
-              sessionId={sessionId}
+              agentId={agentId ?? null}
               anchorId={anchorId}
               exited={exited}
               wireStatus={rawStatus}

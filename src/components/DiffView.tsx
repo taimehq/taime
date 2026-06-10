@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "../monacoSetup"; // point Monaco at the bundled (offline) build before use
 import { DiffEditor } from "@monaco-editor/react";
 import {
@@ -62,6 +62,7 @@ export function DiffView() {
   const frames = useStore((s) => s.frames);
   const pendingSwitch = useStore((s) => s.pendingSwitch);
   const resolveSwitch = useStore((s) => s.resolveSwitch);
+  const connected = useStore((s) => s.connected);
 
   const [files, setFiles] = useState<FileDiffEntry[]>([]);
   const [hunks, setHunks] = useState<HunkedFileEntry[]>([]);
@@ -81,45 +82,78 @@ export function DiffView() {
 
   const frame = frames.find((f) => f.terminalId === terminalId);
 
+  // Fingerprint of the last loaded hunk payload: selections are positional
+  // hunk indices, so they survive a reload ONLY while the payload is
+  // byte-identical (e.g. a daemon blip with no worktree change).
+  const lastHunksRef = useRef<string | null>(null);
+  // Load sequencing: load() re-fires on `connected` flips and after apply(),
+  // so two loads can be in flight at once — only the NEWEST may write state,
+  // or a slow stale payload would land over a fresh one and render as the
+  // authoritative diff (DiffView has no poll to self-correct).
+  const loadSeq = useRef(0);
+
   const load = useCallback(async () => {
     if (!terminalId) return;
+    const mySeq = ++loadSeq.current;
     setLoading(true);
     setError(null);
     try {
+      // STRICT reads: daemon-down REJECTS (DaemonUnreachableError) instead of
+      // resolving empty shapes — so a dead daemon can never render as an
+      // authoritative "No changes to review" with a working Mark reviewed.
       const [fd, hk, wt, attr] = await Promise.all([
-        api.getFileDiffs(terminalId).catch(() => ({ agent_id: terminalId, files: [] })),
-        api
-          .getHunks(terminalId)
-          .catch(() => ({ agent_id: terminalId, base: null, digest: null, files: [] })),
-        api.getWorktree(terminalId).catch(() => null),
-        api.getAttribution(terminalId).catch(() => ({ team: [], files: {} })),
+        api.getFileDiffs(terminalId),
+        api.getHunks(terminalId),
+        api.getWorktree(terminalId),
+        api.getAttribution(terminalId),
       ]);
+      if (loadSeq.current !== mySeq) return; // superseded — a newer load owns the state
       setFiles(fd.files);
       setHunks(hk.files);
       setDigest(hk.digest);
       setWorktree(wt);
       setAttribution(attr);
-      setSelected((prev) => prev ?? fd.files[0]?.path ?? null);
+      // Drop the in-progress hunk selection when the diff actually drifted —
+      // stale positional indices against new hunks would merge the wrong
+      // lines. An unchanged payload keeps it (reconnect heals seamlessly).
+      const fp = JSON.stringify(hk.files);
+      if (lastHunksRef.current !== null && lastHunksRef.current !== fp) setSel({});
+      lastHunksRef.current = fp;
+      setSelected((prev) =>
+        prev && fd.files.some((f) => f.path === prev) ? prev : (fd.files[0]?.path ?? null),
+      );
       if (wt?.mode === "shared" || wt?.mode === "isolated") {
         // Contention is workspace-wide: key off the worktree's project root
-        // (the workspace-grouping id), not a frame label.
+        // (the workspace-grouping id), not a frame label. Decoration only —
+        // a contention failure must not take down the loaded diff.
         const root = wt?.project_root;
         if (root) {
           const c = await api.getContention(root).catch(() => []);
-          setContended(new Set(c.map((r) => r.path)));
+          if (loadSeq.current === mySeq) setContended(new Set(c.map((r) => r.path)));
         }
       }
     } catch (e) {
-      setError(String(e));
+      if (loadSeq.current === mySeq) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (loadSeq.current === mySeq) setLoading(false);
     }
+    // Re-load when the daemon connection flips (down → error state shown; back
+    // up → the surface heals without reopening). Mirrors AgentDetail's probe.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [terminalId]);
+  }, [terminalId, connected]);
 
+  // Reset the review-in-progress state (hunk selection, focused file) only
+  // when the SUBJECT changes. load() also re-fires on `connected` flips (the
+  // heal-on-reconnect path) — wiping the reviewer's selection on a daemon
+  // blip would discard a partial merge mid-review; load() itself drops it
+  // when the reloaded diff actually drifted.
   useEffect(() => {
     setSel({});
     setSelected(null);
+    lastHunksRef.current = null;
+  }, [terminalId]);
+
+  useEffect(() => {
     load();
   }, [load]);
 
@@ -366,6 +400,14 @@ export function DiffView() {
     if (pendingSwitch) resolveSwitch(true);
   };
 
+  // The diff on screen is authoritative only while the daemon is answering and
+  // the last load succeeded. This gates Mark reviewed (acknowledging changes
+  // never truly shown would disarm the switch guard on a falsehood) AND
+  // Merge/Revert (selections are positional hunk indices re-resolved against
+  // the live worktree at apply time — a selection built on a stale or
+  // mid-reload payload could merge/revert the wrong lines).
+  const reviewTrusted = connected && !error;
+
   const totalAdd = files.reduce((n, f) => n + f.additions, 0);
   const totalDel = files.reduce((n, f) => n + f.deletions, 0);
   const currentHunks = current ? (hunksByPath[current.path]?.hunks ?? []) : [];
@@ -420,16 +462,22 @@ export function DiffView() {
             </select>
           </label>
           <button
-            disabled={busy || selectionCount === 0}
+            disabled={busy || selectionCount === 0 || !reviewTrusted || loading}
             onClick={() => apply("merge")}
+            title={
+              reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could merge the wrong lines"
+            }
             className={`flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
           >
             <GitMerge size={14} />
             Merge {selectionCount > 0 ? `${selectionCount}` : ""}
           </button>
           <button
-            disabled={busy || selectionCount === 0}
+            disabled={busy || selectionCount === 0 || !reviewTrusted || loading}
             onClick={() => apply("revert")}
+            title={
+              reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could revert the wrong lines"
+            }
             className={`flex items-center gap-1.5 rounded-md border border-rose-500/50 px-3 py-1.5 text-sm text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
           >
             <Undo2 size={14} />
@@ -438,7 +486,13 @@ export function DiffView() {
           <div className="mx-1 h-5 w-px bg-ink-600" />
           <button
             onClick={onMarkReviewed}
-            className={`flex items-center gap-1.5 rounded-md bg-emerald-600/90 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 ${FOCUS_RING}`}
+            disabled={!reviewTrusted || loading}
+            title={
+              reviewTrusted
+                ? undefined
+                : "Daemon unreachable — the changes can't be verified, so they can't be acknowledged"
+            }
+            className={`flex items-center gap-1.5 rounded-md bg-emerald-600/90 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
           >
             <Check size={14} />
             Mark reviewed
@@ -493,7 +547,22 @@ export function DiffView() {
         {/* Diff + hunk selection */}
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="min-h-0 flex-1">
-            {!loading && files.length === 0 ? (
+            {!loading && files.length === 0 && !reviewTrusted ? (
+              // Daemon down / load failed: the empty file list is a FALLBACK,
+              // not a verified "no changes" — say so, and offer no Mark
+              // reviewed (acknowledging unseen changes would disarm the guard).
+              <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+                <GitMerge size={32} className="text-zinc-600" />
+                <p className="mt-3 text-sm text-zinc-300">
+                  {connected ? "Couldn't load this agent's changes" : "Daemon unreachable"}
+                </p>
+                <p className="mt-1 max-w-sm text-[12px] text-zinc-400">
+                  {connected
+                    ? (error ?? "The diff query failed.")
+                    : "This agent's changes can't be shown or reviewed until the daemon answers — retrying."}
+                </p>
+              </div>
+            ) : !loading && files.length === 0 ? (
               // Nothing changed: a single centered empty state spans the body so
               // we never render a bare bg-ink-900 void.
               <div className="flex h-full flex-col items-center justify-center px-6 text-center">

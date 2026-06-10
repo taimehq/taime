@@ -38,6 +38,11 @@ export function TaskReviewTab({
   const [contended, setContended] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [loadedOnce, setLoadedOnce] = useState(false);
+  /** Members whose last bundle load FAILED (strict reads reject): their kept
+   *  bundles are stale and their sections review-disabled — per member, so one
+   *  failing worktree (a >60s diff, a daemon-side error) never poisons the
+   *  healthy siblings' freshly loaded sections. */
+  const [failedIds, setFailedIds] = useState<Set<string>>(new Set());
   const seq = useRef(0);
   const sectionEls = useRef<Record<string, HTMLElement | null>>({});
 
@@ -46,16 +51,27 @@ export function TaskReviewTab({
     const ms = membersRef.current;
     setLoading(true);
     try {
-      const entries = await Promise.all(
+      // Per-member settle: each member's bundle loads independently. Fulfilled
+      // bundles land; rejected ones keep their previous bundle (stale beats
+      // fabricated-empty) and are flagged so their sections gate review.
+      const results = await Promise.allSettled(
         ms.map(async (a) => [a.agent_id, await loadAgentDiffBundle(a.agent_id)] as const),
       );
       // Contention is workspace-wide (same source DiffView reads) — flag files
       // also changed by another agent so cross-worktree merges aren't blind.
+      // Decoration only: its failure must not take down the loaded diffs.
       const cont = rootRef.current
         ? await api.getContention(rootRef.current).catch(() => [])
         : [];
       if (seq.current !== mySeq) return; // stale — membership changed mid-load
-      setBundles(Object.fromEntries(entries));
+      const fresh: Record<string, AgentDiffBundle> = {};
+      const failed = new Set<string>();
+      results.forEach((r, i) => {
+        if (r.status === "fulfilled") fresh[r.value[0]] = r.value[1];
+        else failed.add(ms[i].agent_id);
+      });
+      setBundles((prev) => ({ ...prev, ...fresh }));
+      setFailedIds(failed);
       setContended(new Set(cont.map((r) => r.path)));
       setLoadedOnce(true);
     } finally {
@@ -70,7 +86,11 @@ export function TaskReviewTab({
       return;
     }
     void loadAll();
-  }, [memberIds, loadAll]);
+    // `connected` in the deps heals the tab when the daemon comes back (the
+    // strict reads reject while it's down) — same wiring as DiffView/DiffPanel.
+    // Without it, the "until it answers" copy promised a retry that never ran,
+    // and pre-outage bundles silently became trusted again on reconnect.
+  }, [memberIds, loadAll, connected]);
 
   /** After a merge/revert: the worktree changed AND the rollups did. */
   const onApplied = useCallback(() => {
@@ -159,6 +179,18 @@ export function TaskReviewTab({
           The task aggregates — it does not own the diff. Merge runs per agent
           worktree.
         </p>
+        {loadedOnce && failedIds.size > 0 && (
+          // A failed refresh after data has rendered: the affected sections are
+          // STALE, not current — say so; each one's Mark reviewed/Merge/Revert
+          // gates on the per-member `stale` prop.
+          <p className="mt-1 text-[10px] text-amber">
+            {connected
+              ? `${failedIds.size} member diff${failedIds.size === 1 ? "" : "s"} failed to refresh — ${
+                  failedIds.size === 1 ? "that section is" : "those sections are"
+                } stale and review-disabled until a refresh succeeds`
+              : "daemon unreachable — the diffs below may be stale; reviewing is disabled until it answers"}
+          </p>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -204,6 +236,7 @@ export function TaskReviewTab({
               member={a}
               siblings={members.filter((m) => m.agent_id !== a.agent_id)}
               bundle={bundles[a.agent_id]}
+              stale={failedIds.has(a.agent_id)}
               contended={contended}
               onApplied={onApplied}
               sectionRef={(el) => {

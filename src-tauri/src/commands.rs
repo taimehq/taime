@@ -232,6 +232,9 @@ fn default_agent_spec(
 /// Generic daemon query RPC (Phase 6 route-layer migration) — the daemon-backed
 /// replacement for the CAO REST surface (diff/hunks/attribution/contention/
 /// worktree/agents). Returns a JSON value in the frontend's existing shape.
+/// `fallback: None` is strict mode: a dead daemon is an error ("daemon
+/// unreachable"), never a well-typed empty value masquerading as data — the
+/// review/trust surfaces depend on this distinction.
 #[tauri::command]
 pub async fn daemon_query(
     daemon: State<'_, DaemonClient>,
@@ -239,8 +242,7 @@ pub async fn daemon_query(
     args: serde_json::Value,
     fallback: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let fb = fallback.unwrap_or_else(|| "null".to_string());
-    let json = daemon.query(kind, args.to_string(), &fb).await?;
+    let json = daemon.query(kind, args.to_string(), fallback.as_deref()).await?;
     serde_json::from_str(&json).map_err(|e| format!("parse query result: {e}"))
 }
 
@@ -310,7 +312,9 @@ pub async fn daemon_attach(
     rows: u16,
     cols: u16,
     on_data: Channel<InvokeResponseBody>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
+    // Returns the attach generation; the view hands it back to
+    // daemon_close_view so a stale view can never detach a newer attach.
     daemon.attach(session_id, rows, cols, on_data).await
 }
 
@@ -365,8 +369,9 @@ pub async fn daemon_checkpoint(
 pub async fn daemon_close_view(
     daemon: State<'_, DaemonClient>,
     session_id: String,
+    gen: Option<u64>,
 ) -> Result<(), String> {
-    daemon.detach(&session_id).await;
+    daemon.detach(&session_id, gen).await;
     Ok(())
 }
 

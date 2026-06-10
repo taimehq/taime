@@ -57,30 +57,43 @@ export function TaskActivityTab({
 
   const [graph, setGraph] = useState<ActivityGraph | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const current = useRef(taskId);
   current.current = taskId;
+
+  // getGraph scopes the roster by WORKSPACE ROOT, not task id — passing the
+  // task id matched no workspace, so the roster was always empty and agent
+  // turns never rendered (2026-06 review). Query the task's workspace and
+  // keep the client-side task_id filter below.
+  const workspaceRoot = detail.task.workspace_root;
 
   // Poll the graph (5s — turns land on turn close, not keystrokes).
   useEffect(() => {
     setGraph(null);
     setLoaded(false);
+    setLoadError(false);
     let alive = true;
     const load = () =>
       api
-        .getGraph(taskId)
+        .getGraph(workspaceRoot)
         .then((g) => {
           if (!alive || current.current !== taskId) return;
           setGraph(g);
           setLoaded(true);
+          setLoadError(false);
         })
-        .catch(() => {});
+        .catch(() => {
+          // Strict read: daemon-down rejects. Keep polling; the feed shows an
+          // unreachable state instead of an authoritative "No activity yet".
+          if (alive && current.current === taskId) setLoadError(true);
+        });
     load();
     const t = setInterval(load, 5000);
     return () => {
       alive = false;
       clearInterval(t);
     };
-  }, [taskId]);
+  }, [taskId, workspaceRoot]);
 
   const events = useMemo<FeedEvent[]>(() => {
     const out: FeedEvent[] = [];
@@ -136,7 +149,9 @@ export function TaskActivityTab({
     return (
       <div className="flex h-full items-center justify-center px-6 text-center">
         <p className="text-xs text-zinc-500">
-          {connected ? "loading activity…" : "daemon unreachable · retrying"}
+          {!connected || loadError
+            ? "daemon unreachable · retrying"
+            : "loading activity…"}
         </p>
       </div>
     );
