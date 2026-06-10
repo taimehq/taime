@@ -52,7 +52,7 @@ export function useRustPtyReconcile() {
     // spawning a daemon when none is running.
     let bootDone = false;
     (async () => {
-      const sessions = await daemonList();
+      const sessions = (await daemonList()) ?? [];
       if (!alive) return;
       const adopt = useStore.getState().adoptDaemonSession;
       for (const s of sessions) adopt(s);
@@ -67,6 +67,10 @@ export function useRustPtyReconcile() {
     const tick = async () => {
       const daemonSessions = await daemonList();
       if (!alive) return;
+      // A FAILED enumeration is not an empty roster: skip the whole tick
+      // (adoption, status mirror, and especially the exit demotion below)
+      // rather than treat the error as "every agent is gone".
+      if (daemonSessions === null) return;
       applyDaemonStatuses(daemonSessions);
       // Mirror daemon-side Task membership (task_assign / delete demotion) into
       // the tracked metas so the sidebar grouping stays fresh.

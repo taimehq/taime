@@ -305,13 +305,16 @@ export async function daemonKill(sessionId: string): Promise<void> {
 }
 
 /** Enumerate the detached daemon's sessions. Returns [] (without spawning a
- *  daemon) when none is running — safe to call on every boot. */
-export async function daemonList(): Promise<DaemonSessionSummary[]> {
+ *  daemon) when none is running — safe to call on every boot. Returns NULL
+ *  when the enumeration itself failed (invoke/RPC error): an errored list is
+ *  not an authoritative empty roster, and treating it as one would let the
+ *  reconcile tick falsely demote live agents to exited (sticky). */
+export async function daemonList(): Promise<DaemonSessionSummary[] | null> {
   if (!inTauri()) return [];
   try {
     return await invoke<DaemonSessionSummary[]>("daemon_list");
   } catch {
-    return [];
+    return null;
   }
 }
 

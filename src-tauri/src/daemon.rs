@@ -518,6 +518,12 @@ impl DaemonClient {
                             deliberate_detach = true;
                             break;
                         };
+                        // Forwarding a Detach IS the deliberate detach — stay
+                        // silent even if the send fails (the conn may already
+                        // be torn down right as the view closes).
+                        if matches!(out, ClientMsg::Detach) {
+                            deliberate_detach = true;
+                        }
                         if let Ok(bytes) = encode_client(&out) {
                             if sink.send(bytes).await.is_err() {
                                 break;
@@ -553,6 +559,22 @@ impl DaemonClient {
                             }
                             Err(_) => break,
                         }
+                    }
+                }
+            }
+            // The select! picks randomly among ready arms: a stream error can win
+            // the race against an already-dropped input channel. Re-check here so
+            // a deliberate detach/re-attach stays silent even when another arm
+            // broke the loop first (drain buffered msgs to reach the closed state).
+            if !deliberate_detach {
+                loop {
+                    match input_rx.try_recv() {
+                        Ok(_) => continue,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            deliberate_detach = true;
+                            break;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
                     }
                 }
             }

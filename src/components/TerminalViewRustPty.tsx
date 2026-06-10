@@ -249,8 +249,13 @@ export function TerminalViewRustPty({
         // while framed — without the flag, the framed exemption would wedge a
         // crashed daemon's agent as "running · PTY attached" forever.
         () => {
+          // alive-gated: a superseded pump's LATE push (the channel callback
+          // outlives unmount) must not re-flag a session whose newer attach
+          // already cleared the flag. Post-unmount, either the frame closed
+          // (unframed → the normal demotion path) or a newer view owns the
+          // session's connection state.
+          if (!alive) return;
           useStore.getState().setRustPtyConnectionLost(sessionId, true);
-          if (!alive) return; // post-unmount push — nothing to render
           term.write("\r\n\x1b[33m[daemon connection lost — reattach to resume]\x1b[0m\r\n");
           onConnectionChange?.("closed");
         },
