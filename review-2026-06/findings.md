@@ -40,6 +40,38 @@ Trust the per-finding verdicts, not that summary prose.
   hydrate tick can no longer disarm an agent that is dirty again. This also resolves the one-shot
   review-ack finding (ux-design: "Review ack is one-shot per agent").
 
+## Status — P0 cluster landed on main (2026-06-10)
+
+P0 is **effectively complete**. Two batches landed and pushed:
+
+- **Batch 1 (commit `0a9b4f3`):** items 1, 2, 3, 6, 7, 8, 9, 10, 15, 16 — the interactive
+  Review/merge surface (symbolic targets, daemon-enforced + digest-bound merge gate, untracked
+  files, strict reads, detach≠exit, Console input, Task Activity, corrupt-store recovery) + CI,
+  LICENSE, daemon.log. See [INTEGRATION.md](INTEGRATION.md).
+- **Batch 2 (commit `bdbfd56`, branch `fix/p0-attribution-durability`):** items 4, 5, 11, 12, 13,
+  14, 18 — the attribution-substrate + identity/durability cluster, rebased on the new
+  archive-then-reclaim substrate:
+  - **13** — Agent ID widened 32→64-bit, collision-checked at mint against worktree rows *and*
+    `refs/taime/archive/<id>` (a collision can no longer corrupt an archive ref).
+  - **12** — pty ids made unique across daemon generations (per-boot nonce); `record_session`
+    upsert replaces all identity columns, not just status.
+  - **14** — `flows` (schedules) upsert preserves `enabled` + `last_run` on boot re-ingest.
+  - **5** — schedule fires isolated by default (auto-archived/reclaimed); `shared` is opt-in
+    front-matter (`flows.shared`, schema v13). A self-review caught + fixed a critical regression
+    where `fire_headless` still ran in the user's real tree (`headless_target` → worktree_path).
+  - **4 + 11** — shared-mode fs attribution gated on mid-turn/recently-active (`out_offset > 0`
+    cold-start window closed) + cross-co-watcher de-dup; out-of-worktree edits documented as
+    dropped, never misattributed.
+  - **18** — delete-workspace soft-by-default (preserves archive refs); destroying archive refs is
+    an opt-in typed-confirm path scoped exactly to the counted `archive_ref.is_some()` set.
+  - Validated independently: 196 cargo tests, clippy `-D warnings` clean, typecheck clean, 144
+    vitest. Acknowledged-and-left as heuristic-by-design: shared-agent de-dup tie-break, 2⁻⁶⁴ mint
+    TOCTOU, per-batch de-dup lock cost.
+
+**Remaining P0:** only item 17 (protocol-version-without-bump), which is moot pre-release
+(version-gated handshake). **Next:** Phase 2 — commit/merge with provenance, redesigned around the
+archive ref (it's already a durable commit; `Taime-Agent-Id` ↔ `refs/taime/archive/<id>` unify).
+
 ---
 
 ## daemon-lifecycle
