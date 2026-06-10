@@ -2529,6 +2529,15 @@ impl Manager {
         let Some(repo) = w.repo_root.as_deref() else { return false };
         let base = w.base_sha.as_deref().unwrap_or("");
         let now = now_unix();
+        // Checkout already gone (a legacy row from before archive-then-reclaim, or
+        // a prior external removal): nothing to archive — it IS reclaimed, so
+        // record that and stop surfacing it. Without this, such rows would forever
+        // re-fail the snapshot ("checkout missing") and linger in the cleanup list.
+        if !std::path::Path::new(&w.worktree_path).exists() {
+            let _ = store.mark_reclaimed(&w.terminal_id, now);
+            self.worktrees_gced.lock().unwrap().insert(w.terminal_id.clone());
+            return true;
+        }
         let outcome =
             crate::worktree::archive_agent(&w.terminal_id, &w.worktree_path, repo, base);
         match outcome {
