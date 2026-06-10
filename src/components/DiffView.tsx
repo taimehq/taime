@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "../monacoSetup"; // point Monaco at the bundled (offline) build before use
 import { DiffEditor } from "@monaco-editor/react";
 import {
@@ -78,6 +78,11 @@ export function DiffView() {
 
   const frame = frames.find((f) => f.terminalId === terminalId);
 
+  // Fingerprint of the last loaded hunk payload: selections are positional
+  // hunk indices, so they survive a reload ONLY while the payload is
+  // byte-identical (e.g. a daemon blip with no worktree change).
+  const lastHunksRef = useRef<string | null>(null);
+
   const load = useCallback(async () => {
     if (!terminalId) return;
     setLoading(true);
@@ -96,7 +101,15 @@ export function DiffView() {
       setHunks(hk.files);
       setWorktree(wt);
       setAttribution(attr);
-      setSelected((prev) => prev ?? fd.files[0]?.path ?? null);
+      // Drop the in-progress hunk selection when the diff actually drifted —
+      // stale positional indices against new hunks would merge the wrong
+      // lines. An unchanged payload keeps it (reconnect heals seamlessly).
+      const fp = JSON.stringify(hk.files);
+      if (lastHunksRef.current !== null && lastHunksRef.current !== fp) setSel({});
+      lastHunksRef.current = fp;
+      setSelected((prev) =>
+        prev && fd.files.some((f) => f.path === prev) ? prev : (fd.files[0]?.path ?? null),
+      );
       if (wt?.mode === "shared" || wt?.mode === "isolated") {
         // Contention is workspace-wide: key off the worktree's project root
         // (the workspace-grouping id), not a frame label. Decoration only —
@@ -117,9 +130,18 @@ export function DiffView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terminalId, connected]);
 
+  // Reset the review-in-progress state (hunk selection, focused file) only
+  // when the SUBJECT changes. load() also re-fires on `connected` flips (the
+  // heal-on-reconnect path) — wiping the reviewer's selection on a daemon
+  // blip would discard a partial merge mid-review; load() itself drops it
+  // when the reloaded diff actually drifted.
   useEffect(() => {
     setSel({});
     setSelected(null);
+    lastHunksRef.current = null;
+  }, [terminalId]);
+
+  useEffect(() => {
     load();
   }, [load]);
 
