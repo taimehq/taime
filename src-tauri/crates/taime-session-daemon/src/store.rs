@@ -1418,11 +1418,25 @@ impl Store {
     /// Create or replace a schedule (resets last_run; next_run is recomputed).
     pub fn upsert_schedule(&self, row: &ScheduleRow) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // ON CONFLICT DO UPDATE (not INSERT OR REPLACE): for an existing schedule
+        // we refresh only the columns that come FROM the .md definition and PRESERVE
+        // `enabled` and `last_run`. Both are runtime/user state the .md has no field
+        // for — `enabled` is the UI disable toggle (DB-only), `last_run` is run
+        // history — so re-ingesting every .md at boot must not clobber them.
+        // INSERT OR REPLACE deleted the row and reinserted with row_from_def's
+        // hardcoded enabled=true/last_run=NULL, so a disabled schedule silently
+        // re-enabled (and fired unattended) on every daemon restart.
         conn.execute(
-            "INSERT OR REPLACE INTO flows \
+            "INSERT INTO flows \
              (name, file_path, schedule, agent_profile, provider, script, last_run, next_run, \
               enabled, prompt, workspace_root, task_mode, task_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT(name) DO UPDATE SET \
+               file_path = excluded.file_path, schedule = excluded.schedule, \
+               agent_profile = excluded.agent_profile, provider = excluded.provider, \
+               script = excluded.script, next_run = excluded.next_run, \
+               prompt = excluded.prompt, workspace_root = excluded.workspace_root, \
+               task_mode = excluded.task_mode, task_id = excluded.task_id",
             rusqlite::params![
                 row.name,
                 row.file_path,
@@ -2075,6 +2089,47 @@ mod tests {
         assert_eq!(store.get_schedule("nightly").unwrap().unwrap().last_run, Some(200));
         store.delete_schedule("nightly").unwrap();
         assert!(store.list_schedules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reingest_preserves_disabled_state_and_last_run() {
+        // The boot re-ingest bug: load_schedules_on_start re-upserts every .md with
+        // a row_from_def row that hardcodes enabled=true/last_run=None. INSERT OR
+        // REPLACE clobbered the row, silently re-enabling a user-disabled schedule
+        // (which then fired unattended) and wiping its run history every restart.
+        let store = Store::open_at(std::path::Path::new(":memory:")).unwrap();
+        // A .md-style row (this is exactly what row_from_def produces).
+        let from_md = |prompt: &str, next: Option<u64>| ScheduleRow {
+            name: "nightly".into(),
+            file_path: "/x/nightly.md".into(),
+            schedule: "0 2 * * *".into(),
+            agent_profile: "security-reviewer".into(),
+            provider: "claude_code".into(),
+            script: None,
+            prompt: Some(prompt.into()),
+            last_run: None, // the .md has no last_run field
+            next_run: next,
+            enabled: true, // the .md has no enabled field — always true
+            workspace_root: Some("/projects/app".into()),
+            task_mode: None,
+            task_id: None,
+        };
+        store.upsert_schedule(&from_md("review", Some(100))).unwrap();
+        // The user disabled it in the UI and it ran once (runtime/DB-only state).
+        store.set_schedule_enabled("nightly", false).unwrap();
+        store.set_schedule_run("nightly", 200, Some(300)).unwrap();
+
+        // Daemon restarts → load_schedules_on_start re-ingests the .md (with an
+        // edited prompt, to prove definition columns DO refresh).
+        store.upsert_schedule(&from_md("review v2", Some(999))).unwrap();
+
+        let got = store.get_schedule("nightly").unwrap().unwrap();
+        assert!(!got.enabled, "disabled toggle survives re-ingest");
+        assert_eq!(got.last_run, Some(200), "run history survives re-ingest");
+        assert_eq!(got.prompt.as_deref(), Some("review v2"), "definition columns refresh");
+        assert_eq!(got.next_run, Some(999), "next_run refreshes from the schedule");
+        assert!(!store.has_enabled_schedules(), "the daemon won't resurrect+fire it");
+        assert_eq!(store.due_schedules(2000).unwrap().len(), 0, "still not due (disabled)");
     }
 
     #[test]
