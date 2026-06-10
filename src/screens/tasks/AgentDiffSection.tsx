@@ -161,6 +161,10 @@ export function AgentDiffSection({
     if (selectionCount === 0 || busy) return;
     setBusy(mode);
     try {
+      // Merging from the review surface IS the review act: record the durable
+      // ack the daemon's merge gate requires (it refuses unacked merges). The
+      // local guard state is untouched — unmerged changes still need review.
+      if (mode === "merge") await api.markReviewed(member.agent_id);
       const res = await api.applySelection(member.agent_id, {
         target: mode === "revert" ? "self" : target,
         mode,

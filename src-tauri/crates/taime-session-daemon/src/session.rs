@@ -575,6 +575,15 @@ impl Session {
                 .map(|c| (gen_event_id(), c.path.clone(), c.kind.to_string()))
                 .collect();
             let _ = store.record_fs_events(key, ts, &rows);
+            // A new dirty path means changes beyond what any review covered:
+            // invalidate the standing ack daemon-side, so the merge gate's
+            // "reviewed" is always current — the guard owns the invariant
+            // rather than trusting the app to clear it. (Re-writes of
+            // already-dirty paths keep the ack, matching the app's
+            // path-set re-arm semantics.)
+            if grew {
+                let _ = store.clear_reviewed(key);
+            }
         }
         // Push the full dirty set to the app (Phase 6 fs-dirty push).
         if grew {

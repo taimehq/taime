@@ -291,6 +291,10 @@ export function DiffView() {
     if (selectionCount === 0) return;
     setBusy(true);
     try {
+      // Merging from the review surface IS the review act: record the durable
+      // ack the daemon's merge gate requires (it refuses unacked merges). The
+      // local guard state is untouched — unmerged changes still need review.
+      if (mode === "merge") await api.markReviewed(terminalId);
       const res = await api.applySelection(terminalId, {
         target: mode === "revert" ? "self" : target,
         mode,

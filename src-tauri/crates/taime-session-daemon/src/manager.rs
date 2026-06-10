@@ -667,6 +667,12 @@ impl Manager {
         (cwd, None)
     }
 
+    /// Whether the agent has a standing review ack — the merge gate's read.
+    /// `None` store ⇒ `false`: the gate fails closed without persistence.
+    fn has_review_ack(&self, agent_id: &str) -> bool {
+        self.store.as_ref().and_then(|s| s.is_reviewed(agent_id).ok()).unwrap_or(false)
+    }
+
     /// Resolve the review surfaces' symbolic merge/revert target to a real
     /// directory. The UI only ever sends `"self"` (revert), `"main"` (merge to
     /// the mainline checkout), or a sibling Agent ID (merge to its worktree) —
@@ -731,7 +737,21 @@ impl Manager {
                 let symbol = a.get("target_dir").and_then(|v| v.as_str()).unwrap_or("self");
                 let mode = a.get("mode").and_then(|v| v.as_str()).unwrap_or("merge");
                 let sel = a.get("selections").cloned().unwrap_or_else(|| serde_json::json!({}));
-                match self.resolve_apply_target(tk, &cwd, symbol) {
+                // The review gate, enforced where the merge happens — not by UI
+                // placement: a merge requires a standing review ack for the
+                // agent (the review surfaces record one; any new dirty path
+                // invalidates it). Fails closed when persistence is off — no
+                // store means no acks, and unrecorded merges break the thesis.
+                // Reverts stay ungated: discarding the agent's own work back to
+                // base is the safe direction.
+                let resolved = if mode != "revert" && !self.has_review_ack(tk) {
+                    Err(format!(
+                        "merge refused: no standing review ack for '{tk}' — nothing merges without Review"
+                    ))
+                } else {
+                    self.resolve_apply_target(tk, &cwd, symbol)
+                };
+                match resolved {
                     Ok(target) => {
                         crate::diff::apply_selection(&cwd, base.as_deref(), &target, mode, &sel)
                             .to_string()
@@ -3075,12 +3095,20 @@ mod tests {
         .to_string()
     }
 
+    /// Record the review ack the merge gate requires — the same `mark_reviewed`
+    /// query the review surfaces issue when the user merges/marks reviewed.
+    fn ack_review(mgr: &Manager, agent: &str) {
+        let args = serde_json::json!({ "agent_id": agent }).to_string();
+        assert_eq!(mgr.query("mark_reviewed", &args), "true");
+    }
+
     #[test]
     fn apply_selection_resolves_main_symbol_to_the_project_checkout() {
         let mgr = mem_manager();
         let proj = project_repo();
         let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
         std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        ack_review(&mgr, "agent-a");
 
         let v: serde_json::Value = serde_json::from_str(
             &mgr.query("apply_selection", &apply_args("agent-a", "main", "merge", serde_json::json!({ "a.txt": [0] }))),
@@ -3102,6 +3130,8 @@ mod tests {
         let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
         std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
 
+        // Deliberately NO review ack: revert (discarding the agent's own work
+        // back to base) is the safe direction and must stay ungated.
         let v: serde_json::Value = serde_json::from_str(
             &mgr.query("apply_selection", &apply_args("agent-a", "self", "revert", serde_json::json!({}))),
         )
@@ -3123,6 +3153,7 @@ mod tests {
         let wt_a = seed_isolated_agent(&mgr, &proj, "agent-a");
         let wt_b = seed_isolated_agent(&mgr, &proj, "agent-b");
         std::fs::write(wt_a.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        ack_review(&mgr, "agent-a");
 
         let v: serde_json::Value = serde_json::from_str(
             &mgr.query("apply_selection", &apply_args("agent-a", "agent-b", "merge", serde_json::json!({}))),
@@ -3159,6 +3190,8 @@ mod tests {
             )
             .unwrap();
         std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        // Acked, so target rejection (not the review gate) is what's exercised.
+        ack_review(&mgr, "agent-a");
 
         // A literal directory must NOT be treated as a path (the old behavior).
         for bad in ["no-such-agent", "/tmp", "agent-z"] {
@@ -3174,6 +3207,57 @@ mod tests {
             "one\ntwo\nthree\n",
             "nothing may be applied anywhere on a rejected target"
         );
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn merge_is_refused_without_a_standing_review_ack() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let merge = || -> serde_json::Value {
+            serde_json::from_str(
+                &mgr.query("apply_selection", &apply_args("agent-a", "main", "merge", serde_json::json!({}))),
+            )
+            .unwrap()
+        };
+
+        // No ack → the daemon refuses, and nothing touches the project checkout.
+        let v = merge();
+        assert_eq!(v["applied"], false, "unacked merge must be refused: {v}");
+        assert!(v["error"].as_str().unwrap().contains("review"), "refusal names the gate: {v}");
+        assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "one\ntwo\nthree\n");
+
+        // Acked → the same merge lands.
+        ack_review(&mgr, "agent-a");
+        let v = merge();
+        assert_eq!(v["applied"], true, "acked merge must apply: {v}");
+        assert!(std::fs::read_to_string(proj.join("a.txt")).unwrap().contains("TWO"));
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn clear_dirty_drops_the_ack_and_re_arms_the_merge_gate() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        ack_review(&mgr, "agent-a");
+        assert!(mgr.store().unwrap().is_reviewed("agent-a").unwrap());
+
+        // A fresh review cycle (clear_dirty) drops the standing ack…
+        let _ = mgr.query("clear_dirty", &serde_json::json!({ "agent_id": "agent-a" }).to_string());
+        assert!(!mgr.store().unwrap().is_reviewed("agent-a").unwrap());
+
+        // …so the next merge is refused until the diff is reviewed again.
+        let v: serde_json::Value = serde_json::from_str(
+            &mgr.query("apply_selection", &apply_args("agent-a", "main", "merge", serde_json::json!({}))),
+        )
+        .unwrap();
+        assert_eq!(v["applied"], false, "merge after a cleared ack must be refused: {v}");
         let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&proj);
     }

@@ -1061,6 +1061,19 @@ impl Store {
         Ok(())
     }
 
+    /// Whether an agent has a standing review ack. This is what the daemon's
+    /// merge gate reads: `apply_selection` refuses a merge without it, so
+    /// "nothing merges without Review" is enforced here, not by UI placement.
+    pub fn is_reviewed(&self, agent_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM taime_reviews WHERE agent_id = ?1",
+            rusqlite::params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Drop an agent's review ack — a fresh review cycle (its dirty set was
     /// reset), so the next change re-raises the guard.
     pub fn clear_reviewed(&self, agent_id: &str) -> rusqlite::Result<()> {
