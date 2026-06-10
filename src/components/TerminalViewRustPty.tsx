@@ -72,6 +72,10 @@ export function TerminalViewRustPty({
   const applyResizeRef = useRef<() => void>(() => {});
   // Held so the channel's onmessage isn't GC'd while the view is mounted.
   const channelRef = useRef<Channel<unknown> | null>(null);
+  // The attach generation (from daemonAttach) — scopes our daemonCloseView so
+  // this view's cleanup can never detach a NEWER view's live attachment if our
+  // attach lost a close-and-reopen race. Null until the attach resolves.
+  const attachGenRef = useRef<number | null>(null);
   const fontSize = useStore((s) => s.terminalFontSize);
   const {
     searchRef,
@@ -210,7 +214,7 @@ export function TerminalViewRustPty({
       safeFit();
       // Attach: registers the channel sink + replays scrollback (in-app) or sends
       // the grid repaint at the attach size (daemon), then streams live output.
-      const ch = await daemonAttach(
+      const attached = await daemonAttach(
         sessionId,
         term.rows,
         term.cols,
@@ -252,15 +256,17 @@ export function TerminalViewRustPty({
         },
       );
       if (!alive) {
-        // Unmounted while the attach was in flight: detach so we don't leave a
-        // phantom attachment with no acker (which would stall the agent at the
-        // backpressure watermark).
-        daemonCloseView(sessionId);
+        // Unmounted while the attach was in flight: detach OUR attachment (gen-
+        // scoped — a newer view may already hold the session) so we don't leave
+        // a phantom attachment with no acker, which would stall the agent at
+        // the backpressure watermark. Nothing to close if the attach failed.
+        if (attached) daemonCloseView(sessionId, attached.gen);
         return;
       }
-      channelRef.current = ch as Channel<unknown> | null;
+      channelRef.current = (attached?.channel ?? null) as Channel<unknown> | null;
+      attachGenRef.current = attached?.gen ?? null;
       // A live attach supersedes any earlier connection-lost flag.
-      if (ch) useStore.getState().setRustPtyConnectionLost(sessionId, false);
+      if (attached) useStore.getState().setRustPtyConnectionLost(sessionId, false);
       onConnectionChange?.("open");
       // Nudge a redraw so a reattached TUI repaints cleanly at the current size.
       safeFit();
@@ -279,8 +285,10 @@ export function TerminalViewRustPty({
       // it registered until the app-side pump drops the Channel (the in-order
       // "end" message), so every attach callback above must stay alive-gated.
       channelRef.current = null;
-      // Closing the view detaches — it does NOT kill the agent.
-      daemonCloseView(sessionId);
+      // Closing the view detaches — it does NOT kill the agent. Gen-scoped to
+      // OUR attach; if the attach is still in flight, its continuation above
+      // closes it instead (nothing to close yet here).
+      if (attachGenRef.current != null) daemonCloseView(sessionId, attachGenRef.current);
       offResults.dispose();
       searchRef.current = null;
       termRef.current = null;

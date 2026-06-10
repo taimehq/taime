@@ -281,11 +281,15 @@ export async function daemonCheckpoint(sessionId: string, cause: string): Promis
   }
 }
 
-/** Detach the view — the daemon keeps the agent running (close ≠ kill). */
-export async function daemonCloseView(sessionId: string): Promise<void> {
+/** Detach the view — the daemon keeps the agent running (close ≠ kill).
+ *  `gen` (from `daemonAttach`) scopes the detach to the caller's own attach:
+ *  a stale view's cleanup must never detach a newer view's live attachment
+ *  (close-and-reopen races are real — an attach can wait seconds on a daemon
+ *  spawn). Omit it for an explicit, unconditional close (frame close). */
+export async function daemonCloseView(sessionId: string, gen?: number): Promise<void> {
   if (!inTauri()) return;
   try {
-    await invoke("daemon_close_view", { sessionId });
+    await invoke("daemon_close_view", { sessionId, gen: gen ?? null });
   } catch {
     /* ignore */
   }
@@ -317,8 +321,9 @@ export async function daemonList(): Promise<DaemonSessionSummary[]> {
  * JSON: `exit` → `onExit`, `turn` → `onTurn`, `status` → `onStatus` (Phase 4
  * push), `fs_dirty` → `onFsDirty` (Phase 6 push), `disconnected` →
  * `onDisconnected` (the daemon CONNECTION dropped without a process exit — the
- * agent may well still be running; never an exit). Returns the `Channel` — the
- * caller must keep it alive (GC of it silently stops output).
+ * agent may well still be running; never an exit). Returns the `Channel` (the
+ * caller must keep it alive — GC of it silently stops output) plus the attach
+ * generation to pass back to `daemonCloseView`.
  */
 export async function daemonAttach(
   sessionId: string,
@@ -330,7 +335,7 @@ export async function daemonAttach(
   onStatus?: (status: string) => void,
   onFsDirty?: (paths: string[]) => void,
   onDisconnected?: () => void,
-): Promise<Channel<PtyChannelMessage> | null> {
+): Promise<{ channel: Channel<PtyChannelMessage>; gen: number } | null> {
   if (!inTauri()) return null;
   const onData = new Channel<PtyChannelMessage>();
   onData.onmessage = (msg) => {
@@ -367,8 +372,8 @@ export async function daemonAttach(
   try {
     // rows/cols let the daemon resize the PTY + emulator BEFORE the grid repaint,
     // so the repaint matches the real viewport (handoff step 1).
-    await invoke("daemon_attach", { sessionId, rows, cols, onData });
-    return onData;
+    const gen = await invoke<number>("daemon_attach", { sessionId, rows, cols, onData });
+    return { channel: onData, gen };
   } catch (e) {
     console.warn("[taime] daemon_attach failed", e);
     return null;

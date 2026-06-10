@@ -64,12 +64,19 @@ struct AttachHandle {
     /// Length of the repaint message (frontend counts it in its processed total).
     repaint_len: Arc<AtomicU64>,
     ready: Arc<AtomicBool>,
+    /// Monotonic attach generation (minted at `attach()` entry). An attach that
+    /// resolves AFTER a newer attach for the same session must neither replace
+    /// the newer handle nor let its view's cleanup detach it — connect can take
+    /// seconds (daemon spawn/restart wait), so close-and-reopen races are real.
+    gen: u64,
 }
 
 pub struct DaemonClient {
     socket: PathBuf,
     daemon_bin: Option<PathBuf>,
     req_counter: AtomicU64,
+    /// Mints `AttachHandle::gen` (see there) — newest attach wins.
+    attach_counter: AtomicU64,
     attaches: Mutex<HashMap<String, AttachHandle>>,
     /// Serializes stale-daemon replacement so two ops hitting the protocol-mismatch
     /// path at once don't each spawn a replacement.
@@ -87,6 +94,7 @@ impl DaemonClient {
             socket,
             daemon_bin,
             req_counter: AtomicU64::new(1),
+            attach_counter: AtomicU64::new(0),
             attaches: Mutex::new(HashMap::new()),
             restart_lock: Mutex::new(()),
             incompatible: AtomicBool::new(false),
@@ -413,16 +421,33 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Whether a NEWER attach for `session_id` already holds the handle — the
+    /// signal that this in-flight attach lost a close-and-reopen race and must
+    /// stand down instead of clobbering the live view's handle.
+    async fn superseded(&self, session_id: &str, gen: u64) -> bool {
+        self.attaches.lock().await.get(session_id).is_some_and(|h| h.gen > gen)
+    }
+
     /// Attach `session_id` and pump its frames to `channel`. Stores a handle so
-    /// `write`/`resize`/`ack`/`detach` can reach the same connection.
+    /// `write`/`resize`/`ack`/`detach` can reach the same connection. Returns
+    /// the attach generation — the view passes it back to `daemon_close_view`
+    /// so a stale view's cleanup can never detach a newer attach's handle.
     pub async fn attach(
         &self,
         session_id: String,
         rows: u16,
         cols: u16,
         channel: Channel<InvokeResponseBody>,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
+        let gen = self.attach_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let mut conn = self.connect_handshake().await?;
+        // connect_handshake is the slow part (a daemon spawn/restart waits up to
+        // ~3s). If a newer attach completed meanwhile, bail BEFORE the daemon
+        // ever sees our Attach — it would steal the live view's daemon-side
+        // attachment (last Attach wins there).
+        if self.superseded(&session_id, gen).await {
+            return Err("attach superseded by a newer view".to_string());
+        }
         send(
             &mut conn,
             &ClientMsg::Attach { session_id: session_id.clone(), rows, cols },
@@ -442,6 +467,34 @@ impl DaemonClient {
             ServerMsg::AttachOk { seq_n: s, .. } => seq_n.store(s, Ordering::SeqCst),
             ServerMsg::Error { message } => return Err(message),
             other => return Err(format!("unexpected attach reply: {other:?}")),
+        }
+
+        // Last-look under the map lock: a newer attach may have landed during
+        // OUR handshake. Withdraw our daemon-side attachment (Detach is
+        // conn-scoped daemon-side, so this never touches the newer conn) and
+        // stand down — replacing the newer handle would silently kill its pump
+        // (the input drop is a deliberate detach, so nothing would surface).
+        {
+            let mut map = self.attaches.lock().await;
+            match map.get(&session_id) {
+                Some(h) if h.gen > gen => {
+                    drop(map);
+                    let _ = send(&mut conn, &ClientMsg::Detach).await;
+                    return Err("attach superseded by a newer view".to_string());
+                }
+                _ => {
+                    map.insert(
+                        session_id.clone(),
+                        AttachHandle {
+                            input: input_tx,
+                            seq_n: seq_n.clone(),
+                            repaint_len: repaint_len.clone(),
+                            ready: ready.clone(),
+                            gen,
+                        },
+                    );
+                }
+            }
         }
 
         let (seq2, rl2, ready2) = (seq_n.clone(), repaint_len.clone(), ready.clone());
@@ -516,11 +569,7 @@ impl DaemonClient {
             }
         });
 
-        self.attaches.lock().await.insert(
-            session_id,
-            AttachHandle { input: input_tx, seq_n, repaint_len, ready },
-        );
-        Ok(())
+        Ok(gen)
     }
 
     async fn send_to_session(&self, session_id: &str, msg: ClientMsg) {
@@ -564,9 +613,23 @@ impl DaemonClient {
         }
     }
 
-    pub async fn detach(&self, session_id: &str) {
-        self.send_to_session(session_id, ClientMsg::Detach).await;
-        self.attaches.lock().await.remove(session_id);
+    /// Detach the view. `gen: Some(g)` scopes the detach to the attach that
+    /// minted it — a stale view's cleanup (its in-flight attach lost a
+    /// close-and-reopen race) must not detach the newer view's live handle.
+    /// `None` detaches unconditionally (an explicit frame close). The handle
+    /// is REMOVED first and Detach sent through it (not a fresh map lookup),
+    /// so a concurrent attach can't slip a new handle in between.
+    pub async fn detach(&self, session_id: &str, gen: Option<u64>) {
+        let handle = {
+            let mut map = self.attaches.lock().await;
+            match (map.get(session_id), gen) {
+                (Some(h), Some(g)) if h.gen != g => None, // stale caller — leave the live handle alone
+                _ => map.remove(session_id),
+            }
+        };
+        if let Some(h) = handle {
+            let _ = h.input.send(ClientMsg::Detach).await;
+        }
     }
 }
 

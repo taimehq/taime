@@ -6,14 +6,9 @@
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
-// Capture every constructed Channel so dispatch tests can drive onmessage.
-const channels: Array<{ onmessage: (msg: unknown) => void }> = [];
 vi.mock("@tauri-apps/api/core", () => {
   class MockChannel {
     onmessage: (msg: unknown) => void = () => {};
-    constructor() {
-      channels.push(this);
-    }
   }
   return { invoke: vi.fn(), Channel: MockChannel };
 });
@@ -36,7 +31,6 @@ const invokeMock = vi.mocked(invoke);
 const inTauriMock = vi.mocked(inTauri);
 
 beforeEach(() => {
-  channels.length = 0;
   vi.clearAllMocks();
   inTauriMock.mockReturnValue(true);
   vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -115,9 +109,9 @@ describe("daemonAttach channel dispatch", () => {
 
   /** Attach with mocked invoke and return the channel + spies. */
   async function attach() {
-    invokeMock.mockResolvedValueOnce(undefined);
+    invokeMock.mockResolvedValueOnce(7); // the attach generation
     const h = handlers();
-    const ch = await daemonAttach(
+    const res = await daemonAttach(
       "sess-1",
       24,
       80,
@@ -128,7 +122,14 @@ describe("daemonAttach channel dispatch", () => {
       h.onFsDirty,
       h.onDisconnected,
     );
-    expect(ch).not.toBeNull();
+    expect(res).not.toBeNull();
+    expect(res!.gen).toBe(7); // the gen rides back for gen-scoped close_view
+    // Pin the wire contract: rows/cols must reach the daemon BEFORE the grid
+    // repaint (the resize-first handoff), alongside the channel sink.
+    expect(invokeMock).toHaveBeenCalledWith(
+      "daemon_attach",
+      expect.objectContaining({ sessionId: "sess-1", rows: 24, cols: 80 }),
+    );
     // The channel passed to invoke is the one whose onmessage dispatches.
     const sent = invokeMock.mock.calls[0][1] as { onData: { onmessage: (m: unknown) => void } };
     return { dispatch: sent.onData.onmessage, ...h };
@@ -173,10 +174,11 @@ describe("daemonAttach channel dispatch", () => {
     expect(t.onExit).not.toHaveBeenCalled();
   });
 
-  it("returns null without invoking when the attach fails", async () => {
+  it("returns null when the attach invoke rejects", async () => {
     invokeMock.mockRejectedValueOnce("no such session");
     const h = handlers();
-    const ch = await daemonAttach("sess-x", 24, 80, h.onBytes, h.onExit);
-    expect(ch).toBeNull();
+    const res = await daemonAttach("sess-x", 24, 80, h.onBytes, h.onExit);
+    expect(res).toBeNull();
+    expect(invokeMock).toHaveBeenCalledTimes(1);
   });
 });

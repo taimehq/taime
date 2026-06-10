@@ -292,7 +292,9 @@ pub async fn daemon_attach(
     rows: u16,
     cols: u16,
     on_data: Channel<InvokeResponseBody>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
+    // Returns the attach generation; the view hands it back to
+    // daemon_close_view so a stale view can never detach a newer attach.
     daemon.attach(session_id, rows, cols, on_data).await
 }
 
@@ -347,8 +349,9 @@ pub async fn daemon_checkpoint(
 pub async fn daemon_close_view(
     daemon: State<'_, DaemonClient>,
     session_id: String,
+    gen: Option<u64>,
 ) -> Result<(), String> {
-    daemon.detach(&session_id).await;
+    daemon.detach(&session_id, gen).await;
     Ok(())
 }
 
