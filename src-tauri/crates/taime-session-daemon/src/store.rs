@@ -28,7 +28,7 @@ use taime_protocol::{StoreHealth, WorktreeInfo};
 /// L13). Bump when the schema changes so a future gating migration can branch.
 /// v12: worktree archive-then-reclaim — `taime_review_patches` + the
 /// `archive_ref`/`archived_at`/`reclaimed_at` columns on `taime_worktrees`.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Whether an open-path error is corruption of the database FILE — the class
 /// where moving the file aside and starting fresh is the right recovery.
@@ -173,6 +173,9 @@ pub struct ScheduleRow {
     /// `task_id`, "per_run" = create a fresh task per fire (explicit opt-in).
     pub task_mode: Option<String>,
     pub task_id: Option<String>,
+    /// Fire in a SHARED worktree (the user's real tree) instead of the default
+    /// isolated worktree. Opt-in only; off ⇒ isolated + reviewable.
+    pub shared: bool,
 }
 
 /// A workflow run row.
@@ -334,6 +337,10 @@ impl Store {
         add_column(&conn, "ALTER TABLE taime_worktrees ADD COLUMN archive_ref TEXT")?;
         add_column(&conn, "ALTER TABLE taime_worktrees ADD COLUMN archived_at INTEGER")?;
         add_column(&conn, "ALTER TABLE taime_worktrees ADD COLUMN reclaimed_at INTEGER")?;
+        // Schedules default to ISOLATED fires (v13): `shared = 1` is the explicit
+        // opt-in to fire in the user's real working tree. Existing rows default 0
+        // (isolated) — the safe behavior — so the flip applies to them too.
+        add_column(&conn, "ALTER TABLE flows ADD COLUMN shared INTEGER DEFAULT 0")?;
         // This index references the ALTER-added column, so it must run AFTER the
         // ALTERs (a pre-existing DB's SCHEMA batch ran before task_id existed).
         conn.execute(
@@ -1429,14 +1436,15 @@ impl Store {
         conn.execute(
             "INSERT INTO flows \
              (name, file_path, schedule, agent_profile, provider, script, last_run, next_run, \
-              enabled, prompt, workspace_root, task_mode, task_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+              enabled, prompt, workspace_root, task_mode, task_id, shared) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
              ON CONFLICT(name) DO UPDATE SET \
                file_path = excluded.file_path, schedule = excluded.schedule, \
                agent_profile = excluded.agent_profile, provider = excluded.provider, \
                script = excluded.script, next_run = excluded.next_run, \
                prompt = excluded.prompt, workspace_root = excluded.workspace_root, \
-               task_mode = excluded.task_mode, task_id = excluded.task_id",
+               task_mode = excluded.task_mode, task_id = excluded.task_id, \
+               shared = excluded.shared",
             rusqlite::params![
                 row.name,
                 row.file_path,
@@ -1451,6 +1459,7 @@ impl Store {
                 row.workspace_root,
                 row.task_mode,
                 row.task_id,
+                row.shared as i64,
             ],
         )?;
         Ok(())
@@ -1803,7 +1812,7 @@ fn map_task(r: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
 
 /// Column list for a `ScheduleRow` SELECT (kept in sync with [`map_schedule`]).
 const SCHEDULE_COLS: &str = "name, file_path, schedule, agent_profile, provider, script, \
-     last_run, next_run, enabled, prompt, workspace_root, task_mode, task_id";
+     last_run, next_run, enabled, prompt, workspace_root, task_mode, task_id, shared";
 
 fn map_schedule(r: &rusqlite::Row) -> rusqlite::Result<ScheduleRow> {
     let parse = |s: Option<String>| s.and_then(|x| x.trim().parse::<u64>().ok());
@@ -1821,6 +1830,7 @@ fn map_schedule(r: &rusqlite::Row) -> rusqlite::Result<ScheduleRow> {
         workspace_root: r.get(10)?,
         task_mode: r.get(11)?,
         task_id: r.get(12)?,
+        shared: r.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -1877,7 +1887,8 @@ CREATE TABLE IF NOT EXISTS flows (
     prompt TEXT,
     workspace_root TEXT,
     task_mode TEXT,
-    task_id TEXT
+    task_id TEXT,
+    shared INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS taime_worktrees (
     terminal_id TEXT PRIMARY KEY,
@@ -2067,6 +2078,7 @@ mod tests {
             workspace_root: Some("/projects/app".into()),
             task_mode: Some("fixed".into()),
             task_id: Some("task-12345678".into()),
+            shared: false,
         };
         store.upsert_schedule(&mk(Some(100), true)).unwrap();
         // Task-targeting columns roundtrip through the flows table.
@@ -2113,6 +2125,7 @@ mod tests {
             workspace_root: Some("/projects/app".into()),
             task_mode: None,
             task_id: None,
+            shared: false,
         };
         store.upsert_schedule(&from_md("review", Some(100))).unwrap();
         // The user disabled it in the UI and it ran once (runtime/DB-only state).
@@ -2130,6 +2143,34 @@ mod tests {
         assert_eq!(got.next_run, Some(999), "next_run refreshes from the schedule");
         assert!(!store.has_enabled_schedules(), "the daemon won't resurrect+fire it");
         assert_eq!(store.due_schedules(2000).unwrap().len(), 0, "still not due (disabled)");
+    }
+
+    #[test]
+    fn shared_flag_persists_through_flows() {
+        // The fire path keys isolation off this column (isolate = !shared). It
+        // defaults to 0 (isolated, reviewable) and roundtrips through upsert →
+        // get_schedule; re-ingest refreshes it like any other definition column.
+        let store = Store::open_at(std::path::Path::new(":memory:")).unwrap();
+        let mk = |shared: bool| ScheduleRow {
+            name: "job".into(),
+            file_path: "/x/job.md".into(),
+            schedule: "0 2 * * *".into(),
+            agent_profile: "developer".into(),
+            provider: "claude_code".into(),
+            script: None,
+            prompt: Some("go".into()),
+            last_run: None,
+            next_run: Some(1),
+            enabled: true,
+            workspace_root: Some("/projects/app".into()),
+            task_mode: None,
+            task_id: None,
+            shared,
+        };
+        store.upsert_schedule(&mk(false)).unwrap();
+        assert!(!store.get_schedule("job").unwrap().unwrap().shared, "default isolated");
+        store.upsert_schedule(&mk(true)).unwrap();
+        assert!(store.get_schedule("job").unwrap().unwrap().shared, "opt-in persists + refreshes");
     }
 
     #[test]

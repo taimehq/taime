@@ -47,6 +47,13 @@ pub struct ScheduleDef {
     pub task_mode: Option<String>,
     /// The target task for `task_mode: fixed` (front-matter `task_id:`).
     pub task_id: Option<String>,
+    /// Run the fire in a SHARED worktree — the user's real working tree — instead
+    /// of the default isolated worktree (front-matter `shared: true`). Off by
+    /// default: an isolated fire auto-archives + reclaims, so its diff surfaces in
+    /// Review like any other agent and nothing lands in the user's tree unattended.
+    /// Shared is the explicit opt-in escape hatch (e.g. a job that must mutate the
+    /// live checkout in place), and degrades attribution to heuristic.
+    pub shared: bool,
 }
 
 /// Parse a schedule markdown file (YAML-ish front-matter + body). Hand-rolled (no
@@ -122,6 +129,10 @@ pub fn parse_schedule(text: &str) -> Result<ScheduleDef, String> {
     // Explicit `uncategorized` is the spelled-out absent default.
     let task_mode = get("task_mode").filter(|m| m != "uncategorized");
     let task_id = get("task_id");
+    // Opt-in shared (non-isolated) fire; absent ⇒ isolated (the safe default).
+    let shared = get("shared")
+        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
     if prompt.is_empty() {
         return Err("schedule has no prompt body (after the closing `---`)".to_string());
     }
@@ -151,6 +162,7 @@ pub fn parse_schedule(text: &str) -> Result<ScheduleDef, String> {
         workspace_root,
         task_mode,
         task_id,
+        shared,
     })
 }
 
@@ -203,6 +215,10 @@ pub fn to_markdown(def: &ScheduleDef) -> String {
     }
     if let Some(tid) = &def.task_id {
         s.push_str(&format!("task_id: {tid}\n"));
+    }
+    // Only emit the opt-in when set — default (isolated) files stay clean.
+    if def.shared {
+        s.push_str("shared: true\n");
     }
     s.push_str("---\n");
     s.push_str(def.prompt.trim());
@@ -307,9 +323,34 @@ mod tests {
             workspace_root: None,
             task_mode: None,
             task_id: None,
+            shared: false,
         };
         let reparsed = parse_schedule(&to_markdown(&def)).unwrap();
         assert_eq!(reparsed, def);
+    }
+
+    #[test]
+    fn shared_flag_defaults_off_and_roundtrips_when_set() {
+        // Absent `shared:` ⇒ isolated (false), the safe default.
+        let md = "---\nname: x\nschedule: \"0 2 * * *\"\n---\nbody";
+        assert!(!parse_schedule(md).unwrap().shared);
+
+        // Explicit opt-in parses true and survives a markdown roundtrip.
+        let def = ScheduleDef {
+            name: "inplace".into(),
+            schedule: "0 2 * * *".into(),
+            agent_profile: "developer".into(),
+            provider: "claude_code".into(),
+            script: None,
+            prompt: "mutate the live tree".into(),
+            workspace_root: Some("/projects/app".into()),
+            task_mode: None,
+            task_id: None,
+            shared: true,
+        };
+        let rendered = to_markdown(&def);
+        assert!(rendered.contains("shared: true"));
+        assert_eq!(parse_schedule(&rendered).unwrap(), def);
     }
 
     #[test]
@@ -325,6 +366,7 @@ mod tests {
             workspace_root: Some("/projects/app".into()),
             task_mode: Some("fixed".into()),
             task_id: Some("task-deadbeef".into()),
+            shared: false,
         };
         assert_eq!(parse_schedule(&to_markdown(&def)).unwrap(), def);
 

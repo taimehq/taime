@@ -1754,6 +1754,7 @@ impl Manager {
             workspace_root: def.workspace_root.clone(),
             task_mode: def.task_mode.clone(),
             task_id: def.task_id.clone(),
+            shared: def.shared,
         }
     }
 
@@ -1819,6 +1820,9 @@ impl Manager {
             workspace_root,
             task_mode,
             task_id,
+            // UI-created schedules default to isolated (reviewable) fires; shared
+            // is opt-in via the `.md` front-matter only (no RPC surface yet).
+            shared: false,
         };
         let dir = Self::schedules_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("create schedules dir: {e}"))?;
@@ -1846,13 +1850,17 @@ impl Manager {
         workspace_root: Option<String>,
         prompt: &str,
         task_id: Option<String>,
+        isolate: bool,
     ) -> Result<String, String> {
         let (key, cwd) = match workspace_root.filter(|r| !r.trim().is_empty()) {
             Some(root) => {
-                // Shared (not isolated): unattended fires work in the workspace
-                // itself, matching CAO flow behavior (spawn path 4 of 4).
+                // Isolated by default: the fire gets its own worktree that
+                // auto-archives + reclaims, so its diff surfaces in Review like any
+                // other agent and nothing lands in the user's tree unattended.
+                // `isolate=false` (the schedule's `shared:` opt-in) fires in the
+                // workspace itself — CAO flow parity, heuristic attribution.
                 let info =
-                    self.provision_worktree(root.clone(), provider.to_string(), false, task_id);
+                    self.provision_worktree(root.clone(), provider.to_string(), isolate, task_id);
                 (info.agent_id, Some(root))
             }
             None => (format!("sched-{}", &gen_id()[..8]), None),
@@ -1951,6 +1959,7 @@ impl Manager {
             row.workspace_root.clone(),
             &prompt,
             task.clone(),
+            !row.shared, // isolated unless the schedule opts into a shared fire
         ) {
             eprintln!("[taime-daemon] schedule '{}' fire failed: {e}", row.name);
             // Roll back a task minted for THIS fire — a persistently failing
@@ -1997,6 +2006,7 @@ impl Manager {
             row.workspace_root.clone(),
             &prompt,
             task.clone(),
+            !row.shared, // isolated unless the schedule opts into a shared fire
         ) {
             // Roll back a per-run task minted for this (failed) manual fire.
             if task_created {
@@ -3377,6 +3387,7 @@ mod tests {
                 workspace_root: Some("/proj".into()),
                 task_mode: None,
                 task_id: None,
+                shared: false,
             })
             .unwrap();
 
