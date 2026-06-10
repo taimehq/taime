@@ -734,6 +734,51 @@ fn spawn_detached(daemon_bin: &Path, socket: &Path) -> std::io::Result<u32> {
     Ok(pid)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client whose socket path can never have a listener — the daemon-down
+    /// case, without touching the real runtime dir.
+    fn dead_client(tag: &str) -> DaemonClient {
+        let mut c = DaemonClient::new(None);
+        c.socket = std::env::temp_dir().join(format!("taime-test-{}-{tag}.sock", std::process::id()));
+        c
+    }
+
+    /// The strict-mode query contract the frontend's trust surfaces depend on
+    /// (P0 item 7): no daemon + no fallback MUST be the exact error string
+    /// `daemonQueryStrict` classifies as DaemonUnreachableError — never a
+    /// well-typed fallback masquerading as data.
+    #[tokio::test]
+    async fn query_without_fallback_errors_daemon_unreachable() {
+        let c = dead_client("strict");
+        let err = c.query("agents".into(), "{}".into(), None).await.unwrap_err();
+        assert_eq!(err, "daemon unreachable");
+    }
+
+    /// The tolerant mode is unchanged: no daemon + a fallback serves the
+    /// fallback as Ok (the non-trust surfaces render their own empty states).
+    #[tokio::test]
+    async fn query_with_fallback_serves_the_fallback() {
+        let c = dead_client("tolerant");
+        let out = c.query("agents".into(), "{}".into(), Some("[]")).await.unwrap();
+        assert_eq!(out, "[]");
+    }
+
+    /// send_message is connect-only: with no daemon there is no receiver, and
+    /// spawning one to enqueue would dead-letter to an id it has never seen.
+    #[tokio::test]
+    async fn send_message_is_connect_only() {
+        let c = dead_client("send");
+        let err = c
+            .send_message("user".into(), "agent-1".into(), "hi".into())
+            .await
+            .unwrap_err();
+        assert_eq!(err, "daemon unreachable");
+    }
+}
+
 /// Resolve the daemon binary across dev + bundle layouts: a sibling of the app
 /// exe (dev `target/<profile>/`, and macOS `.app/Contents/MacOS/`), or the
 /// macOS bundle Resources dir (`bundle.resources` may flatten or nest under
