@@ -1,0 +1,54 @@
+# CI for the two halves of the repo: the Rust workspace under src-tauri/
+# (app + protocol + session daemon) and the Vite/React frontend.
+#
+# Rust runs on macOS: Taime is a macOS app — the daemon's spawn/PTY paths and
+# the bundle layouts the binary-resolution code probes are Darwin-shaped, and
+# building Tauri v2 on Linux would drag in the webkit2gtk system-dep dance for
+# a platform we don't ship.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: cargo test + clippy
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # ALWAYS --workspace: the root package is the Tauri app only, so a bare
+      # `cargo test` silently skips the daemon crate — where most tests live.
+      - run: cargo test --workspace --locked
+      # Clippy is warning-clean today; -D warnings keeps it that way.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  web:
+    name: typecheck + vitest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
