@@ -372,12 +372,19 @@ pub fn apply_selection(
         return json!({ "applied": false, "target_dir": target_dir, "files": [], "conflicts": [], "error": "write patch failed" });
     }
     let tmp_str = tmp.to_string_lossy().to_string();
-    let mut args = vec!["apply", "--3way"];
-    if mode == "revert" {
-        args.push("--reverse");
-    }
-    args.push(&tmp_str);
-    let out = git_raw(Path::new(target_dir), &args);
+    // Direct working-tree apply first: `--3way` refuses outright when the
+    // target's index doesn't match its working tree ("does not match index") —
+    // which is the NORMAL state of the dir a revert targets (its uncommitted
+    // changes are exactly what's being reversed). Fall back to `--3way` only
+    // when the direct apply doesn't fit, for its conflict-marker output (a
+    // failed direct apply is atomic, so the retry starts from an untouched
+    // tree).
+    let reverse: &[&str] = if mode == "revert" { &["--reverse"] } else { &[] };
+    let direct = git_raw(Path::new(target_dir), &[&["apply"], reverse, &[tmp_str.as_str()]].concat());
+    let out = match &direct {
+        Ok(o) if o.status.success() => direct,
+        _ => git_raw(Path::new(target_dir), &[&["apply", "--3way"], reverse, &[tmp_str.as_str()]].concat()),
+    };
     let _ = std::fs::remove_file(&tmp);
 
     match out {

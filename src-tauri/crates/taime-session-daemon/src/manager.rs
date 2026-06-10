@@ -667,6 +667,45 @@ impl Manager {
         (cwd, None)
     }
 
+    /// Resolve the review surfaces' symbolic merge/revert target to a real
+    /// directory. The UI only ever sends `"self"` (revert), `"main"` (merge to
+    /// the mainline checkout), or a sibling Agent ID (merge to its worktree) —
+    /// anything else is rejected rather than treated as a literal path, so a
+    /// caller can never aim `git apply` at an arbitrary directory.
+    ///
+    /// `"main"` resolves to the agent's recorded `repo_root` (diff paths are
+    /// toplevel-relative) falling back to `project_root`; an Agent ID resolves
+    /// to that agent's worktree only when both agents share a workspace.
+    fn resolve_apply_target(&self, agent_id: &str, cwd: &str, target: &str) -> Result<String, String> {
+        if target == "self" {
+            // The dir the diff was computed from — the agent's own worktree.
+            return Ok(cwd.to_string());
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| format!("persistence unavailable: cannot resolve target '{target}'"))?;
+        let src = store.worktree_row(agent_id).ok().flatten();
+        if target == "main" {
+            let src = src.ok_or("no worktree recorded for this agent: cannot resolve 'main'")?;
+            return src
+                .repo_root
+                .or(src.project_root)
+                .ok_or_else(|| "agent has no recorded workspace root".to_string());
+        }
+        let Some(dst) = store.worktree_row(target).ok().flatten() else {
+            return Err(format!("unknown merge target '{target}'"));
+        };
+        let same_workspace = match (src.and_then(|s| s.project_root), &dst.project_root) {
+            (Some(a), Some(b)) => a == *b,
+            _ => false,
+        };
+        if !same_workspace {
+            return Err(format!("merge target '{target}' is not in this agent's workspace"));
+        }
+        Ok(dst.worktree_path)
+    }
+
     /// Generic query RPC (Phase 6 route-layer migration): returns a JSON string in
     /// the frontend's shape for `kind`. Shells out to git (diffs) — call from a
     /// blocking context.
@@ -689,10 +728,19 @@ impl Manager {
             }
             "apply_selection" => {
                 let (cwd, base) = self.diff_context(tk);
-                let target = a.get("target_dir").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| cwd.clone());
+                let symbol = a.get("target_dir").and_then(|v| v.as_str()).unwrap_or("self");
                 let mode = a.get("mode").and_then(|v| v.as_str()).unwrap_or("merge");
                 let sel = a.get("selections").cloned().unwrap_or_else(|| serde_json::json!({}));
-                crate::diff::apply_selection(&cwd, base.as_deref(), &target, mode, &sel).to_string()
+                match self.resolve_apply_target(tk, &cwd, symbol) {
+                    Ok(target) => {
+                        crate::diff::apply_selection(&cwd, base.as_deref(), &target, mode, &sel)
+                            .to_string()
+                    }
+                    Err(e) => serde_json::json!({
+                        "applied": false, "target_dir": symbol, "files": [], "conflicts": [], "error": e
+                    })
+                    .to_string(),
+                }
             }
             "contention" => self.contention_json(a.get("session").and_then(|v| v.as_str()).unwrap_or("")),
             "workspace_info" => {
@@ -2964,5 +3012,169 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(&mgr.query(retired, "{}")).unwrap();
             assert!(v.get("error").is_some(), "{retired} must be an unknown query");
         }
+    }
+
+    // ---- Review pipeline end-to-end: the `apply_selection` query arm driven
+    // ---- with the UI's ACTUAL arguments (symbolic "main"/"self"/agent-id
+    // ---- targets — which used to reach `git -C` as literal directories).
+
+    use std::path::{Path, PathBuf};
+
+    fn git_in(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git").current_dir(cwd).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A real project repo with one commit of `a.txt` — the "main" checkout.
+    fn project_repo() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("taime-mgr-e2e-{:08x}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        git_in(&dir, &["init", "-q"]);
+        git_in(&dir, &["config", "user.email", "t@t"]);
+        git_in(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git_in(&dir, &["add", "-A"]);
+        git_in(&dir, &["commit", "-qm", "init"]);
+        dir
+    }
+
+    /// Provision a REAL isolated `git worktree` for `agent_id` at the project's
+    /// HEAD and record its durable row — what the symbolic-target resolver and
+    /// `diff_context` read.
+    fn seed_isolated_agent(mgr: &Manager, proj: &Path, agent_id: &str) -> PathBuf {
+        let base = git_in(proj, &["rev-parse", "HEAD"]);
+        let wt = std::env::temp_dir().join(format!("taime-mgr-wt-{agent_id}-{:08x}", rand::random::<u32>()));
+        let branch = format!("taime/test-{agent_id}");
+        git_in(proj, &["worktree", "add", "-q", "-b", &branch, wt.to_str().unwrap(), &base]);
+        mgr.store()
+            .unwrap()
+            .upsert_worktree(
+                &WorktreeInfo {
+                    agent_id: agent_id.into(),
+                    project_root: proj.to_string_lossy().into_owned(),
+                    repo_root: Some(proj.to_string_lossy().into_owned()),
+                    worktree_path: wt.to_string_lossy().into_owned(),
+                    branch: Some(branch),
+                    base_sha: Some(base),
+                    mode: "isolated".into(),
+                    error: None,
+                },
+                "claude_code",
+                1,
+            )
+            .unwrap();
+        wt
+    }
+
+    fn apply_args(agent: &str, target: &str, mode: &str, selections: serde_json::Value) -> String {
+        // Exactly the payload api.ts `applySelection` sends.
+        serde_json::json!({
+            "agent_id": agent, "target_dir": target, "mode": mode, "selections": selections
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn apply_selection_resolves_main_symbol_to_the_project_checkout() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(
+            &mgr.query("apply_selection", &apply_args("agent-a", "main", "merge", serde_json::json!({ "a.txt": [0] }))),
+        )
+        .unwrap();
+        assert_eq!(v["applied"], true, "merge to 'main' failed: {v}");
+        assert!(
+            std::fs::read_to_string(proj.join("a.txt")).unwrap().contains("TWO"),
+            "the hunk must land in the project checkout"
+        );
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn apply_selection_resolves_self_symbol_for_revert() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(
+            &mgr.query("apply_selection", &apply_args("agent-a", "self", "revert", serde_json::json!({}))),
+        )
+        .unwrap();
+        assert_eq!(v["applied"], true, "revert from 'self' failed: {v}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+            "one\ntwo\nthree\n",
+            "the agent's worktree must be back at base"
+        );
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn apply_selection_merges_into_a_same_workspace_sibling() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt_a = seed_isolated_agent(&mgr, &proj, "agent-a");
+        let wt_b = seed_isolated_agent(&mgr, &proj, "agent-b");
+        std::fs::write(wt_a.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(
+            &mgr.query("apply_selection", &apply_args("agent-a", "agent-b", "merge", serde_json::json!({}))),
+        )
+        .unwrap();
+        assert_eq!(v["applied"], true, "merge to sibling failed: {v}");
+        assert!(std::fs::read_to_string(wt_b.join("a.txt")).unwrap().contains("TWO"));
+        let _ = std::fs::remove_dir_all(&wt_a);
+        let _ = std::fs::remove_dir_all(&wt_b);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn apply_selection_rejects_non_symbolic_and_cross_workspace_targets() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        // A sibling row in a DIFFERENT workspace — never a valid target.
+        mgr.store()
+            .unwrap()
+            .upsert_worktree(
+                &WorktreeInfo {
+                    agent_id: "agent-z".into(),
+                    project_root: "/elsewhere".into(),
+                    repo_root: None,
+                    worktree_path: "/elsewhere".into(),
+                    branch: None,
+                    base_sha: None,
+                    mode: "shared".into(),
+                    error: None,
+                },
+                "claude_code",
+                2,
+            )
+            .unwrap();
+        std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+
+        // A literal directory must NOT be treated as a path (the old behavior).
+        for bad in ["no-such-agent", "/tmp", "agent-z"] {
+            let v: serde_json::Value = serde_json::from_str(
+                &mgr.query("apply_selection", &apply_args("agent-a", bad, "merge", serde_json::json!({}))),
+            )
+            .unwrap();
+            assert_eq!(v["applied"], false, "target '{bad}' must be rejected");
+            assert!(v["error"].as_str().unwrap_or("").contains(bad), "error names the target: {v}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(proj.join("a.txt")).unwrap(),
+            "one\ntwo\nthree\n",
+            "nothing may be applied anywhere on a rejected target"
+        );
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
     }
 }
