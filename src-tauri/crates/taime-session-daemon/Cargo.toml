@@ -3,6 +3,7 @@
 [package]
 name = "taime-session-daemon"
 version = "0.1.0"
+license = "FSL-1.1-ALv2"
 edition = "2021"
 # 1.80 for std::sync::LazyLock (the provider-registry status regexes). The daemon
 # already needs a recent toolchain for the git-pinned wezterm-term dep.

@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "license": "FSL-1.1-ALv2",
   "description": "Taime — a unified app+terminal orchestrator for the official AI coding CLIs",
   "scripts": {
     "dev": "vite",
