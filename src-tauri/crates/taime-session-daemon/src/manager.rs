@@ -613,26 +613,31 @@ impl Manager {
         }
         for wt in &agents {
             if wt.mode.as_deref() == Some("isolated") {
-                if destroy_archives {
-                    // HARD: force-remove the checkout and DESTROY the durable
-                    // archive ref — the reclaimed agent's only copy of its work.
+                if destroy_archives && wt.archive_ref.is_some() {
+                    // HARD destroy — but ONLY the archived work the user was shown a
+                    // count of and typed-confirmed (`archive_ref.is_some()` is
+                    // exactly `workspace_archived_count`). Drop the durable ref (the
+                    // reclaimed agent's only copy) and remove any checkout.
                     crate::worktree::remove_force(
                         &wt.worktree_path,
                         wt.repo_root.as_deref(),
                         wt.branch.as_deref(),
                     );
-                    if let (Some(repo), Some(ar)) =
-                        (wt.repo_root.as_deref(), wt.archive_ref.as_deref())
-                    {
-                        crate::worktree::drop_archive_ref(repo, ar);
+                    if let Some(repo) = wt.repo_root.as_deref() {
+                        if let Some(ar) = wt.archive_ref.as_deref() {
+                            crate::worktree::drop_archive_ref(repo, ar);
+                        }
                     }
                 } else if wt.reclaimed_at.is_none() {
-                    // SOFT: snapshot any still-on-disk checkout into the archive ref
-                    // (non-lossy) before reclaiming it, and NEVER drop an archive
-                    // ref — so no unmerged work is silently destroyed. (An archive
+                    // PRESERVE (the default, AND every agent outside the confirmed
+                    // destroy set even on a hard delete): snapshot any still-on-disk
+                    // checkout into its archive ref (non-lossy) before reclaiming,
+                    // and NEVER drop a ref. So a hard delete destroys exactly the
+                    // counted archived work and nothing uncounted. (An archive
                     // failure keeps the checkout; nothing is lost.)
                     self.archive_and_reclaim(wt);
                 }
+                // else (reclaimed, archive ref preserved): nothing to do.
             }
             let _ = store.delete_review_patch(&wt.terminal_id);
             let _ = store.delete_worktree_row(&wt.terminal_id);
@@ -1897,11 +1902,38 @@ impl Manager {
             .map_err(|e| format!("store schedule: {e}"))
     }
 
+    /// The `(attribution key, spawn cwd)` for a headless fire. With a
+    /// `workspace_root` it provisions a worktree and runs in that worktree's path —
+    /// for an ISOLATED fire the private checkout (NOT `root`, the user's real
+    /// tree); for a shared fire `worktree_path == root`. Without a workspace it
+    /// runs in the daemon's cwd under a synthetic `sched-` key. Extracted so the
+    /// cwd selection is unit-testable without a live spawn (the isolated-vs-shared
+    /// cwd is the difference between reviewable work and silently mutating the
+    /// user's tree).
+    fn headless_target(
+        &self,
+        workspace_root: Option<String>,
+        provider: &str,
+        isolate: bool,
+        task_id: Option<String>,
+    ) -> (String, Option<String>) {
+        match workspace_root.filter(|r| !r.trim().is_empty()) {
+            Some(root) => {
+                let info = self.provision_worktree(root, provider.to_string(), isolate, task_id);
+                (info.agent_id, Some(info.worktree_path))
+            }
+            None => (format!("sched-{}", &gen_id()[..8]), None),
+        }
+    }
+
     /// Spawn a headless agent under `profile`/`provider` and deliver `prompt` when
     /// it next goes idle (the shared Schedule/Workflow fire path). With a
-    /// `workspace_root` the agent is provisioned a shared worktree row there —
-    /// so attribution AND Task membership land on the durable anchor; without
-    /// one it runs in the daemon's cwd under a synthetic `sched-` key.
+    /// `workspace_root` the agent is provisioned a worktree there (ISOLATED by
+    /// default — its diff surfaces in Review like any other agent and nothing
+    /// lands in the user's tree unattended; `isolate=false` is the schedule's
+    /// `shared:` opt-in) so attribution AND Task membership land on the durable
+    /// anchor; without one it runs in the daemon's cwd under a synthetic `sched-`
+    /// key.
     pub fn fire_headless(
         &self,
         profile: &str,
@@ -1911,19 +1943,7 @@ impl Manager {
         task_id: Option<String>,
         isolate: bool,
     ) -> Result<String, String> {
-        let (key, cwd) = match workspace_root.filter(|r| !r.trim().is_empty()) {
-            Some(root) => {
-                // Isolated by default: the fire gets its own worktree that
-                // auto-archives + reclaims, so its diff surfaces in Review like any
-                // other agent and nothing lands in the user's tree unattended.
-                // `isolate=false` (the schedule's `shared:` opt-in) fires in the
-                // workspace itself — CAO flow parity, heuristic attribution.
-                let info =
-                    self.provision_worktree(root.clone(), provider.to_string(), isolate, task_id);
-                (info.agent_id, Some(root))
-            }
-            None => (format!("sched-{}", &gen_id()[..8]), None),
-        };
+        let (key, cwd) = self.headless_target(workspace_root, provider, isolate, task_id);
         let spec = AgentSpawnSpec {
             provider: provider.to_string(),
             profile: AgentProfile { name: profile.to_string(), ..Default::default() },
@@ -3134,6 +3154,35 @@ mod tests {
             crate::worktree::archive_ref_exists(&root, "agent-a"),
             "the soft-preserved ref is untouched by a later hard delete of another agent"
         );
+
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn isolated_fire_runs_in_its_worktree_not_the_users_tree() {
+        // Regression for the schedule-isolation fix: an isolated headless fire must
+        // run in its PRIVATE worktree checkout, never the user's real project root
+        // — else it mutates the user's tree unattended and its work never surfaces
+        // in Review (the isolated checkout would sit empty). headless_target is the
+        // exact cwd-selection fire_headless uses.
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let root = proj.to_string_lossy().into_owned();
+        let store = mgr.store().unwrap();
+
+        // Isolated (the default): cwd is a private checkout, distinct from root.
+        let (key, cwd) = mgr.headless_target(Some(root.clone()), "claude_code", true, None);
+        let cwd = cwd.expect("a workspace fire has a cwd");
+        assert_ne!(cwd, root, "isolated fire must NOT run in the user's real tree");
+        let row = store.worktree_row(&key).unwrap().unwrap();
+        assert_eq!(row.mode.as_deref(), Some("isolated"));
+        assert_eq!(row.worktree_path, cwd, "fire runs in the provisioned worktree");
+        crate::worktree::remove_force(&cwd, Some(&root), row.branch.as_deref());
+
+        // Shared (the `shared:` opt-in): worktree_path == root, so cwd IS the root.
+        let (skey, scwd) = mgr.headless_target(Some(root.clone()), "claude_code", false, None);
+        assert_eq!(scwd.as_deref(), Some(root.as_str()), "shared fire runs in the workspace itself");
+        assert_eq!(store.worktree_row(&skey).unwrap().unwrap().mode.as_deref(), Some("shared"));
 
         let _ = std::fs::remove_dir_all(&proj);
     }

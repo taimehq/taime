@@ -1422,7 +1422,8 @@ impl Store {
 
     // ---- Schedules (cron-triggered unattended agent runs; `flows` table) ----
 
-    /// Create or replace a schedule (resets last_run; next_run is recomputed).
+    /// Insert a new schedule, or refresh an existing one's .md-defined columns —
+    /// PRESERVING its `enabled` toggle and `last_run` history (see the body).
     pub fn upsert_schedule(&self, row: &ScheduleRow) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         // ON CONFLICT DO UPDATE (not INSERT OR REPLACE): for an existing schedule

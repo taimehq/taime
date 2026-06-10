@@ -54,14 +54,18 @@ const FS_DIRTY_CAP: usize = 50;
 /// worse error, and real user-idle edits come minutes later, not seconds.
 const SHARED_ATTRIBUTION_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Whether a SHARED agent should attribute a change observed now: only while it is
-/// mid-turn, or within [`SHARED_ATTRIBUTION_GRACE`] of its last output (covers its
-/// own write/flush + debounce lag after a turn). Idle longer than that ⇒ the
-/// change is the user's (or another agent's) and is dropped. Pure so the window is
-/// unit-testable without spawning a PTY. Isolated agents bypass this entirely —
-/// they own their worktree, so every change there is theirs.
-fn shared_records_now(turn_open: bool, since_last_output: std::time::Duration) -> bool {
-    turn_open || since_last_output < SHARED_ATTRIBUTION_GRACE
+/// Whether a SHARED agent should attribute a change observed now: only once it has
+/// actually produced output (`has_output`) AND is mid-turn or within
+/// [`SHARED_ATTRIBUTION_GRACE`] of its last output (covers its own write/flush +
+/// debounce lag after a turn). The `has_output` gate closes the cold-start window:
+/// a freshly-spawned agent's `last_output` is its spawn instant, so without it any
+/// edit the USER makes in the shared tree during the provider's startup latency
+/// (before the agent emits a byte) would be misattributed — the worse error. Idle
+/// longer than the grace ⇒ the change is the user's (or another agent's) and is
+/// dropped. Pure so the window is unit-testable without spawning a PTY. Isolated
+/// agents bypass this entirely — they own their worktree, so changes are theirs.
+fn shared_records_now(has_output: bool, turn_open: bool, since_last_output: std::time::Duration) -> bool {
+    has_output && (turn_open || since_last_output < SHARED_ATTRIBUTION_GRACE)
 }
 
 /// Backpressure watermarks (bytes in flight = sent − acked). Generous for the
@@ -600,7 +604,11 @@ impl Session {
         let changes = if self.inner.shared {
             let recently_active = {
                 let st = lock_state(&self.inner);
-                shared_records_now(st.turn_started_unix.is_some(), st.last_output.elapsed())
+                shared_records_now(
+                    st.out_offset > 0,
+                    st.turn_started_unix.is_some(),
+                    st.last_output.elapsed(),
+                )
             };
             if !recently_active {
                 return;
@@ -1011,38 +1019,48 @@ mod tests {
 
     #[test]
     fn shared_attribution_gate_records_only_while_recently_active() {
-        // Mid-turn → always attribute, regardless of the output clock.
-        assert!(shared_records_now(true, Duration::from_secs(3600)));
-        // Idle but within the grace window (own write/flush lag) → attribute.
-        assert!(shared_records_now(false, SHARED_ATTRIBUTION_GRACE / 2));
+        // has_output=true, mid-turn → always attribute, regardless of the clock.
+        assert!(shared_records_now(true, true, Duration::from_secs(3600)));
+        // has_output=true, idle but within the grace window (write/flush lag) → yes.
+        assert!(shared_records_now(true, false, SHARED_ATTRIBUTION_GRACE / 2));
         // Idle past the grace window → the change is the user's (or another
         // agent's); drop it rather than misattribute.
-        assert!(!shared_records_now(false, SHARED_ATTRIBUTION_GRACE + Duration::from_secs(1)));
+        assert!(!shared_records_now(true, false, SHARED_ATTRIBUTION_GRACE + Duration::from_secs(1)));
+        // Cold start: NO output yet (out_offset == 0) → never attribute, even though
+        // last_output (the spawn instant) is "recent". Closes the spawn-window
+        // false-positive where the user's edits would be stamped as the agent's.
+        assert!(!shared_records_now(false, false, Duration::from_millis(1)));
+        assert!(!shared_records_now(false, true, Duration::from_millis(1)));
     }
 
     #[test]
     fn shared_session_records_its_edit_while_active() {
         // A SHARED agent (cwd = the user's real tree) still records its OWN edits
-        // while recently active — the gate drops only idle-window changes. Freshly
-        // spawned ⇒ last_output is now ⇒ within the grace window ⇒ records.
+        // while recently active — the gate drops only idle/cold-start changes. The
+        // agent prints output first (so has_output is true and it's within the
+        // grace window) before editing, so the edit is attributed.
         let dir = std::env::temp_dir().join(format!("taime-fsw-shared-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let store = Arc::new(Store::open_at(Path::new(":memory:")).unwrap());
         let spec = SpawnSpec {
-            prog: "sleep".into(),
-            args: vec!["10".into()],
+            // Emit output (so out_offset > 0 clears the cold-start gate), then stay
+            // alive so the watcher keeps running.
+            prog: "sh".into(),
+            args: vec!["-c".into(), "printf ready; sleep 10".into()],
             cwd: Some(dir.to_string_lossy().into_owned()),
             env: vec![],
             rows: 24,
             cols: 80,
             agent_id: Some("term-shared".into()),
         };
-        // shared = true: the authorship gate is active, but the agent is within its
-        // post-spawn active window, so its edit is attributed.
+        // shared = true: the authorship gate is active.
         let session = Session::spawn("pty-shared".into(), &spec, Some(store.clone()), true).unwrap();
 
+        // Let the "ready" output land (out_offset > 0) BEFORE editing, so the gate
+        // sees the agent as active when the file's debounced fs event fires.
+        std::thread::sleep(Duration::from_millis(500));
         std::fs::write(dir.join("work.txt"), "agent output").unwrap();
 
         let mut recorded = false;

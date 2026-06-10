@@ -45,9 +45,12 @@ export function DeleteWorkspaceDialog({
   const isActive = path === workspaceDir;
   const typedOk = confirm.trim() === name;
   // Either destructive opt-in (destroy archived work / delete the folder) demands
-  // the typed name; the soft default needs none.
+  // the typed name; the soft default needs none. We do NOT gate on `connected`:
+  // the soft remove-from-Taime must still work offline (as it did before), and the
+  // daemon-only opt-in (destroy archives) is already unreachable while disconnected
+  // because its checkbox only appears once the archived count has been fetched.
   const needsTyped = deleteDir || destroyArchives;
-  const canRun = !busy && connected && (!needsTyped || typedOk);
+  const canRun = !busy && (!needsTyped || typedOk);
 
   // Fetch the archived-work count on open (and whenever the daemon reconnects) so
   // the destroy-archives opt-in only appears when there's actually work to lose.
@@ -90,8 +93,10 @@ export function DeleteWorkspaceDialog({
     const parts = [
       r.killed ? `stopped ${plural(r.killed, "agent")}` : null,
       r.tasks ? `deleted ${plural(r.tasks, "task")}` : null,
-      destroyArchives && hasArchives
-        ? `destroyed ${plural(archivedCount ?? 0, "agent")}' archived work`
+      // Only claim destruction if the daemon actually processed it (r.ok) — a
+      // daemon-down run unlists but destroys nothing.
+      destroyArchives && hasArchives && r.ok
+        ? `destroyed archived work for ${plural(archivedCount ?? 0, "agent")}`
         : null,
       deleteDir && !dirErr ? "removed the folder" : null,
     ].filter(Boolean);
