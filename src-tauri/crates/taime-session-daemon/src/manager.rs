@@ -21,6 +21,12 @@ use crate::store::{ScheduleRow, SessionRow, Store};
 
 pub struct Manager {
     sessions: Mutex<HashMap<String, Session>>,
+    /// Random per-daemon-generation nonce woven into every pty session id so the
+    /// monotonic `session_counter` (which restarts at 0 each boot) can never mint
+    /// an id that collides with a prior generation's durable `daemon_sessions` row.
+    /// Idle-shutdown makes daemon restarts routine; without this the first spawn
+    /// after every restart was `pty-0`, resurrecting the dead gen-1 agent's row.
+    boot_nonce: String,
     session_counter: AtomicU64,
     conn_counter: AtomicU64,
     active_conns: AtomicU64,
@@ -358,6 +364,7 @@ impl Manager {
         let store = store.map(Arc::new);
         Manager {
             sessions: Mutex::new(HashMap::new()),
+            boot_nonce: format!("{:016x}", rand::random::<u64>()),
             session_counter: AtomicU64::new(0),
             conn_counter: AtomicU64::new(0),
             active_conns: AtomicU64::new(0),
@@ -401,8 +408,15 @@ impl Manager {
         *self.last_activity.lock().unwrap() = Instant::now();
     }
 
+    /// Mint the next pty session id for THIS daemon generation: `pty-<nonce>-<n>`.
+    /// The boot nonce makes it globally unique across restarts (the counter alone
+    /// restarts at 0), so a new agent never inherits a dead agent's durable row.
+    fn next_pty_id(&self) -> String {
+        format!("pty-{}-{:x}", self.boot_nonce, self.session_counter.fetch_add(1, Ordering::SeqCst))
+    }
+
     pub fn spawn(&self, spec: SpawnSpec) -> Result<String, String> {
-        let id = format!("pty-{:x}", self.session_counter.fetch_add(1, Ordering::SeqCst));
+        let id = self.next_pty_id();
         let session = Session::spawn(id.clone(), &spec, self.store.clone())?;
         self.sessions.lock().unwrap().insert(id.clone(), session);
         self.touch();
@@ -438,7 +452,7 @@ impl Manager {
         let prepared = self.registry.build(&spec)?;
         // The adapter (status inference) travels with the session.
         let adapter = self.registry.adapter(&spec.provider);
-        let id = format!("pty-{:x}", self.session_counter.fetch_add(1, Ordering::SeqCst));
+        let id = self.next_pty_id();
         let program = prepared.spec.prog.clone();
         // Persist the provider-cleanup ledger (review H2) NOW — `registry.build`
         // already wrote the injected config (gemini settings.json / grok
@@ -2874,6 +2888,7 @@ impl Manager {
     pub fn for_test(store: Option<Store>) -> Self {
         Manager {
             sessions: Mutex::new(HashMap::new()),
+            boot_nonce: format!("{:016x}", rand::random::<u64>()),
             session_counter: AtomicU64::new(0),
             conn_counter: AtomicU64::new(0),
             active_conns: AtomicU64::new(0),
@@ -3062,6 +3077,22 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn pty_ids_are_unique_within_and_across_daemon_generations() {
+        // Two managers model two daemon generations (each session_counter restarts
+        // at 0). Within a generation ids are monotonic-unique; across generations
+        // the boot nonce guarantees no overlap — so a gen-2 spawn can never reuse a
+        // gen-1 pty id and resurrect its durable daemon_sessions row.
+        let gen1 = Manager::for_test(None);
+        let gen2 = Manager::for_test(None);
+        let a = gen1.next_pty_id();
+        let b = gen1.next_pty_id();
+        let c = gen2.next_pty_id(); // gen-2's counter is also 0 here
+        assert!(a.starts_with("pty-"), "id shape: {a}");
+        assert_ne!(a, b, "unique within a generation");
+        assert_ne!(a, c, "no cross-generation collision despite both counters at 0");
     }
 
     #[test]

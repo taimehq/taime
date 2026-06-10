@@ -368,11 +368,20 @@ impl Store {
     /// errors are returned for the caller to log, never to fail the spawn.
     pub fn record_session(&self, row: &SessionRow) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // On conflict, replace EVERY identity column — not just status. pty session
+        // ids are now generation-unique (a boot nonce), so a conflict only happens
+        // on a legitimate re-record of the same live session; but were an id ever
+        // reused, a status-only upsert would graft the new agent onto the dead
+        // agent's attribution_key/provider/cwd (the resurrection bug). Replacing all
+        // columns makes the row always describe whoever currently holds the id.
         conn.execute(
             "INSERT INTO daemon_sessions \
                (pty_session_id, provider, attribution_key, cwd, program, created_at_unix, status) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-             ON CONFLICT(pty_session_id) DO UPDATE SET status = excluded.status",
+             ON CONFLICT(pty_session_id) DO UPDATE SET \
+               provider = excluded.provider, attribution_key = excluded.attribution_key, \
+               cwd = excluded.cwd, program = excluded.program, \
+               created_at_unix = excluded.created_at_unix, status = excluded.status",
             rusqlite::params![
                 row.pty_session_id,
                 row.provider,
@@ -2319,6 +2328,39 @@ mod tests {
         assert_eq!(p0.status, "exited");
         assert_eq!(p0.provider.as_deref(), Some("claude_code"));
         assert_eq!(p0.attribution_key.as_deref(), Some("term-1"));
+    }
+
+    #[test]
+    fn record_session_conflict_replaces_identity_not_just_status() {
+        // The resurrection bug: a reused pty id whose upsert updated ONLY status
+        // grafted a new agent onto the dead agent's attribution row. The upsert now
+        // replaces every identity column, so the row always describes whoever
+        // currently holds the id (belt to the generation-unique-pty-id suspenders).
+        let store = Store::open_at(std::path::Path::new(":memory:")).unwrap();
+        store.record_session(&row("pty-0")).unwrap(); // agent "term-1", running
+        store.set_session_status("pty-0", "exited").unwrap(); // boot sweep
+
+        // Same pty id, a DIFFERENT agent's identity (gen-2 reuse, were it possible).
+        store
+            .record_session(&SessionRow {
+                pty_session_id: "pty-0".into(),
+                provider: Some("codex".into()),
+                attribution_key: Some("term-2".into()),
+                cwd: Some("/tmp/wt2".into()),
+                program: "codex".into(),
+                created_at_unix: 2000,
+                status: "running".into(),
+            })
+            .unwrap();
+
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1, "still one row, not duplicated");
+        let p0 = &sessions[0];
+        assert_eq!(p0.attribution_key.as_deref(), Some("term-2"), "new agent's key, not the dead one's");
+        assert_eq!(p0.provider.as_deref(), Some("codex"));
+        assert_eq!(p0.cwd.as_deref(), Some("/tmp/wt2"));
+        assert_eq!(p0.created_at_unix, 2000);
+        assert_eq!(p0.status, "running");
     }
 
     #[test]
