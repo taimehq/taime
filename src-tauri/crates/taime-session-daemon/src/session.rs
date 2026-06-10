@@ -577,7 +577,7 @@ impl Session {
             let _ = store.record_fs_events(key, ts, &rows);
             // A new dirty path means changes beyond what any review covered:
             // invalidate the standing ack daemon-side, so the merge gate's
-            // "reviewed" is always current — the guard owns the invariant
+            // "reviewed" is always current — the daemon owns this invalidation
             // rather than trusting the app to clear it. (Re-writes of
             // already-dirty paths keep the ack, matching the app's
             // path-set re-arm semantics.)

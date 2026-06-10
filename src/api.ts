@@ -449,7 +449,7 @@ export const api = {
       error?: string;
     }>("workspace_delete", { workspace_root: workspaceRoot }, { ok: false, error: "daemon unavailable" }),
 
-  // ── Durable review acks (the flagship safe-context-switch guard) ──────────
+  // ── Durable review acks (the safe-context-switch guard) ───────────────────
   /** Persist that the user acknowledged an agent's current changes — so the ack
    *  survives a UI/daemon restart (it was frontend-local before). Resolves
    *  `false` when the ack was NOT durably recorded (daemon down or persistence

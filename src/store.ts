@@ -82,14 +82,6 @@ export type Section =
  *  screen keeps its own tab state). */
 export type TaskTab = "overview" | "review";
 
-/** A context switch held pending review of the current agent's unreviewed work.
- *  One pending switch at a time — the guard owns the invariant; further switch
- *  requests are ignored until it resolves. */
-export type PendingSwitch =
-  | { kind: "frame"; key: string }
-  | { kind: "section"; section: Section }
-  | { kind: "task"; taskId: string; tab: TaskTab | null };
-
 /** Per-agent terminal rendering mode: raw PTY (xterm) or the structured
  *  console projection of the same stream. Absent ⇒ "terminal". */
 export type TermMode = "terminal" | "console";
@@ -306,13 +298,11 @@ interface Store {
   /** Terminal ids whose auto-surfaced frame the user explicitly closed; the
    *  reconciler must not reopen these. (Manually reopening clears the flag.) */
   dismissedTerminalIds: Set<string>;
-  /** Agents (by agent id) whose dirty changes the user has acknowledged (for
-   *  the switch guard). Keyed by agent_id so review state survives frame
-   *  close/reopen and is shared by every view of the same agent. */
+  /** Agents (by agent id) whose dirty changes the user has acknowledged — drives
+   *  the reviewed/unreviewed indicators and the merge gate's ack. Keyed by
+   *  agent_id so review state survives frame close/reopen and is shared by every
+   *  view of the same agent. */
   reviewedFrames: Record<string, boolean>;
-  /** When set, a context switch (frame, section, or task navigation) is
-   *  blocked pending review of the current agent's unreviewed work. */
-  pendingSwitch: PendingSwitch | null;
   /** Launch-collected assignments awaiting one-shot delivery, keyed by agent
    *  id (minted at provision). Sent as the agent's first prompt the first time
    *  its terminal view is attached AND it reports IDLE, then cleared — at most
@@ -471,9 +461,9 @@ interface Store {
   /** Mark a terminal id as dismissed so the reconciler won't reopen it. */
   dismissTerminal: (id: string) => void;
   setActiveFrame: (key: string | null) => void;
-  /** Switch active frame, raising the dirty-state guard if needed. */
+  /** Switch active frame — the single navigation entry point all surfaces
+   *  route through. */
   setActiveFrameGuarded: (key: string) => void;
-  resolveSwitch: (proceed: boolean) => void;
   /** Acknowledge an agent's dirty changes (keyed by agent id). Also persisted
    *  daemon-side so the ack survives a UI/daemon restart. */
   markReviewed: (agentId: string) => void;
@@ -483,7 +473,7 @@ interface Store {
    *  race the durable ack would be wiped). Use this instead of calling
    *  clearDirty + markReviewed separately. */
   markFrameReviewed: (agentId: string) => void;
-  /** Merge daemon-persisted review acks into the guard state (boot/tick
+  /** Merge daemon-persisted review acks into the local ack state (boot/tick
    *  hydration — union only; can add an ack, never clear a local one). */
   hydrateReviewed: (agentIds: string[]) => void;
   openDiff: (terminalId: string) => void;
@@ -525,32 +515,6 @@ interface Store {
   hideSnackbar: () => void;
 }
 
-/** Does this frame's agent have dirty changes the user hasn't acknowledged?
- *  (The guard condition — shared by frame switches and section navigation.) */
-function hasUnreviewedWork(
-  s: Pick<Store, "dirty" | "reviewedFrames">,
-  frame: Frame | undefined,
-): boolean {
-  if (!frame?.terminalId) return false;
-  const d = s.dirty[frame.terminalId];
-  return !!d && d.count > 0 && !s.reviewedFrames[frame.terminalId];
-}
-
-/** Are these two agents touching any of the same files? The real cross-agent
- *  collision signal — a same-task switch is still guarded when it fires. */
-function contendedBetween(
-  s: Pick<Store, "dirty">,
-  aTid: string | null | undefined,
-  bTid: string | null | undefined,
-): boolean {
-  if (!aTid || !bTid) return false;
-  const a = s.dirty[aTid];
-  const b = s.dirty[bTid];
-  if (!a || !b) return false;
-  const bPaths = new Set(b.paths);
-  return a.paths.some((p) => bPaths.has(p));
-}
-
 const bootWorkspaceDir = loadWorkspaceDir();
 const bootRecents = loadRecentProjects();
 
@@ -587,7 +551,6 @@ export const useStore = create<Store>((set, get) => ({
   dirty: {},
   dismissedTerminalIds: new Set(),
   reviewedFrames: {},
-  pendingSwitch: null,
   pendingAssignments: {},
   notifications: [],
   termModes: {},
@@ -608,35 +571,11 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   setSection: (section) => {
-    const s = get();
-    // The guard owns the invariant: while a switch is pending review, ignore
-    // further navigation so a second keystroke/click cannot silently retarget
-    // the open guard modal.
-    if (s.pendingSwitch) return;
-    if (section === s.section) return;
-    // Leaving the agents section away from an agent with unreviewed changes
-    // raises the guard instead of navigating (same gate as frame switches).
-    if (
-      s.section === "agents" &&
-      hasUnreviewedWork(s, s.frames.find((f) => f.key === s.activeFrameKey))
-    ) {
-      set({ pendingSwitch: { kind: "section", section } });
-      return;
-    }
+    if (section === get().section) return;
     set({ section });
   },
 
   selectTask: (taskId, tab) => {
-    const s = get();
-    if (s.pendingSwitch) return;
-    const current = s.frames.find((f) => f.key === s.activeFrameKey);
-    // Navigating to the task this agent belongs to is not a context switch —
-    // it's the path to the agent's own Review tab; never guard it.
-    const sameTask = (current?.taskId ?? null) === taskId;
-    if (s.section === "agents" && !sameTask && hasUnreviewedWork(s, current)) {
-      set({ pendingSwitch: { kind: "task", taskId, tab: tab ?? null } });
-      return;
-    }
     set({ section: "tasks", selectedTaskId: taskId, taskInitialTab: tab ?? null });
   },
 
@@ -1237,61 +1176,10 @@ export const useStore = create<Store>((set, get) => ({
     });
   },
 
+  // The single frame-navigation entry point every surface routes through.
   setActiveFrameGuarded: (key) => {
-    const s = get();
-    // The guard owns the invariant: while a switch is pending review, ignore
-    // further switch requests so a second keystroke/click cannot silently
-    // retarget the open guard modal.
-    if (s.pendingSwitch) return;
-    if (key === s.activeFrameKey) return;
-    const current = s.frames.find((f) => f.key === s.activeFrameKey);
-    // If the agent we're switching AWAY from left unreviewed changes, raise the
-    // guard instead of switching. The UI resolves it (review or proceed).
-    // The Task is the unit of safe context switching: moving between agents of
-    // the same Task (incl. both Uncategorized) is supervision of parallel
-    // work, not a context switch — exempt, UNLESS the two agents have dirty
-    // paths in common (a real collision, task membership notwithstanding).
-    if (hasUnreviewedWork(s, current)) {
-      const next = s.frames.find((f) => f.key === key);
-      const sameTask = !!next && (next.taskId ?? null) === (current?.taskId ?? null);
-      if (!sameTask || contendedBetween(s, current?.terminalId, next.terminalId)) {
-        set({ pendingSwitch: { kind: "frame", key } });
-        return;
-      }
-    }
+    if (key === get().activeFrameKey) return;
     set({ activeFrameKey: key });
-  },
-
-  resolveSwitch: (proceed) => {
-    const s = get();
-    const target = s.pendingSwitch;
-    if (!target) return;
-    if (!proceed) {
-      set({ pendingSwitch: null });
-      return;
-    }
-    // Proceeding past the guard acknowledges the current agent's changes for
-    // this session only (keyed by agent id — review state outlives this frame).
-    // Deliberately NOT persisted as a durable review ack: proceeding is a
-    // skip, not a review. New dirty paths re-arm the guard (markDaemonFsDirty)
-    // and an app restart re-raises it once — only Mark reviewed is durable.
-    const from = s.frames.find((f) => f.key === s.activeFrameKey);
-    const reviewedFrames = from?.terminalId
-      ? { ...s.reviewedFrames, [from.terminalId]: true }
-      : s.reviewedFrames;
-    if (target.kind === "frame") {
-      set({ activeFrameKey: target.key, pendingSwitch: null, reviewedFrames });
-    } else if (target.kind === "section") {
-      set({ section: target.section, pendingSwitch: null, reviewedFrames });
-    } else {
-      set({
-        section: "tasks",
-        selectedTaskId: target.taskId,
-        taskInitialTab: target.tab,
-        pendingSwitch: null,
-        reviewedFrames,
-      });
-    }
   },
 
   markReviewed: (agentId) => {
@@ -1309,7 +1197,7 @@ export const useStore = create<Store>((set, get) => ({
         // A durable ack only covers work up to the review that set it. The
         // daemon resets its dirty accumulation at that same review, so a
         // non-empty dirty set here means changes arrived AFTER the ack — the
-        // ack is stale; don't let a hydrate tick disarm the guard.
+        // ack is stale; don't let a hydrate tick mark it reviewed.
         if (s.dirty[id] && s.dirty[id].count > 0) continue;
         if (!next[id]) {
           next[id] = true;
@@ -1444,8 +1332,9 @@ export const useStore = create<Store>((set, get) => ({
     }
     // A standing ack covers the set that was acknowledged. Pushes are
     // cumulative (the full set since the last review-clear), so any path the
-    // ack didn't cover re-arms the guard — locally and in the daemon's
-    // durable ack (best-effort), so a hydrate tick can't re-disarm it.
+    // ack didn't cover invalidates the ack — locally and in the daemon's
+    // durable record (best-effort), so a hydrate tick can't re-apply it. This
+    // is what keeps the merge gate from honoring a stale review.
     const known = new Set(prev?.paths ?? []);
     const ackStale = !!s.reviewedFrames[tid] && paths.some((p) => !known.has(p));
     if (ackStale) api.clearReviewed(tid).catch(() => {});

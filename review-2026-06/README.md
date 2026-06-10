@@ -3,6 +3,8 @@
 A 124-agent adversarial review of the app at `f2abb7f` (post daemon-hardening), plus external
 research and a synthesized design for the adversarial multi-model feature ("Council").
 
+> **⚠ Model correction (2026-06-10).** This review was written against an earlier framing where review/approval was treated as **mandatory** ("nothing merges without Review", "the Review gate"). That framing was an error. Taime's actual model: **attribution/audit is the always-on invariant; complete autonomy is the primary/default mode; review before merge/push/PR is OPT-IN, never mandatory.** The findings below still stand — but read every "nothing merges without Review" / "bypasses Review" claim as "the *opt-in* review/merge surface can't be trusted *when the user enables it*" and every attribution hole as a defect in the always-on substrate, not as a broken mandatory gate. Canonical model now: `architecture-lexicon.md` (Review row).
+
 **How it was produced:** 9 review dimensions read the code in parallel; every finding was then
 handed to an independent verifier instructed to refute it (high-severity findings got two —
 a correctness-trace lens and a reproduction lens). 4 web researchers covered design

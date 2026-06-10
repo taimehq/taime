@@ -59,8 +59,6 @@ export function DiffView() {
   const markFrameReviewed = useStore((s) => s.markFrameReviewed);
   const showSnackbar = useStore((s) => s.showSnackbar);
   const frames = useStore((s) => s.frames);
-  const pendingSwitch = useStore((s) => s.pendingSwitch);
-  const resolveSwitch = useStore((s) => s.resolveSwitch);
   const connected = useStore((s) => s.connected);
 
   const [files, setFiles] = useState<FileDiffEntry[]>([]);
@@ -397,12 +395,11 @@ export function DiffView() {
     // writes can't race and wipe the durable ack).
     markFrameReviewed(terminalId);
     closeDiff();
-    if (pendingSwitch) resolveSwitch(true);
   };
 
   // The diff on screen is authoritative only while the daemon is answering and
   // the last load succeeded. This gates Mark reviewed (acknowledging changes
-  // never truly shown would disarm the switch guard on a falsehood) AND
+  // never truly shown would record a false review ack) AND
   // Merge/Revert (selections are positional hunk indices re-resolved against
   // the live worktree at apply time — a selection built on a stale or
   // mid-reload payload could merge/revert the wrong lines).

@@ -10,9 +10,9 @@ import { inTauri } from "../backend";
 /**
  * Cmd+K command palette — the primary navigation/action surface. It is NOT a
  * status replacement: it indexes the store live (agents, tasks, workspaces)
- * and EVERY jump goes through the guard-routed store actions
- * (setActiveFrameGuarded / setSection / selectTask) so the dirty-state guard
- * always applies. Hand-rolled (no cmdk dep) against the store.
+ * and EVERY jump goes through the store's navigation actions
+ * (setActiveFrameGuarded / setSection / selectTask). Hand-rolled (no cmdk dep)
+ * against the store.
  *
  * Inventory: Workspaces (switch/add) · Sections · Tasks (open / open review)
  * · Agents (open / open console) · Actions (launch agent, new task,

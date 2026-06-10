@@ -44,7 +44,7 @@ function GroupLabel({ text, count }: { text: string; count?: number }) {
  * pushed by the daemon, grouped Unread / Earlier, newest first. Clicking an
  * item marks it read and navigates — review items deep-link to the task's
  * review tab, everything else jumps to the agent. Navigation IS the action
- * (no inline approve/deny); the context-switch guard still applies.
+ * (no inline approve/deny).
  */
 export function NotificationsDrawer({ onClose }: { onClose: () => void }) {
   const notifications = useStore((s) => s.notifications);

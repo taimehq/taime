@@ -1115,8 +1115,8 @@ impl Store {
         Ok(n)
     }
 
-    // ---- Durable review acknowledgments (the flagship safe-context-switch
-    // ---- guard's state, persisted so it survives a UI/daemon restart) ----
+    // ---- Durable review acknowledgments (the safe-context-switch guard's
+    // ---- state, persisted so it survives a UI/daemon restart) ----
 
     /// Mark an agent's current changes acknowledged (idempotent upsert).
     pub fn mark_reviewed(&self, agent_id: &str, now_unix: u64) -> rusqlite::Result<()> {
@@ -1130,8 +1130,8 @@ impl Store {
     }
 
     /// Whether an agent has a standing review ack. This is what the daemon's
-    /// merge gate reads: `apply_selection` refuses a merge without it, so
-    /// "nothing merges without Review" is enforced here, not by UI placement.
+    /// merge gate reads: `apply_selection` refuses an unacked merge, binding the
+    /// merge to reviewed content — enforced here, not by UI placement.
     pub fn is_reviewed(&self, agent_id: &str) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row(
@@ -1847,7 +1847,7 @@ CREATE TABLE IF NOT EXISTS taime_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_root ON taime_tasks(workspace_root, status);
 
--- Durable review acknowledgments — the flagship safe-context-switch guard's
+-- Durable review acknowledgments — the safe-context-switch guard's
 -- state. Records which agents' current changes the user has acknowledged, so the
 -- "I already reviewed this" fact survives a UI/daemon restart (it was
 -- frontend-only `reviewedFrames` before, dying with the UI — the worst case for

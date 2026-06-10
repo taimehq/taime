@@ -81,7 +81,7 @@ pub enum GcOutcome {
     /// still at the provision base.
     Removed,
     /// Kept: uncommitted changes or commits beyond base — that is the user's
-    /// unreviewed work, and review-before-merge is the product.
+    /// in-progress work, preserved for attribution and any review before merge.
     KeptHasWork,
     /// Kept: state couldn't be verified (git error). Never delete what we
     /// can't prove worthless.

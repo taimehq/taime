@@ -25,7 +25,6 @@ import { SeedDialog } from "./components/SeedDialog";
 import { DeleteWorkspaceDialog } from "./components/DeleteWorkspaceDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { Snackbar } from "./components/Snackbar";
-import { ContextSwitchGuard } from "./components/ContextSwitchGuard";
 import { useTerminalFileDrop } from "./hooks/useTerminalFileDrop";
 import { useRustPtyReconcile } from "./hooks/useRustPtyReconcile";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
@@ -75,7 +74,6 @@ export default function App() {
   const deleteWorkspaceTarget = useStore((s) => s.deleteWorkspaceTarget);
   const setDeleteWorkspaceTarget = useStore((s) => s.setDeleteWorkspaceTarget);
   const connected = useStore((s) => s.connected);
-  const openDiff = useStore((s) => s.openDiff);
   const section = useStore((s) => s.section);
 
   // Subscribe to live supervisor status (Tauri only).
@@ -143,7 +141,6 @@ export default function App() {
         />
       )}
       <CommandPalette />
-      <ContextSwitchGuard onReview={openDiff} />
       <Suspense fallback={null}>
         <DiffView />
         <ActivityGraph />

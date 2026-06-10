@@ -4,7 +4,9 @@ A native multi-agent coding workspace. Taime launches the official AI coding
 CLIs — **Claude Code**, **Codex**, **Gemini CLI**, **Grok CLI** — as **Agents**
 in your project (the **Workspace**), each in its own isolated git **Worktree**,
 and records **Attribution** for everything they do: turns, files touched,
-diffs, all keyed to a durable **Agent ID**. Nothing merges without **Review**.
+diffs, all keyed to a durable **Agent ID**. Agents work autonomously by
+default; **Review** is an opt-in gate you can switch on to vet changes before
+they merge or reach a remote.
 
 Taime drives the real CLI binaries (never raw provider APIs), so your
 subscriptions and every native agent capability stay intact.

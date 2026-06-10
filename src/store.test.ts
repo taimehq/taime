@@ -812,7 +812,7 @@ describe("clearSelectedTask", () => {
   });
 });
 
-// ── section navigation (guard-gated) ────────────────────────────────────────
+// ── section navigation ──────────────────────────────────────────────────────
 
 /** An agents-section state with one dirty, unreviewed active frame. */
 function seedUnreviewedAgent() {
@@ -835,10 +835,9 @@ describe("section navigation", () => {
     expect(s.selectedSchedule).toBeNull();
   });
 
-  it("setSection switches freely when no unreviewed work", () => {
+  it("setSection switches", () => {
     useStore.getState().setSection("tasks");
     expect(useStore.getState().section).toBe("tasks");
-    expect(useStore.getState().pendingSwitch).toBeNull();
   });
 
   it("per-section selection persists across section switches", () => {
@@ -855,71 +854,10 @@ describe("section navigation", () => {
     expect(s.selectedSchedule).toBe("sch-1");
   });
 
-  it("leaving agents with unreviewed work raises the guard instead of switching", () => {
-    seedUnreviewedAgent();
-
-    useStore.getState().setSection("dashboard");
-
-    const s = useStore.getState();
-    expect(s.section).toBe("agents"); // did NOT navigate
-    expect(s.pendingSwitch).toEqual({ kind: "section", section: "dashboard" });
-  });
-
-  it("ignores further navigation while the guard is open", () => {
+  it("leaving agents with unreviewed work switches freely (no guard)", () => {
     seedUnreviewedAgent();
     useStore.getState().setSection("dashboard");
-
-    useStore.getState().setSection("settings");
-    useStore.getState().selectTask("task-9");
-
-    const s = useStore.getState();
-    expect(s.pendingSwitch).toEqual({ kind: "section", section: "dashboard" }); // not retargeted
-    expect(s.section).toBe("agents");
-    expect(s.selectedTaskId).toBeNull();
-  });
-
-  it("resolveSwitch(true) applies the section and marks the agent reviewed by agent id", () => {
-    seedUnreviewedAgent();
-    useStore.getState().setSection("dashboard");
-
-    useStore.getState().resolveSwitch(true);
-
-    const s = useStore.getState();
-    expect(s.section).toBe("dashboard");
-    expect(s.pendingSwitch).toBeNull();
-    expect(s.reviewedFrames["term-1"]).toBe(true); // keyed by agent id, not frame key
-  });
-
-  it("resolveSwitch(false) cancels and stays", () => {
-    seedUnreviewedAgent();
-    useStore.getState().setSection("dashboard");
-
-    useStore.getState().resolveSwitch(false);
-
-    const s = useStore.getState();
-    expect(s.section).toBe("agents");
-    expect(s.pendingSwitch).toBeNull();
-    expect(s.reviewedFrames["term-1"]).toBeUndefined();
-  });
-
-  it("already-reviewed work (by agent id) does not raise the guard", () => {
-    seedUnreviewedAgent();
-    useStore.setState({ reviewedFrames: { "term-1": true } });
-
-    useStore.getState().setSection("dashboard");
-
     expect(useStore.getState().section).toBe("dashboard");
-    expect(useStore.getState().pendingSwitch).toBeNull();
-  });
-
-  it("no guard when leaving a non-agents section, even with dirty work", () => {
-    seedUnreviewedAgent();
-    useStore.setState({ section: "dashboard" }); // already away from the agent
-
-    useStore.getState().setSection("settings");
-
-    expect(useStore.getState().section).toBe("settings");
-    expect(useStore.getState().pendingSwitch).toBeNull();
   });
 
   it("selectTask navigates to tasks with the deep-link tab when clean", () => {
@@ -934,28 +872,16 @@ describe("section navigation", () => {
     expect(useStore.getState().taskInitialTab).toBeNull();
   });
 
-  it("selectTask is gated leaving agents; resolveSwitch(true) completes the deep link", () => {
+  it("selectTask switches even when leaving an agent with unreviewed work", () => {
     seedUnreviewedAgent();
-
     useStore.getState().selectTask("task-1", "review");
-
-    let s = useStore.getState();
-    expect(s.section).toBe("agents");
-    expect(s.selectedTaskId).toBeNull();
-    expect(s.pendingSwitch).toEqual({ kind: "task", taskId: "task-1", tab: "review" });
-
-    useStore.getState().resolveSwitch(true);
-
-    s = useStore.getState();
+    const s = useStore.getState();
     expect(s.section).toBe("tasks");
     expect(s.selectedTaskId).toBe("task-1");
-    expect(s.taskInitialTab).toBe("review");
-    expect(s.reviewedFrames["term-1"]).toBe(true);
   });
 
-  it("frame switches still guard (pendingSwitch kind frame) and honor agent-id review state", () => {
+  it("setActiveFrameGuarded switches the active frame", () => {
     seedUnreviewedAgent();
-    // Different tasks — the guarded case (same-task switches are exempt below).
     useStore.setState({
       frames: [
         makeFrame({ key: "f1", terminalId: "term-1", taskId: "task-1" }),
@@ -964,74 +890,7 @@ describe("section navigation", () => {
     });
 
     useStore.getState().setActiveFrameGuarded("f2");
-    expect(useStore.getState().pendingSwitch).toEqual({ kind: "frame", key: "f2" });
-    expect(useStore.getState().activeFrameKey).toBe("f1");
-
-    useStore.getState().resolveSwitch(true);
-    const s = useStore.getState();
-    expect(s.activeFrameKey).toBe("f2");
-    expect(s.reviewedFrames["term-1"]).toBe(true);
-  });
-
-  it("frame switches inside the same task are supervision, not a context switch — no guard", () => {
-    seedUnreviewedAgent();
-    useStore.setState({
-      frames: [
-        makeFrame({ key: "f1", terminalId: "term-1", taskId: "task-1" }),
-        makeFrame({ key: "f2", terminalId: "term-2", ptySessionId: "sess-2", taskId: "task-1" }),
-      ],
-    });
-
-    useStore.getState().setActiveFrameGuarded("f2");
-    const s = useStore.getState();
-    expect(s.pendingSwitch).toBeNull();
-    expect(s.activeFrameKey).toBe("f2");
-  });
-
-  it("two Uncategorized agents share the null partition cell — no guard between them", () => {
-    seedUnreviewedAgent();
-    useStore.setState({
-      frames: [
-        makeFrame({ key: "f1", terminalId: "term-1" }),
-        makeFrame({ key: "f2", terminalId: "term-2", ptySessionId: "sess-2" }),
-      ],
-    });
-
-    useStore.getState().setActiveFrameGuarded("f2");
-    expect(useStore.getState().pendingSwitch).toBeNull();
     expect(useStore.getState().activeFrameKey).toBe("f2");
-  });
-
-  it("a same-task switch is still guarded when the two agents contend on a file", () => {
-    seedUnreviewedAgent();
-    useStore.setState({
-      frames: [
-        makeFrame({ key: "f1", terminalId: "term-1", taskId: "task-1" }),
-        makeFrame({ key: "f2", terminalId: "term-2", ptySessionId: "sess-2", taskId: "task-1" }),
-      ],
-      // term-1 (seeded) has a.ts + b.ts dirty; term-2 also touched b.ts.
-      dirty: {
-        "term-1": { count: 2, paths: ["a.ts", "b.ts"] },
-        "term-2": { count: 1, paths: ["b.ts"] },
-      },
-    });
-
-    useStore.getState().setActiveFrameGuarded("f2");
-    expect(useStore.getState().pendingSwitch).toEqual({ kind: "frame", key: "f2" });
-    expect(useStore.getState().activeFrameKey).toBe("f1");
-  });
-
-  it("selectTask to the dirty agent's own task isn't guarded (it's the path to Review)", () => {
-    seedUnreviewedAgent();
-    useStore.setState({
-      frames: [makeFrame({ key: "f1", terminalId: "term-1", taskId: "task-1" })],
-    });
-
-    useStore.getState().selectTask("task-1", "review");
-    const s = useStore.getState();
-    expect(s.pendingSwitch).toBeNull();
-    expect(s.section).toBe("tasks");
-    expect(s.selectedTaskId).toBe("task-1");
   });
 });
 
@@ -1348,7 +1207,7 @@ describe("assignment delivery", () => {
   });
 });
 
-// ── durable review acks (the flagship safe-context-switch guard) ────────────
+// ── durable review acks (the merge gate's ack + review indicators) ──────────
 
 describe("durable review acks", () => {
   it("markReviewed sets the local ack AND persists it to the daemon", () => {
@@ -1380,16 +1239,7 @@ describe("durable review acks", () => {
     expect(markReviewedApi).toHaveBeenCalledWith("term-1");
   });
 
-  it("resolveSwitch(true) is a session-local skip — ack set locally, NOT persisted", () => {
-    seedUnreviewedAgent();
-    useStore.getState().setSection("dashboard"); // raises the guard
-    useStore.getState().resolveSwitch(true);
-    expect(useStore.getState().reviewedFrames["term-1"]).toBe(true);
-    // Proceeding is a skip, not a review — only Mark reviewed persists an ack.
-    expect(markReviewedApi).not.toHaveBeenCalled();
-  });
-
-  it("a new dirty path re-arms the guard: local ack dropped, daemon ack cleared", () => {
+  it("a new dirty path invalidates the ack: local ack dropped, daemon ack cleared", () => {
     useStore.setState({
       rustPtySessions: { "sess-1": makeMeta() },
       dirty: { "term-1": { count: 1, paths: ["a.ts"] } },
@@ -1401,7 +1251,7 @@ describe("durable review acks", () => {
     expect(useStore.getState().reviewedFrames["term-1"]).toBe(true);
     expect(clearReviewedApi).not.toHaveBeenCalled();
 
-    // …but a path outside the acknowledged set re-arms the guard.
+    // …but a path outside the acknowledged set invalidates the ack.
     useStore.getState().markDaemonFsDirty("sess-1", ["a.ts", "c.ts"]);
     expect(useStore.getState().reviewedFrames["term-1"]).toBeUndefined();
     expect(clearReviewedApi).toHaveBeenCalledWith("term-1");
@@ -1413,7 +1263,7 @@ describe("durable review acks", () => {
     expect(useStore.getState().reviewedFrames).toEqual({ local: true, a: true, b: true });
   });
 
-  it("hydrateReviewed won't disarm an agent that's dirty again (stale daemon ack)", () => {
+  it("hydrateReviewed won't re-ack an agent that's dirty again (stale daemon ack)", () => {
     useStore.setState({
       dirty: { a: { count: 1, paths: ["x.ts"] } },
       reviewedFrames: {},

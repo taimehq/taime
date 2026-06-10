@@ -25,8 +25,9 @@ delegation; its delegations form a **Team**. The **Task** groups the work,
 tracks lifecycle and review state, and shows rollups — it is the unit of safe
 context switching. **Workflows** are reusable graphs (branches, loops) that
 **Run** inside a workspace; **Schedules** fire agents on cron. The **Daemon**
-keeps all of it alive independently of the app, and nothing merges without
-**Review**.
+keeps all of it alive independently of the app. Every change stays fully
+attributed, and **Review** is an opt-in gate you can switch on before changes
+merge or reach a remote — by default agents work autonomously.
 
 ---
 
@@ -126,7 +127,7 @@ Four structural rules fall out of this:
 | **Run** | One execution of a Workflow inside a workspace: a `run_id`, per-node states, and the Agents the engine spawns for each node. The workspace-scoped counterpart of the Workflow definition. |
 | **Schedule** | A cron-triggered, unattended launch: cron expression + Profile + prompt (markdown with YAML front-matter in `~/.taime/schedules`). Fires in the daemon even when the app is closed. |
 | **Daemon** | The persistent runtime substrate that owns everything above: agent runtimes, attribution recording, the workflow engine, and schedule firing. It outlives the app — which is why agents survive app restarts and schedules fire unattended. **Upgrade caveat (explicit policy):** survival holds across same-version restarts/crashes only; a protocol-bumping app upgrade *replaces* the daemon and terminates its running agents (the strict-equality handshake + positional wire format make read-only adoption impossible). |
-| **Review** | The gate on agent output: per-file/hunk diffs attributed to an Agent ID, with Merge · Revert · Mark reviewed. Nothing merges without it. |
+| **Review** | An **opt-in** gate on agent output: per-file/hunk diffs attributed to an Agent ID, with Merge · Revert · Mark reviewed. Off by default — agents work autonomously; switch it on to vet changes before they merge or reach a remote. The always-on guarantee is **Attribution**, not Review. |
 
 ### Internal-only terms (never in user-facing docs/UI)
 

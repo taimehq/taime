@@ -69,9 +69,8 @@ export function useGlobalShortcuts() {
       }
 
       // --- Frame switching by number: Cmd+1..8 = Nth frame, Cmd+9 = last ---
-      // Routed through setActiveFrameGuarded so the dirty-state guard (and its
-      // pending-switch re-entrancy rule) always applies — this is the only way
-      // navigation surfaces change the active frame.
+      // Routed through setActiveFrameGuarded — the single store action every
+      // navigation surface uses to change the active frame.
       // Use e.code: Option/Shift remap the digit in e.key, so it's unreliable.
       //   Cmd+#         → select that window's tab and fullscreen it.
       //   Cmd+Option+#  → make that window active in place (stay in grid).

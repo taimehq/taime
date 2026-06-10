@@ -771,28 +771,31 @@ impl Manager {
                 let mode = a.get("mode").and_then(|v| v.as_str()).unwrap_or("merge");
                 let sel = a.get("selections").cloned().unwrap_or_else(|| serde_json::json!({}));
                 let digest = a.get("expected_digest").and_then(|v| v.as_str());
-                // The review gate, enforced where the merge happens — not by UI
-                // placement. A merge requires (1) a standing review ack for the
-                // agent (any new dirty path invalidates it; fails closed when
-                // persistence is off — no store means no acks, and unrecorded
-                // merges break the thesis) and (2) the digest of the reviewed
-                // hunked_diff, which apply_selection checks against the patch it
-                // assembles NOW — the content binding that refuses merging what
-                // nobody saw. A revert discards the agent's own work back to
-                // base — the safe direction — so it skips the ack, but ONLY
-                // toward "self": aimed anywhere else it is cross-tree
-                // destruction, not a revert. An empty selection map is refused
-                // outright — "everything, implicitly" is never a reviewed
-                // action (the review surfaces always send explicit selections).
+                // The merge gate, enforced where the merge happens — not by UI
+                // placement. Agents work autonomously and never auto-merge; this
+                // governs only the explicit, user-initiated merge of an agent's
+                // work into another tree. Such a merge requires (1) a standing
+                // review ack for the agent — the merge surface records it as part
+                // of merging, and any new dirty path invalidates it — and (2) the
+                // digest of the reviewed hunked_diff, which apply_selection checks
+                // against the patch it assembles NOW: the content binding that
+                // refuses merging what nobody saw. Together these are an integrity
+                // + staleness guard on the merge action, not a gate on autonomous
+                // work. A revert discards the agent's own work back to base — the
+                // safe direction — so it skips the ack, but ONLY toward "self":
+                // aimed anywhere else it is cross-tree destruction, not a revert.
+                // An empty selection map is refused outright — "everything,
+                // implicitly" is never an explicit selection (the review surfaces
+                // always send explicit selections).
                 let resolved = if sel.as_object().map(|o| o.is_empty()).unwrap_or(true) {
                     Err("nothing selected — fetch hunked_diff and select hunks".to_string())
                 } else if mode == "revert" && symbol != "self" {
                     Err(format!("revert only applies to the agent's own worktree, not '{symbol}'"))
                 } else if mode != "revert" && self.store.is_none() {
-                    Err("merge refused: daemon persistence is unavailable, so review acks cannot be recorded — nothing merges without Review".to_string())
+                    Err("merge refused: daemon persistence is unavailable, so the review ack that binds a merge can't be recorded".to_string())
                 } else if mode != "revert" && !self.has_review_ack(tk) {
                     Err(format!(
-                        "merge refused: no standing review ack for '{tk}' — nothing merges without Review"
+                        "merge refused: no standing review ack for '{tk}' — merge through the review surface (it records the ack) or mark it reviewed first"
                     ))
                 } else if mode != "revert" && digest.is_none() {
                     Err("merge refused: missing expected_digest (the hunked_diff fingerprint of the reviewed changes)".to_string())
@@ -829,7 +832,7 @@ impl Manager {
                 }
                 "true".to_string()
             }
-            // Durable review acks (the flagship safe-context-switch guard). The app
+            // Durable review acks (the safe-context-switch guard). The app
             // records an ack when the user proceeds past the guard / marks reviewed,
             // and hydrates `reviewed` on boot so the ack survives a restart.
             "mark_reviewed" => {
@@ -2352,8 +2355,9 @@ impl Manager {
     /// off the hot loop via spawn_blocking — this shells out to git). DELETION
     /// IS CONSERVATIVE: only checkouts with a clean tree AND a branch still at
     /// its provision base are removed (plus their `taime/…` branch). Anything
-    /// with uncommitted or committed work is the user's unreviewed output and
-    /// is kept — review-before-merge is the product. Shared-mode rows (the
+    /// with uncommitted or committed work is the user's output and is kept —
+    /// the attribution trail (and any opt-in review before merge) depends on
+    /// it. Shared-mode rows (the
     /// user's real project dir) and live agents are never touched. The
     /// `taime_worktrees` ROW always survives: it's the durable Agent-ID anchor
     /// for attribution history.

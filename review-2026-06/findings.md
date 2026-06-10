@@ -3,6 +3,8 @@
 83 findings from 9 review dimensions; every finding adversarially verified by independent agents
 (high-severity by two: a correctness-trace lens and a reproduction lens). 76 confirmed, 7 refuted.
 
+> **⚠ Model correction (2026-06-10).** "Nothing merges without Review" was never Taime's real model — it was an error in the docs/code this review tested against. Correct model: attribution/audit is always-on, autonomy is the default, and review before merge/push/PR is **OPT-IN**. The findings still stand as defects in *attribution* and in the *opt-in review surface when enabled* — mentally re-read any "mandatory Review" framing accordingly. See the banner in `review-2026-06/README.md` + `architecture-lexicon.md`.
+
 ## Post-hoc adjudications (read first)
 
 Two verdicts were overturned after a completeness-critic pass and direct code checks:
