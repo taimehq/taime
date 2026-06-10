@@ -276,6 +276,24 @@ fn gen_id() -> String {
     format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>())
 }
 
+/// Mint a 64-bit random hex id, re-rolling while `taken` reports a collision.
+/// The Agent ID is the durable identity pivot — worktrees, turns, fs events,
+/// edges, and the `refs/taime/archive/<id>` keep-around ref are all keyed by it,
+/// and a collision silently merges two agents' attribution (and now corrupts an
+/// archive ref). 64 random bits (vs the old 32) make a birthday collision
+/// astronomically unlikely even before the check; the mint-time guard closes it
+/// entirely. Bounded retry; falls back to a full 128-bit [`gen_id`] in the
+/// (unreachable) event every roll is taken rather than spinning or panicking.
+fn mint_unique_id(taken: impl Fn(&str) -> bool) -> String {
+    for _ in 0..64 {
+        let id = format!("{:016x}", rand::random::<u64>());
+        if !taken(&id) {
+            return id;
+        }
+    }
+    gen_id()
+}
+
 /// Whether a provider binary is resolvable (PATH + the known install locations
 /// the adapters check). Best-effort; uses the daemon's inherited env.
 fn binary_installed(binary: &str) -> bool {
@@ -466,6 +484,26 @@ impl Manager {
     /// Provision (or resolve) an isolated git worktree for a new agent (Phase 3).
     /// The daemon mints the Agent ID, runs `git worktree`, and persists the
     /// `taime_worktrees` row. Shells out to git — call from a blocking context.
+    /// Mint a fresh durable Agent ID, re-rolling on any collision with the
+    /// durable collision domain: an existing `taime_worktrees` row (rows are never
+    /// pruned — the "durable Agent-ID anchors" — so they are the true domain) OR an
+    /// existing `refs/taime/archive/<id>` in the target repo (a reclaimed agent's
+    /// work lives ONLY in that ref, so colliding onto it would corrupt attribution).
+    /// The archive-ref check is scoped to the resolved repo and only meaningful for
+    /// isolated agents in a git repo (shared mode has no archive ref).
+    fn mint_agent_id(&self, project_root: &str, isolate: bool) -> String {
+        let repo_root = if isolate { crate::worktree::repo_root_of(project_root) } else { None };
+        mint_unique_id(|id| {
+            let row_taken = self
+                .store
+                .as_ref()
+                .and_then(|s| s.worktree_row(id).ok().flatten())
+                .is_some();
+            row_taken
+                || repo_root.as_deref().is_some_and(|repo| crate::worktree::archive_ref_exists(repo, id))
+        })
+    }
+
     pub fn provision_worktree(
         &self,
         project_root: String,
@@ -473,7 +511,7 @@ impl Manager {
         isolate: bool,
         task_id: Option<String>,
     ) -> WorktreeInfo {
-        let agent_id = format!("{:08x}", rand::random::<u32>());
+        let agent_id = self.mint_agent_id(&project_root, isolate);
         let info = crate::worktree::provision(&project_root, &provider, isolate, &agent_id);
         if let Some(store) = &self.store {
             if let Err(e) = store.upsert_worktree(&info, &provider, now_unix()) {
@@ -2967,6 +3005,63 @@ mod tests {
         assert_eq!(store.worktrees_in_workspace("/ws").unwrap().len(), 0);
         assert!(store.worktree_row("c").unwrap().is_some(), "/other agent survives");
         assert_eq!(store.list_tasks("/other", true).unwrap().len(), 1, "/other tasks survive");
+    }
+
+    #[test]
+    fn mint_unique_id_is_64_bit_and_rerolls_on_collision() {
+        // 64-bit width: 16 lowercase hex chars that parse back as a u64 (vs the
+        // old 32-bit / 8-char Agent ID whose birthday collisions merged agents).
+        let id = mint_unique_id(|_| false);
+        assert_eq!(id.len(), 16, "64-bit id is 16 hex chars");
+        assert!(u64::from_str_radix(&id, 16).is_ok(), "id is hex: {id}");
+
+        // Re-rolls past every reported collision: reject the first 3 rolls, accept
+        // the 4th — the mint must consult `taken` exactly 4 times and return then.
+        let calls = std::cell::Cell::new(0u32);
+        let id = mint_unique_id(|_| {
+            let n = calls.get();
+            calls.set(n + 1);
+            n < 3
+        });
+        assert_eq!(calls.get(), 4, "rejected 3 rolls, accepted the 4th");
+        assert_eq!(id.len(), 16);
+
+        // Exhaustion fallback: if every roll is taken, widen to a 128-bit id rather
+        // than spin forever or panic.
+        let id = mint_unique_id(|_| true);
+        assert_eq!(id.len(), 32, "fell back to 128-bit gen_id()");
+    }
+
+    #[test]
+    fn mint_agent_id_never_reuses_a_live_worktree_row() {
+        let mgr = mem_manager();
+        let store = mgr.store().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        // A non-git project root → the archive-ref check is skipped and the durable
+        // worktree-row check is the active guard. Every mint must dodge every row
+        // we persist, so ids stay distinct (the old code minted blind).
+        for _ in 0..200 {
+            let id = mgr.mint_agent_id("/no/such/repo", false);
+            assert_eq!(id.len(), 16, "64-bit agent id");
+            assert!(store.worktree_row(&id).unwrap().is_none(), "mint never lands on a live row");
+            assert!(seen.insert(id.clone()), "ids distinct across mints: {id}");
+            store
+                .upsert_worktree(
+                    &WorktreeInfo {
+                        agent_id: id.clone(),
+                        project_root: "/no/such/repo".into(),
+                        repo_root: None,
+                        worktree_path: "/no/such/repo".into(),
+                        branch: None,
+                        base_sha: None,
+                        mode: "shared".into(),
+                        error: None,
+                    },
+                    "claude_code",
+                    1,
+                )
+                .unwrap();
+        }
     }
 
     #[test]

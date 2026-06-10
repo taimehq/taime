@@ -273,6 +273,27 @@ pub fn drop_archive_ref(repo_root: &str, archive_ref: &str) {
     }
 }
 
+/// Resolve the git repository root containing `project_root` (the same
+/// `--show-toplevel` probe [`provision`] does), or `None` for a non-git dir.
+/// Used at Agent-ID mint time to scope the archive-ref collision check.
+pub fn repo_root_of(project_root: &str) -> Option<String> {
+    git_stdout(Path::new(project_root), &["rev-parse", "--show-toplevel"])
+}
+
+/// Whether `refs/taime/archive/<agent_id>` already exists in `repo_root` — i.e.
+/// another agent has already claimed this id's durable archive. Treated as "id
+/// taken" at mint time so a fresh agent can never collide onto another's archived
+/// snapshot. Best-effort: a git failure reads as "not taken" (the store-row check
+/// remains the primary guard).
+pub fn archive_ref_exists(repo_root: &str, agent_id: &str) -> bool {
+    let repo = Path::new(repo_root);
+    if !repo.is_dir() {
+        return false;
+    }
+    let archive_ref = format!("refs/taime/archive/{agent_id}");
+    ok(run_git(repo, &["rev-parse", "--verify", "--quiet", &archive_ref]))
+}
+
 /// Force-remove a provisioned ISOLATED worktree checkout + its branch, for the
 /// "delete workspace" teardown (and the reclaim path via [`reclaim_checkout`]).
 /// Best-effort: never errors. NEVER pass a shared-mode `worktree_path` (that's
@@ -472,6 +493,43 @@ mod tests {
 
         // Cleanup (reclaim unlocks the live lock, then removes).
         reclaim_checkout(&info.worktree_path, repo.to_str().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(Path::new(&info.worktree_path).parent().unwrap());
+    }
+
+    #[test]
+    fn archive_ref_exists_detects_a_claimed_archive() {
+        let repo = temp_repo();
+        let root = repo.to_str().unwrap();
+        // repo_root_of resolves the toplevel; a non-git dir resolves to None.
+        // (git canonicalizes the path — /var → /private/var on macOS — so compare
+        // canonicalized rather than the raw temp path.)
+        let resolved = repo_root_of(root).expect("git dir resolves to a toplevel");
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(root).unwrap(),
+        );
+        assert_eq!(repo_root_of("/no/such/dir"), None);
+
+        // No archive ref yet → free to mint onto this id.
+        assert!(!archive_ref_exists(root, "deadbeefcafef00d"));
+
+        // Archive an agent's worktree, creating refs/taime/archive/<id>.
+        let info = provision(root, "claude_code", true, "deadbeefcafef00d");
+        std::fs::write(Path::new(&info.worktree_path).join("new.txt"), "work").unwrap();
+        let outcome = archive_agent(
+            &info.agent_id,
+            &info.worktree_path,
+            root,
+            info.base_sha.as_deref().unwrap(),
+        );
+        assert!(matches!(outcome, ArchiveOutcome::Archived(_)), "outcome: {outcome:?}");
+
+        // The id is now taken — a fresh mint must re-roll past it.
+        assert!(archive_ref_exists(root, "deadbeefcafef00d"));
+        assert!(!archive_ref_exists(root, "0000000000000000"), "a different id is still free");
+
+        reclaim_checkout(&info.worktree_path, root, None);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(Path::new(&info.worktree_path).parent().unwrap());
     }
