@@ -157,6 +157,26 @@ pub async fn daemon_restart(daemon: State<'_, DaemonClient>) -> Result<(), Strin
     daemon.force_restart().await
 }
 
+/// Durable-store health from the last daemon handshake, flattened to the
+/// frontend's shape: `status` ∈ ok | recovered | unavailable, `detail` = the
+/// moved-aside filename (recovered) or the open error (unavailable). `null`
+/// until the first handshake — the UI gates on `connected` anyway.
+#[tauri::command]
+pub async fn daemon_store_health(
+    daemon: State<'_, DaemonClient>,
+) -> Result<Option<serde_json::Value>, String> {
+    use taime_protocol::StoreHealth;
+    Ok(daemon.last_store_health().map(|h| match h {
+        StoreHealth::Ok => serde_json::json!({ "status": "ok", "detail": null }),
+        StoreHealth::Recovered { moved_to } => {
+            serde_json::json!({ "status": "recovered", "detail": moved_to })
+        }
+        StoreHealth::Unavailable { error } => {
+            serde_json::json!({ "status": "unavailable", "detail": error })
+        }
+    }))
+}
+
 /// Provision (or resolve) an isolated git worktree for a daemon agent (Phase 3) —
 /// the daemon-owned replacement for CAO's `/worktrees/provision`. Returns the
 /// worktree info (snake_case fields, incl. `agent_id` = the Agent ID).

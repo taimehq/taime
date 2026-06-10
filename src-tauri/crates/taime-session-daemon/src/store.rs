@@ -14,17 +14,30 @@
 //!
 //! Persistence is **best-effort**: if the DB can't open, the daemon still runs
 //! (every call goes through `Manager`'s `Option<Store>`); a launch never fails
-//! because of the store.
+//! because of the store. But best-effort is no longer SILENT: a corrupt DB is
+//! moved aside and recreated (`open_or_recover`), and the outcome travels to
+//! the app as `StoreHealth` in the `HelloOk` handshake.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension};
-use taime_protocol::WorktreeInfo;
+use taime_protocol::{StoreHealth, WorktreeInfo};
 
 /// Current schema level, stamped into `PRAGMA user_version` after migrate (review
 /// L13). Bump when the schema changes so a future gating migration can branch.
 const SCHEMA_VERSION: i64 = 11;
+
+/// Whether an open-path error is corruption of the database FILE — the class
+/// where moving the file aside and starting fresh is the right recovery.
+/// Everything else (disk full, permissions, locks) must be left in place.
+fn is_corruption(e: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode;
+    matches!(
+        e.sqlite_error_code(),
+        Some(ErrorCode::DatabaseCorrupt) | Some(ErrorCode::NotADatabase)
+    )
+}
 
 /// Run an additive `ALTER TABLE … ADD COLUMN`, ignoring ONLY the "duplicate
 /// column" error (the column already exists — idempotent re-run) and PROPAGATING
@@ -172,12 +185,18 @@ pub struct NodeState {
 }
 
 impl Store {
-    /// Open (creating the dir + file) and run the schema migration.
+    /// Open (creating the dir + file) and run the schema migration. One attempt,
+    /// no recovery — `--import-cao` uses this directly because an import must
+    /// hard-fail on a bad store, never quietly recreate it.
     pub fn open() -> rusqlite::Result<Store> {
         let dir = data_dir().ok_or_else(|| {
             rusqlite::Error::InvalidParameterName("no data dir".into())
         })?;
-        std::fs::create_dir_all(&dir).map_err(|e| {
+        Self::open_in(&dir)
+    }
+
+    fn open_in(dir: &std::path::Path) -> rusqlite::Result<Store> {
+        std::fs::create_dir_all(dir).map_err(|e| {
             rusqlite::Error::InvalidParameterName(format!("create data dir: {e}"))
         })?;
         let conn = Connection::open(dir.join("taime.sqlite"))?;
@@ -185,6 +204,55 @@ impl Store {
         let store = Store { conn: Mutex::new(conn) };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// The daemon's open path: recover from a corrupt DB instead of degrading to
+    /// permanent, silent persistence-off (the corrupt-store review finding — a
+    /// once-corrupted file failed identically on every future boot).
+    ///
+    /// On a corruption-class failure the bad `taime.sqlite` (and its `-wal`/
+    /// `-shm` — a fresh DB next to the OLD wal would try to replay it) is
+    /// renamed aside to `taime.sqlite.corrupt-<unix-secs>*` and the open is
+    /// retried once on a clean slate. Non-corruption failures (disk full,
+    /// permissions, a transient lock) do NOT move the file aside: recovery
+    /// must never destroy a healthy DB that merely failed to open.
+    pub fn open_or_recover() -> (Option<Store>, StoreHealth) {
+        let Some(dir) = data_dir() else {
+            return (None, StoreHealth::Unavailable { error: "no data dir".into() });
+        };
+        Self::open_or_recover_in(&dir)
+    }
+
+    fn open_or_recover_in(dir: &std::path::Path) -> (Option<Store>, StoreHealth) {
+        let first_err = match Self::open_in(dir) {
+            Ok(s) => return (Some(s), StoreHealth::Ok),
+            Err(e) => e,
+        };
+        if !is_corruption(&first_err) {
+            return (None, StoreHealth::Unavailable { error: first_err.to_string() });
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let moved_to = format!("taime.sqlite.corrupt-{ts}");
+        if let Err(e) = std::fs::rename(dir.join("taime.sqlite"), dir.join(&moved_to)) {
+            return (None, StoreHealth::Unavailable {
+                error: format!("{first_err}; move-aside failed: {e}"),
+            });
+        }
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::rename(
+                dir.join(format!("taime.sqlite{suffix}")),
+                dir.join(format!("{moved_to}{suffix}")),
+            );
+        }
+        match Self::open_in(dir) {
+            Ok(s) => (Some(s), StoreHealth::Recovered { moved_to }),
+            Err(e) => (None, StoreHealth::Unavailable {
+                error: format!("recreate after move-aside failed: {e}"),
+            }),
+        }
     }
 
     /// Connection PRAGMAs shared by every open path. WAL gives concurrent readers
@@ -2151,5 +2219,47 @@ mod tests {
         r.status = "exited".into();
         store.record_session(&r).unwrap();
         assert_eq!(store.list_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_or_recover_moves_corrupt_db_aside() {
+        let dir = std::env::temp_dir().join(format!("taime-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Not a SQLite file at all → SQLITE_NOTADB on open/migrate.
+        std::fs::write(dir.join("taime.sqlite"), b"definitely not a sqlite database").unwrap();
+
+        let (store, health) = Store::open_or_recover_in(&dir);
+        let store = store.expect("fresh store after move-aside");
+        let StoreHealth::Recovered { moved_to } = health else {
+            panic!("expected Recovered, got {health:?}");
+        };
+        // The bad file is preserved (forensics/manual salvage), byte-for-byte.
+        assert_eq!(
+            std::fs::read(dir.join(&moved_to)).unwrap(),
+            b"definitely not a sqlite database"
+        );
+        // The fresh store actually works.
+        store.record_session(&row("pty-0")).unwrap();
+        assert_eq!(store.list_sessions().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_or_recover_healthy_db_is_ok_and_untouched() {
+        let dir = std::env::temp_dir().join(format!("taime-recover-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let (store, health) = Store::open_or_recover_in(&dir);
+            assert_eq!(health, StoreHealth::Ok);
+            store.unwrap().record_session(&row("pty-0")).unwrap();
+        }
+        // Re-open: still Ok, and the existing rows survive (no spurious recreate).
+        let (store, health) = Store::open_or_recover_in(&dir);
+        assert_eq!(health, StoreHealth::Ok);
+        assert_eq!(store.unwrap().list_sessions().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

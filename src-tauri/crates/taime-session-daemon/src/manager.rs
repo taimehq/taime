@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use taime_protocol::{
-    AgentProfile, AgentSpawnSpec, McpServerConfig, SessionSummary, SpawnSpec, WorktreeInfo,
+    AgentProfile, AgentSpawnSpec, McpServerConfig, SessionSummary, SpawnSpec, StoreHealth,
+    WorktreeInfo,
 };
 
 use crate::providers::Registry;
@@ -31,6 +32,10 @@ pub struct Manager {
     /// persistence is best-effort and never blocks spawning. `Arc` so each session
     /// can hold a handle for its fs-watch attribution writes.
     store: Option<Arc<Store>>,
+    /// How the store open went (Ok / recovered-from-corruption / unavailable),
+    /// reported in every `HelloOk` so degraded persistence is visible in the UI
+    /// instead of silently dropping the attribution substrate.
+    store_health: StoreHealth,
     /// Per-agent MCP token → attribution key (Phase 5 transport). Issued at spawn
     /// for orchestration-enabled agents and injected into their MCP shim's env;
     /// the daemon resolves the authenticated caller from it. Cleaned on exit.
@@ -266,13 +271,18 @@ impl Default for Manager {
 
 impl Manager {
     pub fn new() -> Self {
-        let store = match Store::open() {
-            Ok(s) => Some(Arc::new(s)),
-            Err(e) => {
-                eprintln!("[taime-daemon] persistence disabled (store open failed): {e}");
-                None
-            }
-        };
+        let (store, store_health) = Store::open_or_recover();
+        match &store_health {
+            StoreHealth::Ok => {}
+            StoreHealth::Recovered { moved_to } => eprintln!(
+                "[taime-daemon] store recovered: corrupt taime.sqlite moved aside to \
+                 {moved_to}; starting on a fresh DB (prior history is in the moved file)"
+            ),
+            StoreHealth::Unavailable { error } => eprintln!(
+                "[taime-daemon] persistence disabled (store open failed): {error}"
+            ),
+        }
+        let store = store.map(Arc::new);
         Manager {
             sessions: Mutex::new(HashMap::new()),
             session_counter: AtomicU64::new(0),
@@ -281,6 +291,7 @@ impl Manager {
             last_activity: Mutex::new(Instant::now()),
             registry: Registry::load(),
             store,
+            store_health,
             tokens: Mutex::new(HashMap::new()),
             roles: Mutex::new(HashMap::new()),
             assignments: Mutex::new(HashMap::new()),
@@ -294,6 +305,12 @@ impl Manager {
 
     pub fn next_conn_id(&self) -> u64 {
         self.conn_counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Store health for the `HelloOk` handshake (set once at boot — the store is
+    /// opened exactly once per daemon run).
+    pub fn store_health(&self) -> StoreHealth {
+        self.store_health.clone()
     }
 
     pub fn conn_opened(&self) {
@@ -2404,6 +2421,7 @@ impl Manager {
             last_activity: Mutex::new(Instant::now()),
             registry: Registry::load(),
             store: store.map(Arc::new),
+            store_health: StoreHealth::Ok,
             tokens: Mutex::new(HashMap::new()),
             roles: Mutex::new(HashMap::new()),
             assignments: Mutex::new(HashMap::new()),

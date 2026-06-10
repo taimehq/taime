@@ -213,6 +213,26 @@ export async function daemonRestart(): Promise<void> {
   await invoke("daemon_restart");
 }
 
+/** Durable-store health from the last daemon handshake.
+ *  - `recovered`: a corrupt taime.sqlite was moved aside (detail = the
+ *    moved-aside filename) and the daemon started on a fresh DB.
+ *  - `unavailable`: the store couldn't open at all (detail = the error) —
+ *    agents run, but NOTHING durable (turns, fs events, reviews) is recorded.
+ *  `null` ⇒ no handshake yet; the UI gates on `connected` anyway. */
+export type StoreHealth = {
+  status: "ok" | "recovered" | "unavailable";
+  detail: string | null;
+};
+
+export async function daemonStoreHealth(): Promise<StoreHealth | null> {
+  if (!inTauri()) return null;
+  try {
+    return await invoke<StoreHealth | null>("daemon_store_health");
+  } catch {
+    return null;
+  }
+}
+
 export async function daemonWrite(sessionId: string, data: string): Promise<void> {
   if (!inTauri()) return;
   try {

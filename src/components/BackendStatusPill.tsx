@@ -22,6 +22,7 @@ const LABEL: Record<BackendState["status"], string> = {
 export function BackendStatusPill({ state }: { state: BackendState }) {
   const connected = useStore((s) => s.connected);
   const daemonIncompatible = useStore((s) => s.daemonIncompatible);
+  const storeHealth = useStore((s) => s.storeHealth);
   const restartDaemon = useStore((s) => s.restartDaemon);
 
   // Review M2: a poll found an incompatible/unresponsive daemon and DID NOT
@@ -46,6 +47,34 @@ export function BackendStatusPill({ state }: { state: BackendState }) {
         <span className="h-2 w-2 shrink-0 rounded-full bg-red-500" />
         <span className="min-w-0 truncate whitespace-nowrap">Backend incompatible — Restart</span>
       </button>
+    );
+  }
+
+  // Degraded persistence (the corrupt-store finding): the daemon is up, but the
+  // durable store is gone or was recreated after corruption — attribution is
+  // not being recorded the way the user thinks. The daemon can't fix this
+  // mid-run (the store opens once at boot), so this is honest signage, not an
+  // action button.
+  if (inTauri() && connected && storeHealth && storeHealth.status !== "ok") {
+    const off = storeHealth.status === "unavailable";
+    return (
+      <div
+        title={
+          off
+            ? `Persistence is OFF for this backend run — agents work, but no turns, file events, or reviews are being recorded. Store error: ${storeHealth.detail ?? "unknown"}`
+            : `The attribution database was corrupt and has been moved aside to ${storeHealth.detail ?? "a .corrupt file"} in the app data dir. Recording continues on a fresh database; prior history lives in the moved-aside file.`
+        }
+        className={`no-drag flex h-[26px] min-w-0 items-center gap-2 rounded-full border px-2.5 text-[11px] ${
+          off
+            ? "border-red-500/60 bg-red-950/40 text-red-200"
+            : "border-amber/60 bg-ink-700 text-zinc-200"
+        }`}
+      >
+        <span className={`h-2 w-2 shrink-0 rounded-full ${off ? "bg-red-500" : "bg-amber"}`} />
+        <span className="min-w-0 truncate whitespace-nowrap">
+          {off ? "Attribution not recording" : "Store recovered — history archived"}
+        </span>
+      </div>
     );
   }
 

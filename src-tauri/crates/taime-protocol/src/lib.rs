@@ -60,9 +60,12 @@ pub const MAGIC: u32 = 0x7461_696d;
 ///     are wire-neutral; the bump covers the query-surface renames: `sessions`
 ///     → `agents`, `session_detail` deleted, worktree mode `worktree` →
 ///     `isolated`, JSON keys `terminal_id`/`agent_key` → `agent_id`).
+/// v11: `HelloOk` gained `store_health` (corrupt-store recovery: the daemon
+///     reports whether the durable store is healthy / recovered-by-move-aside /
+///     unavailable, so silent persistence-off is finally visible in the UI).
 /// Postcard is positional, so these are wire-layout changes — a stale older
 /// daemon is rejected at handshake and the app falls back rather than misparsing.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// Feature flags negotiated in the handshake (`capabilities` bitset). Reserving
 /// the bits now keeps app-update-while-old-daemon-running safe.
@@ -310,6 +313,24 @@ pub enum FdKind {
     PtyMaster,
 }
 
+/// Health of the daemon's durable store (SQLite), carried in `HelloOk` so the
+/// app learns about degraded persistence on every handshake — the pre-v11
+/// failure mode was a corrupt DB silently disabling ALL attribution recording
+/// while everything appeared to work (the corrupt-store review finding).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StoreHealth {
+    /// The store opened normally.
+    Ok,
+    /// The store failed to open with a corruption-class error; the bad
+    /// `taime.sqlite` was renamed aside to `moved_to` (same directory) and a
+    /// fresh store was created. History up to the corruption is in the
+    /// moved-aside file, not the live DB.
+    Recovered { moved_to: String },
+    /// The store could not be opened at all — persistence is off for this
+    /// daemon run (agents work, but nothing durable is recorded).
+    Unavailable { error: String },
+}
+
 /// Daemon → app.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMsg {
@@ -318,6 +339,9 @@ pub enum ServerMsg {
         protocol_version: u16,
         capabilities: u32,
         daemon_version: String,
+        /// Durable-store health (v11): surfaced at handshake so degraded
+        /// persistence is loud instead of silent.
+        store_health: StoreHealth,
     },
     /// `Hello` rejected (version/capability/token mismatch). The app may still
     /// fall back to the backward-compatible subset (List + Kill) on a legacy

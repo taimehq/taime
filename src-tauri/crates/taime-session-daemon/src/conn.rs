@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use taime_protocol::{
     cap, decode_client, encode_server, parse_frame, versions_compatible, ClientMsg, Frame,
-    ServerMsg, MAGIC, MAX_FRAME_LEN, PROTOCOL_VERSION,
+    ServerMsg, StoreHealth, MAGIC, MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -101,7 +101,9 @@ pub async fn handle(stream: UnixStream, manager: Arc<Manager>, token: String) {
     // succeeds, so a silent/squatting same-user peer can neither hang here nor
     // pin the daemon awake.
     let hello_ok = match tokio::time::timeout(HELLO_DEADLINE, reader.next()).await {
-        Ok(Some(Ok(payload))) => handle_hello(payload, &token, &out_tx).await,
+        Ok(Some(Ok(payload))) => {
+            handle_hello(payload, &token, manager.store_health(), &out_tx).await
+        }
         _ => false, // timed out / closed / codec error — drop, never counted
     };
     if !hello_ok {
@@ -289,6 +291,7 @@ async fn send(out_tx: &Responder, msg: &ServerMsg) {
 async fn handle_hello(
     payload: BytesMut,
     token: &str,
+    store_health: StoreHealth,
     out_tx: &Responder,
 ) -> bool {
     let body = match parse_frame(payload) {
@@ -312,6 +315,7 @@ async fn handle_hello(
                         protocol_version: PROTOCOL_VERSION,
                         capabilities: cap::CURRENT,
                         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                        store_health,
                     },
                 )
                 .await;

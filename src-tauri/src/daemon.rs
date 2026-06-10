@@ -20,7 +20,7 @@ use futures::{SinkExt, StreamExt};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use taime_protocol::{
     cap, decode_server, encode_client, parse_frame, paths, AgentSpawnSpec, ClientMsg, Frame,
-    ServerMsg, WorktreeInfo, MAGIC, MAX_FRAME_LEN, PROTOCOL_VERSION,
+    ServerMsg, StoreHealth, WorktreeInfo, MAGIC, MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Mutex};
@@ -78,6 +78,11 @@ pub struct DaemonClient {
     /// M2). The poll no longer auto-restarts (that would kill live agents), so the
     /// UI reads this to offer an explicit, consent-gated "restart backend" action.
     incompatible: AtomicBool,
+    /// Durable-store health from the most recent `HelloOk` (v11). Every handshake
+    /// — including the connect-only ping the UI polls — refreshes it, so the
+    /// frontend can show degraded persistence instead of silently losing the
+    /// attribution substrate. `None` until the first successful handshake.
+    store_health: std::sync::Mutex<Option<StoreHealth>>,
 }
 
 impl DaemonClient {
@@ -90,7 +95,14 @@ impl DaemonClient {
             attaches: Mutex::new(HashMap::new()),
             restart_lock: Mutex::new(()),
             incompatible: AtomicBool::new(false),
+            store_health: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Durable-store health from the last successful handshake (`None` = no
+    /// daemon contact yet). The UI pairs this with its live `daemon_ping` result.
+    pub fn last_store_health(&self) -> Option<StoreHealth> {
+        self.store_health.lock().unwrap().clone()
     }
 
     /// Whether a poll has seen an incompatible/unresponsive daemon since the last
@@ -152,7 +164,10 @@ impl DaemonClient {
         };
         send(&mut conn, &hello).await?;
         match read_server_within(&mut conn, HANDSHAKE_TIMEOUT).await? {
-            ServerMsg::HelloOk { .. } => Ok(conn),
+            ServerMsg::HelloOk { store_health, .. } => {
+                *self.store_health.lock().unwrap() = Some(store_health);
+                Ok(conn)
+            }
             ServerMsg::HelloRejected { reason } => Err(format!("handshake rejected: {reason}")),
             other => Err(format!("unexpected handshake reply: {other:?}")),
         }
