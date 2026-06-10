@@ -44,6 +44,26 @@ use crate::{emulator, repaint};
 /// badge's old truncation).
 const FS_DIRTY_CAP: usize = 50;
 
+/// SHARED-mode only (review items 4/11): a shared agent's watcher is rooted at the
+/// user's real working tree, so a change is only honestly the agent's while it is
+/// actively producing output. We attribute a change if the agent produced output
+/// within this window of it (covers the agent's own file-write/flush + debounce
+/// lag after a turn's visible work); edits while the agent is genuinely idle — the
+/// user's or another agent's — fall outside it and are dropped, never recorded
+/// under the agent's key. Short on purpose: misattributing the user's edits is the
+/// worse error, and real user-idle edits come minutes later, not seconds.
+const SHARED_ATTRIBUTION_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a SHARED agent should attribute a change observed now: only while it is
+/// mid-turn, or within [`SHARED_ATTRIBUTION_GRACE`] of its last output (covers its
+/// own write/flush + debounce lag after a turn). Idle longer than that ⇒ the
+/// change is the user's (or another agent's) and is dropped. Pure so the window is
+/// unit-testable without spawning a PTY. Isolated agents bypass this entirely —
+/// they own their worktree, so every change there is theirs.
+fn shared_records_now(turn_open: bool, since_last_output: std::time::Duration) -> bool {
+    turn_open || since_last_output < SHARED_ATTRIBUTION_GRACE
+}
+
 /// Backpressure watermarks (bytes in flight = sent − acked). Generous for the
 /// daemon's two-hop path (socket + Tauri channel + xterm); 64 KiB would stall a
 /// bursty TUI. Tunable.
@@ -99,6 +119,13 @@ struct SessionInner {
     id: String,
     program: String,
     cwd: String,
+    /// Whether this agent runs in a SHARED worktree (the user's real tree) rather
+    /// than its own isolated checkout. Shared mode gates fs-event attribution on
+    /// the agent being mid-turn + de-dups across co-watchers (review items 4/11):
+    /// the watcher's cwd is shared with the user and other agents, so a change is
+    /// only honestly the agent's while it's actively working. Isolated agents own
+    /// their whole worktree — every change there is unambiguously theirs.
+    shared: bool,
     attribution_key: Option<String>,
     /// Provider id (`claude_code`/`codex`/…) when spawned via the registry.
     /// `None` for low-level spawns.
@@ -146,6 +173,7 @@ impl Session {
         id: String,
         spec: &SpawnSpec,
         store: Option<Arc<Store>>,
+        shared: bool,
     ) -> Result<Session, String> {
         let dspec = DaemonSessionSpec {
             prog: spec.prog.clone(),
@@ -158,7 +186,7 @@ impl Session {
             attribution_key: spec.agent_id.clone(),
             paste_enter_count: 1,
         };
-        Self::spawn_inner(id, &dspec, Cleanup::default(), None, store)
+        Self::spawn_inner(id, &dspec, Cleanup::default(), None, store, shared)
     }
 
     /// Spawn a registry-`Prepared` agent: the daemon-built command + MCP injection
@@ -169,8 +197,9 @@ impl Session {
         prepared: Prepared,
         adapter: Option<Box<dyn Provider>>,
         store: Option<Arc<Store>>,
+        shared: bool,
     ) -> Result<Session, String> {
-        Self::spawn_inner(id, &prepared.spec, prepared.cleanup, adapter, store)
+        Self::spawn_inner(id, &prepared.spec, prepared.cleanup, adapter, store, shared)
     }
 
     /// Shared PTY setup for both spawn paths.
@@ -180,6 +209,7 @@ impl Session {
         cleanup: Cleanup,
         adapter: Option<Box<dyn Provider>>,
         store: Option<Arc<Store>>,
+        shared: bool,
     ) -> Result<Session, String> {
         let provider = adapter.as_ref().map(|a| a.id().to_string());
         let pty_system = native_pty_system();
@@ -248,6 +278,7 @@ impl Session {
             id: id.clone(),
             program: spec.prog.clone(),
             cwd: spec.cwd.clone().unwrap_or_default(),
+            shared,
             attribution_key: spec.attribution_key.clone(),
             provider,
             adapter,
@@ -551,6 +582,43 @@ impl Session {
         if changes.is_empty() {
             return;
         }
+        // SHARED-mode authorship gating (review items 4/11). An isolated agent owns
+        // its whole worktree, so every change there is unambiguously its work and
+        // is recorded as-is. A SHARED agent's watcher is rooted at the user's real
+        // tree, shared with the user and any co-watching agents — so we must not
+        // blindly stamp every change with this agent's key:
+        //  (a) Mid-turn gate: only attribute while the agent was recently producing
+        //      output. Outside that window the change is the user's (or another
+        //      agent's); we DROP it entirely rather than misattribute (the worse
+        //      error). This also silences an idle co-watcher recording the active
+        //      agent's edits. (Edits an isolated agent makes OUTSIDE its worktree
+        //      are never seen here — the watcher is rooted at the worktree — and we
+        //      drop them by omission rather than guess; see `start_fs_watch`.)
+        //  (b) Co-watcher de-dup: among simultaneously-active shared agents in one
+        //      root, only the first to observe a path records it, so a shared edit
+        //      is attributed once, never double-counted as phantom contention.
+        let changes = if self.inner.shared {
+            let recently_active = {
+                let st = lock_state(&self.inner);
+                shared_records_now(st.turn_started_unix.is_some(), st.last_output.elapsed())
+            };
+            if !recently_active {
+                return;
+            }
+            let now = Instant::now();
+            let kept: Vec<crate::fswatch::FsChange> = changes
+                .into_iter()
+                .filter(|c| {
+                    crate::fswatch::claim_shared_change(&self.inner.cwd, &c.path, &self.inner.id, now)
+                })
+                .collect();
+            if kept.is_empty() {
+                return;
+            }
+            kept
+        } else {
+            changes
+        };
         let (grew, snapshot, out) = {
             let mut st = lock_state(&self.inner);
             let mut grew = false;
@@ -694,6 +762,16 @@ fn drain_turn_paths(st: &mut SessionState, turn: &mut TurnInfo) {
 /// non-dir cwd or watcher-init failure just means no fs attribution). The
 /// callback holds a `Weak` to avoid a ref-cycle that would keep the session — and
 /// thus the OS watch — alive forever; on session drop the watcher drops with it.
+///
+/// Scope decision (review item 11 — out-of-worktree edits): the watch is rooted at
+/// the agent's cwd (its worktree). An isolated agent that writes OUTSIDE its
+/// worktree via an absolute path produces no event here, so such edits are NOT
+/// attributed to it. This is deliberate: the worktree boundary is what *proves*
+/// authorship, and the watcher has no way to know an out-of-worktree write was
+/// this agent's rather than the user's — so we DROP it (invisible) rather than
+/// guess and silently misattribute. Surfacing escaped writes as "changes outside
+/// any worktree" (a project-root escape watcher flagged while an agent is
+/// PROCESSING) is a separate Review feature, intentionally not built here.
 fn start_fs_watch(inner: &Arc<SessionInner>) {
     if inner.cwd.is_empty() {
         return;
@@ -903,7 +981,9 @@ mod tests {
             cols: 80,
             agent_id: Some("term-fsw".into()),
         };
-        let session = Session::spawn("pty-fsw".into(), &spec, Some(store.clone())).unwrap();
+        // isolated (shared=false): the worktree boundary proves authorship, so the
+        // watcher records unconditionally — no mid-turn gate.
+        let session = Session::spawn("pty-fsw".into(), &spec, Some(store.clone()), false).unwrap();
 
         // Create a source file; the debounced watcher should pick it up.
         std::fs::write(dir.join("hello.txt"), "hi").unwrap();
@@ -927,6 +1007,60 @@ mod tests {
 
         assert!(recorded, "watcher should record the new file to the store");
         assert!(dirty.iter().any(|p| p == "hello.txt"), "dirty set: {dirty:?}");
+    }
+
+    #[test]
+    fn shared_attribution_gate_records_only_while_recently_active() {
+        // Mid-turn → always attribute, regardless of the output clock.
+        assert!(shared_records_now(true, Duration::from_secs(3600)));
+        // Idle but within the grace window (own write/flush lag) → attribute.
+        assert!(shared_records_now(false, SHARED_ATTRIBUTION_GRACE / 2));
+        // Idle past the grace window → the change is the user's (or another
+        // agent's); drop it rather than misattribute.
+        assert!(!shared_records_now(false, SHARED_ATTRIBUTION_GRACE + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn shared_session_records_its_edit_while_active() {
+        // A SHARED agent (cwd = the user's real tree) still records its OWN edits
+        // while recently active — the gate drops only idle-window changes. Freshly
+        // spawned ⇒ last_output is now ⇒ within the grace window ⇒ records.
+        let dir = std::env::temp_dir().join(format!("taime-fsw-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let store = Arc::new(Store::open_at(Path::new(":memory:")).unwrap());
+        let spec = SpawnSpec {
+            prog: "sleep".into(),
+            args: vec!["10".into()],
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            env: vec![],
+            rows: 24,
+            cols: 80,
+            agent_id: Some("term-shared".into()),
+        };
+        // shared = true: the authorship gate is active, but the agent is within its
+        // post-spawn active window, so its edit is attributed.
+        let session = Session::spawn("pty-shared".into(), &spec, Some(store.clone()), true).unwrap();
+
+        std::fs::write(dir.join("work.txt"), "agent output").unwrap();
+
+        let mut recorded = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if store
+                .fs_path_touches("term-shared")
+                .unwrap()
+                .iter()
+                .any(|(p, _)| p == "work.txt")
+            {
+                recorded = true;
+                break;
+            }
+        }
+        session.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(recorded, "an active shared agent should record its own edit");
     }
 
     /// Regression for review H1: `kill()` must terminate the agent's whole process
@@ -964,7 +1098,7 @@ mod tests {
             cols: 80,
             agent_id: Some("term-killpg".into()),
         };
-        let session = Session::spawn("pty-killpg".into(), &spec, None).unwrap();
+        let session = Session::spawn("pty-killpg".into(), &spec, None, false).unwrap();
 
         // Wait for the helper pid to be published.
         let mut helper_pid = None;

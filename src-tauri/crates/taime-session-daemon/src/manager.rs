@@ -417,7 +417,9 @@ impl Manager {
 
     pub fn spawn(&self, spec: SpawnSpec) -> Result<String, String> {
         let id = self.next_pty_id();
-        let session = Session::spawn(id.clone(), &spec, self.store.clone())?;
+        // The low-level Spawn path is the legacy Claude-only entry; it isn't a
+        // worktree-mode agent, so it never runs in a shared tree.
+        let session = Session::spawn(id.clone(), &spec, self.store.clone(), false)?;
         self.sessions.lock().unwrap().insert(id.clone(), session);
         self.touch();
         Ok(id)
@@ -465,7 +467,18 @@ impl Manager {
                 let _ = store.record_cleanup(&id, &json, now_unix());
             }
         }
-        let session = Session::spawn_prepared(id.clone(), prepared, adapter, self.store.clone())?;
+        // Is this agent's worktree SHARED (the user's real tree) rather than its
+        // own isolated checkout? The session needs to know so its fs-watcher gates
+        // attribution on the agent being mid-turn + de-dups co-watchers (review
+        // items 4/11). The Agent ID is the worktree row's key, provisioned before
+        // this spawn; absent/non-shared ⇒ isolated (record unconditionally).
+        let shared = spec
+            .agent_id
+            .as_deref()
+            .and_then(|aid| self.store.as_ref().and_then(|s| s.worktree_row(aid).ok().flatten()))
+            .is_some_and(|w| w.mode.as_deref() == Some("shared"));
+        let session =
+            Session::spawn_prepared(id.clone(), prepared, adapter, self.store.clone(), shared)?;
         self.sessions.lock().unwrap().insert(id.clone(), session);
         if let (Some(token), Some(key)) = (issued_token, &spec.agent_id) {
             self.tokens.lock().unwrap().insert(token, key.clone());

@@ -8,10 +8,10 @@
 //! session accumulates the dirty set, records events to the store, populates each
 //! turn's `fs_dirty_paths`, and pushes `FsDirty` to the attached client.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -178,6 +178,47 @@ fn under_cachedir_tag(path: &Path, root: &Path) -> bool {
     false
 }
 
+/// How long a shared-mode change stays "claimed" by the session that first
+/// observed it, locking out co-watchers (review item 4). Just long enough to span
+/// the debounce skew between two watchers seeing the SAME edit (both fire within a
+/// `DEBOUNCE` window); short enough that a genuinely independent later edit by
+/// another agent isn't swallowed.
+const SHARED_DEDUP_WINDOW: Duration = Duration::from_secs(2);
+
+/// (root, rel-path) → (owning session id, when claimed): the shared-mode de-dup map.
+type SharedClaims = HashMap<(String, String), (String, Instant)>;
+
+/// Process-singleton de-dup map, like [`cache_dir_memo`] — the daemon owns every
+/// session in one process.
+fn shared_claims() -> &'static Mutex<SharedClaims> {
+    static CLAIMS: OnceLock<Mutex<SharedClaims>> = OnceLock::new();
+    CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cross-session de-dup for SHARED-mode watchers (review item 4): when two shared
+/// agents watch the same `root`, each watcher sees the other's edits. Returns
+/// whether `owner` should RECORD `(root, path)` — true for the first session to
+/// claim it (and for the same `owner` re-editing its own file, which always
+/// re-claims), false for a DIFFERENT session within [`SHARED_DEDUP_WINDOW`], so a
+/// shared edit is attributed once (to one agent), never double-counted as phantom
+/// contention. Isolated worktrees are unique per agent, so callers invoke this in
+/// shared mode only. `now` is injected so the window is unit-testable.
+pub fn claim_shared_change(root: &str, path: &str, owner: &str, now: Instant) -> bool {
+    let mut map = shared_claims().lock().unwrap();
+    // Opportunistic prune so the map can't grow unbounded (entries are short-lived).
+    map.retain(|_, (_, when)| now.duration_since(*when) < SHARED_DEDUP_WINDOW);
+    let key = (root.to_string(), path.to_string());
+    match map.get(&key) {
+        // A DIFFERENT session claimed it within the window — it recorded it; skip.
+        Some((existing, _)) if existing != owner => false,
+        // Free, expired, or our own re-edit: (re)claim and record.
+        _ => {
+            map.insert(key, (owner.to_string(), now));
+            true
+        }
+    }
+}
+
 fn build_gitignore(dir: &Path) -> Option<Gitignore> {
     let mut builder = GitignoreBuilder::new(dir);
     let gi = dir.join(".gitignore");
@@ -285,6 +326,29 @@ mod tests {
             None
         )
         .is_none());
+    }
+
+    #[test]
+    fn shared_change_dedup_locks_out_co_watchers_within_the_window() {
+        // Unique root per test run so the process-singleton map can't collide with
+        // a parallel test.
+        let root = "/dedup-test-root-A";
+        let t0 = Instant::now();
+        // First co-watcher to observe the edit records it.
+        assert!(claim_shared_change(root, "src/a.rs", "agent-1", t0));
+        // A DIFFERENT co-watcher seeing the SAME edit within the window is locked
+        // out — no double attribution / phantom contention.
+        assert!(!claim_shared_change(root, "src/a.rs", "agent-2", t0));
+        // The owner re-editing its own file always re-claims (keeps recording).
+        assert!(claim_shared_change(root, "src/a.rs", "agent-1", t0));
+        // A different PATH is independent.
+        assert!(claim_shared_change(root, "src/b.rs", "agent-2", t0));
+        // A different ROOT is independent (different shared workspace).
+        assert!(claim_shared_change("/dedup-test-root-B", "src/a.rs", "agent-2", t0));
+
+        // After the window lapses, the lock-out clears and a new owner can claim.
+        let later = t0 + SHARED_DEDUP_WINDOW + Duration::from_millis(1);
+        assert!(claim_shared_change(root, "src/a.rs", "agent-2", later));
     }
 
     #[test]
