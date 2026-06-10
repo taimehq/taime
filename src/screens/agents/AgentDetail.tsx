@@ -322,7 +322,7 @@ export function AgentDetail({ frame }: { frame: Frame }) {
           {tab === "console" && (
             <ConsolePanel
               key={sessionId}
-              sessionId={sessionId}
+              agentId={agentId ?? null}
               anchorId={anchorId}
               exited={exited}
               wireStatus={rawStatus}

@@ -1,15 +1,19 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ChevronDown, ChevronRight, CornerDownLeft } from "lucide-react";
 import type { GraphTurn } from "../../api";
-import { daemonWrite, daemonCheckpoint } from "../../pty";
+import { daemonSendMessage } from "../../pty";
 import { fmtClock, fmtClockMs } from "./format";
 
 /**
  * Console — a PROJECTION of the agent's one PTY stream, never a second stream.
  * Renders the durable attribution turns as Warp-style blocks (timestamp,
- * status sigil, files touched) and writes back to the SAME PTY via the
- * existing daemon write path (`daemon_write` + a submit checkpoint — exactly
- * what the terminal's Enter does).
+ * status sigil, files touched). Input rides the DAEMON INBOX
+ * (`daemon_send_message`, the proven Schedule/Workflow delivery path): the
+ * daemon types + submits it into the agent's stdin when the agent next goes
+ * idle. A direct `daemon_write` is NOT usable here — it requires a live
+ * terminal attachment, and the Console mounts INSTEAD of the terminal view,
+ * so those bytes were silently dropped while the UI echoed "sent to stdin"
+ * (2026-06 review).
  */
 
 interface Echo {
@@ -35,7 +39,7 @@ function sigilFor(
 }
 
 export function ConsolePanel({
-  sessionId,
+  agentId,
   anchorId,
   exited,
   wireStatus,
@@ -43,8 +47,11 @@ export function ConsolePanel({
   loading,
   error,
 }: {
-  sessionId: string;
-  /** The Agent ID (attribution anchor) — display + projection key. */
+  /** The Agent ID — the inbox address messages deliver to. Null for a
+   *  pre-provision session (no worktree row): input disables, because an
+   *  inbox message addressed to nobody would dead-letter silently. */
+  agentId: string | null;
+  /** The display anchor (Agent ID, or the session id pre-provision). */
   anchorId: string;
   /** Process gone — stdin is closed; the input disables. */
   exited: boolean;
@@ -56,6 +63,7 @@ export function ConsolePanel({
 }) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
   const [echoes, setEchoes] = useState<Echo[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -76,17 +84,22 @@ export function ConsolePanel({
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     const v = input.trim();
-    if (!v || exited || sending) return;
+    if (!v || exited || sending || !agentId) return;
     setSending(true);
     try {
-      // The SAME write path the terminal uses: bytes to the PTY, then the
-      // submit checkpoint (the strongest attribution boundary signal).
-      await daemonWrite(sessionId, v + "\r");
-      void daemonCheckpoint(sessionId, "submit");
+      // Enqueue on the daemon inbox: the daemon types + submits it (with the
+      // attribution boundary) when the agent next goes idle — no dependency on
+      // a terminal attachment this view never has.
+      await daemonSendMessage("user", agentId, v);
+      setSendError(null);
       setEchoes((es) =>
         [...es, { id: ++echoSeq, at: Date.now(), text: v }].slice(-20),
       );
       setInput("");
+    } catch (err) {
+      // The enqueue itself failed (daemon unreachable / refused): say so —
+      // a false "delivered" echo here is exactly the bug this path replaced.
+      setSendError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);
     }
@@ -187,7 +200,7 @@ export function ConsolePanel({
                 {e.text}
               </span>
               <span className="shrink-0 text-[10px] text-zinc-600">
-                sent to stdin
+                queued · delivers when idle
               </span>
               <span className="shrink-0 font-mono text-[10px] tabular-nums text-zinc-600">
                 {fmtClockMs(e.at)}
@@ -197,7 +210,21 @@ export function ConsolePanel({
         </div>
       </div>
 
-      {/* Input — writes to the SAME PTY the terminal drives. */}
+      {/* Inbox delivery is idle-gated: a blocked agent won't see it until its
+          prompt is answered — point at the Terminal tab for that. */}
+      {!exited && wireStatus === "WAITING_USER_ANSWER" && (
+        <p className="shrink-0 border-t border-ink-600 px-2 py-1 text-[10px] text-amber">
+          agent is waiting for an answer — inbox messages deliver when it goes
+          idle; answer its prompt in the Terminal tab
+        </p>
+      )}
+      {sendError && (
+        <p className="shrink-0 border-t border-ink-600 px-2 py-1 text-[10px] text-rose-400">
+          send failed: {sendError}
+        </p>
+      )}
+
+      {/* Input — enqueues on the daemon inbox addressed to the Agent ID. */}
       <form
         onSubmit={submit}
         className="flex shrink-0 items-center gap-2 border-t border-ink-600 px-2 py-1.5"
@@ -206,20 +233,24 @@ export function ConsolePanel({
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          disabled={exited || sending}
+          disabled={exited || sending || !agentId}
           placeholder={
-            exited ? "agent exited · stdin closed" : `send message to ${anchorId}…`
+            exited
+              ? "agent exited · stdin closed"
+              : !agentId
+                ? "no agent id yet — use the Terminal tab"
+                : `message ${anchorId} · delivered when it goes idle…`
           }
-          title="Writes to the agent's PTY stdin — the same stream the terminal shows"
+          title="Enqueues on the daemon inbox; the daemon types + submits it into the agent's stdin when the agent next goes idle"
           className="min-w-0 flex-1 bg-transparent font-mono text-[12px] text-zinc-200 placeholder:text-zinc-700 focus:outline-none disabled:opacity-50"
         />
         <button
           type="submit"
-          disabled={!input.trim() || exited || sending}
+          disabled={!input.trim() || exited || sending || !agentId}
           className="flex shrink-0 items-center gap-1 rounded-md border border-ink-500 px-2 py-0.5 text-[11px] text-zinc-300 enabled:hover:bg-ink-600 disabled:cursor-default disabled:opacity-40"
         >
           <CornerDownLeft size={11} />
-          {sending ? "sending…" : "send"}
+          {sending ? "queuing…" : "send"}
         </button>
       </form>
     </div>
