@@ -606,7 +606,9 @@ async fn read_server_within(conn: &mut Conn, dur: Duration) -> Result<ServerMsg,
 }
 
 /// Spawn the daemon fully detached (`setsid`, stdio → /dev/null, dropped without
-/// wait/kill) so it outlives this app. NOT a Tauri sidecar.
+/// wait/kill) so it outlives this app. NOT a Tauri sidecar. The daemon itself
+/// re-points its stderr from /dev/null at `<data_dir>/taime/daemon.log` on boot,
+/// so its diagnostics are not discarded.
 fn spawn_detached(daemon_bin: &Path, socket: &Path) -> std::io::Result<u32> {
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
