@@ -103,6 +103,12 @@ export function AgentDiffSection({
     setSel({});
   }, [bundle]);
 
+  // Reset the merge target when this section rebinds to a different agent — a
+  // sibling target chosen for the previous one must not carry over.
+  useEffect(() => {
+    setTarget("main");
+  }, [member.agent_id]);
+
   const files = bundle?.files ?? [];
   const attribution = bundle?.attribution ?? null;
   const worktree = bundle?.worktree ?? null;
@@ -206,6 +212,10 @@ export function AgentDiffSection({
           type: "success",
           message: `Committed ${res.commit} → ${where} — ${res.files.length} file(s), provenance recorded`,
         });
+        setSel({});
+        onApplied();
+      } else if (res.noop) {
+        showSnackbar({ type: "success", message: `Already up to date — ${res.files.length} file(s) already at the target` });
         setSel({});
         onApplied();
       } else {

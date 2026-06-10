@@ -832,6 +832,19 @@ fn finish_commit(mut res: Value, target_dir: &str, message: &str) -> Value {
         res["error"] = json!("staging the merged files failed");
         return res;
     }
+    // Nothing actually staged ⇒ the selected change is already present at the
+    // target (e.g. re-merging an agent-created file that was merged before and
+    // still shows as untracked in the agent's worktree). `git commit` would fail
+    // "nothing to commit"; report a clean no-op instead of a misleading error —
+    // the desired state already holds. (apply already reported applied:true.)
+    let mut pathspec: Vec<&str> = vec!["diff", "--cached", "--quiet", "--"];
+    pathspec.extend(files.iter().map(String::as_str));
+    if git_raw(&top, &pathspec).map(|o| o.status.success()).unwrap_or(false) {
+        res["committed"] = json!(false);
+        res["noop"] = json!(true);
+        res["error"] = Value::Null;
+        return res;
+    }
     // Commit ONLY those paths — a partial commit, so other staged/unstaged
     // changes in the target are not swept in.
     let mut commit_args: Vec<&str> = vec!["commit", "-m", message, "--"];
@@ -1455,6 +1468,37 @@ mod tests {
         assert!(body.contains("Taime-Archive-Ref: refs/taime/archive/agent-x"), "trailer: {body}");
         assert!(std::fs::read_to_string(target.join("a.txt")).unwrap().contains("TWO"));
         let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn commit_selection_noop_when_already_present_is_not_a_failure() {
+        // Re-merging an agent-created file whose identical content is ALREADY
+        // committed at the target: apply reports applied (no-op), and the commit
+        // step must report a clean no-op, not a confusing "nothing to commit" error.
+        let src = repo();
+        std::fs::write(src.join("b.txt"), "agent-created\n").unwrap();
+        let target = target_clone();
+        // The same file, identical content, already committed at the target.
+        std::fs::write(target.join("b.txt"), "agent-created\n").unwrap();
+        git(&target, &["add", "-A"]);
+        git(&target, &["commit", "-qm", "add b"]);
+        let before = git_ok(Path::new(&target), &["rev-parse", "HEAD"]).unwrap();
+
+        let v = commit_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            target.to_str().unwrap(),
+            &json!({ "b.txt": [0] }),
+            None,
+            "msg",
+        );
+        assert_eq!(v["applied"], true, "{v}");
+        assert_eq!(v["committed"], false, "{v}");
+        assert_eq!(v["noop"], true, "already-present is a clean no-op: {v}");
+        assert_eq!(v["error"], serde_json::Value::Null, "no error on a no-op: {v}");
+        assert_eq!(before, git_ok(Path::new(&target), &["rev-parse", "HEAD"]).unwrap(), "HEAD unmoved");
+        let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&target);
     }
 

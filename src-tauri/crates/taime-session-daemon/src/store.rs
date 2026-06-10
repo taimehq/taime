@@ -757,6 +757,19 @@ impl Store {
         Ok(())
     }
 
+    /// How many turns an agent has recorded — the cheap `COUNT(*)` for provenance
+    /// (the trailer's `Taime-Turns`), avoiding materializing every turn row just to
+    /// count them.
+    pub fn count_agent_turns(&self, terminal_id: &str) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM taime_agent_turns WHERE terminal_id = ?1",
+            rusqlite::params![terminal_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     /// An agent's persisted turns, newest first: `(id, turn_index, started_at,
     /// ended_at, files_touched)` where files is the raw JSON-array string.
     #[allow(clippy::type_complexity)]

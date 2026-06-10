@@ -1006,55 +1006,6 @@ impl Manager {
         Ok(dst.worktree_path)
     }
 
-    /// Ensure a durable `refs/taime/archive/<id>` snapshot exists for `agent_id`
-    /// and return it, so the provenance commit references an immediately
-    /// dereferenceable ref (`Taime-Agent-Id` ↔ `refs/taime/archive/<id>` — the
-    /// unified identity). A reclaimed / already-archived agent returns its
-    /// existing ref; a LIVE isolated agent is snapshotted in place (no reclaim —
-    /// the checkout stays, only `archived_at`/the cached patch are written, a
-    /// truthful "its work is now durable"). Best-effort: `None` when there's
-    /// nothing to snapshot (clean / shared / no base) or the snapshot fails — the
-    /// caller then omits the ref line rather than emit one that doesn't resolve.
-    fn ensure_archive_snapshot(&self, agent_id: &str) -> Option<String> {
-        let store = self.store.as_ref()?;
-        let w = store.worktree_row(agent_id).ok().flatten()?;
-        // Already archived (reclaimed or previously snapshotted) — reuse if it
-        // still resolves in the repo.
-        if let (Some(ar), Some(repo)) = (w.archive_ref.as_deref(), w.repo_root.as_deref()) {
-            if crate::worktree::archive_ref_exists(repo, agent_id) {
-                return Some(ar.to_string());
-            }
-        }
-        // Snapshot a live isolated agent in place (never a shared/reclaimed row).
-        if w.mode.as_deref() != Some("isolated") || w.reclaimed_at.is_some() {
-            return None;
-        }
-        let repo = w.repo_root.as_deref()?;
-        let base = w.base_sha.as_deref().filter(|b| !b.is_empty())?;
-        if !std::path::Path::new(&w.worktree_path).exists() {
-            return None;
-        }
-        match crate::worktree::archive_agent(agent_id, &w.worktree_path, repo, base) {
-            crate::worktree::ArchiveOutcome::Archived(res) => {
-                let now = now_unix();
-                let _ = store.put_review_patch(
-                    &crate::store::ReviewPatch {
-                        agent_id: agent_id.to_string(),
-                        base_sha: res.base_sha.clone(),
-                        archive_ref: res.archive_ref.clone(),
-                        digest: res.digest.clone(),
-                        diff_blob: res.diff_blob.clone(),
-                        files_changed: res.files_changed as i64,
-                    },
-                    now,
-                );
-                let _ = store.mark_archived(agent_id, Some(&res.archive_ref), now);
-                Some(res.archive_ref)
-            }
-            _ => None,
-        }
-    }
-
     /// Assemble the provenance commit message (subject + body + trailer block) for
     /// a merge of `agent_id`'s selected hunks into `target_symbol`. The always-present
     /// core is `Co-authored-by` plus `Taime-Agent-Id` (== `refs/taime/archive/<id>`);
@@ -1081,8 +1032,7 @@ impl Manager {
         let turns = self
             .store
             .as_ref()
-            .and_then(|s| s.agent_turns(agent_id, 10_000).ok())
-            .map(|v| v.len())
+            .and_then(|s| s.count_agent_turns(agent_id).ok())
             .unwrap_or(0);
         let title = provider_title(&provider);
         let short = short_id(agent_id);
@@ -1168,8 +1118,7 @@ impl Manager {
         let turns = self
             .store
             .as_ref()
-            .and_then(|s| s.agent_turns(agent_id, 10_000).ok())
-            .map(|v| v.len())
+            .and_then(|s| s.count_agent_turns(agent_id).ok())
             .unwrap_or(0);
         let now = now_unix();
 
@@ -1238,8 +1187,7 @@ impl Manager {
         let turns = self
             .store
             .as_ref()
-            .and_then(|s| s.agent_turns(agent_id, 10_000).ok())
-            .map(|v| v.len())
+            .and_then(|s| s.count_agent_turns(agent_id).ok())
             .unwrap_or(0);
         let merges =
             self.store.as_ref().and_then(|s| s.merges_for_agent(agent_id).ok()).unwrap_or_default();
@@ -1441,15 +1389,22 @@ impl Manager {
                                 Ok(target) => {
                                     let (s, t) =
                                         crate::diff::selection_counts_live(&cwd, base.as_deref(), &sel);
-                                    let ar = self.ensure_archive_snapshot(tk);
+                                    // A live agent has no resolvable archive ref yet
+                                    // (it materializes at reclaim, under the SAME id —
+                                    // `Taime-Agent-Id`). Omit the ref line rather than
+                                    // emit one that doesn't dereference, and never
+                                    // snapshot a live checkout here: that would set
+                                    // `archive_ref` on a live row, which the
+                                    // delete-workspace HARD path treats as reclaimed,
+                                    // destructible work.
                                     let msg = self.build_merge_message(
-                                        tk, symbol, base.as_deref(), reviewed, digest, s, t, ar.as_deref(),
+                                        tk, symbol, base.as_deref(), reviewed, digest, s, t, None,
                                     );
                                     let res = crate::diff::commit_selection(
                                         &cwd, base.as_deref(), &target, &sel, digest, &msg,
                                     );
                                     self.finalize_merge(
-                                        res, tk, symbol, &target, base.as_deref(), ar.as_deref(),
+                                        res, tk, symbol, &target, base.as_deref(), None,
                                         digest, reviewed, s, t, push,
                                     )
                                 }
@@ -4712,12 +4667,18 @@ mod tests {
         assert!(body.contains("Taime-Agent-Id: agent-a"), "{body}");
         assert!(body.contains("Taime-Reviewed: false"), "autonomous merge recorded: {body}");
         assert!(body.contains("Taime-Patch-Digest:"), "{body}");
-        // The live agent was snapshotted so the trailer ref resolves.
+        assert!(body.contains("Taime-Base-Sha:"), "{body}");
+        // A LIVE agent is NOT snapshotted at merge: the trailer omits the archive
+        // ref (it materializes at reclaim, under the same id), and no archive ref
+        // is set on the live row — which delete-workspace HARD would otherwise
+        // treat as reclaimed, destructible work.
+        assert!(!body.contains("Taime-Archive-Ref"), "no archive ref for a live agent: {body}");
         assert!(
-            crate::worktree::archive_ref_exists(&proj.to_string_lossy(), "agent-a"),
-            "merge ensured the archive snapshot exists"
+            !crate::worktree::archive_ref_exists(&proj.to_string_lossy(), "agent-a"),
+            "a live merge must not create an archive ref"
         );
-        assert!(body.contains("Taime-Archive-Ref: refs/taime/archive/agent-a"), "{body}");
+        let wrow = mgr.store().unwrap().worktree_row("agent-a").unwrap().unwrap();
+        assert!(wrow.archive_ref.is_none(), "live agent's row has no archive_ref after merge");
         let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&proj);
     }

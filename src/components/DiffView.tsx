@@ -172,6 +172,10 @@ export function DiffView() {
     setSel({});
     setSelected(null);
     lastHunksRef.current = null;
+    // Reset the merge target too — a sibling target chosen for the previous
+    // agent would otherwise persist and be sent for this one (a cross-workspace
+    // target the daemon then rejects, after markReviewed already fired).
+    setTarget("main");
   }, [terminalId]);
 
   useEffect(() => {
@@ -397,6 +401,11 @@ export function DiffView() {
         });
         setSel({});
         await loadMerges();
+        await load();
+      } else if (res.noop) {
+        // Already present at the target — a clean no-op, not a failure.
+        showSnackbar({ type: "success", message: `Already up to date — ${res.files.length} file(s) already at the target` });
+        setSel({});
         await load();
       } else {
         await reportFailure(res, "Merge");

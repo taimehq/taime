@@ -278,6 +278,9 @@ export interface CommitMergeResult extends ApplyResult {
   committed: boolean;
   /** Short sha of the provenance commit (present when `committed`). */
   commit?: string;
+  /** True when the selected change was already present at the target — a clean
+   *  no-op (applied:true, committed:false, no error). Not a failure. */
+  noop?: boolean;
   /** Whether the `refs/notes/taime` git note was attached (best-effort). */
   note_written?: boolean;
   /** Whether an opt-in push of the target branch succeeded. */
