@@ -87,8 +87,7 @@ export function AgentDiffSection({
 }) {
   const terminalStatuses = useStore((s) => s.terminalStatuses);
   const reviewed = useStore((s) => !!s.reviewedFrames[member.agent_id]);
-  const clearDirty = useStore((s) => s.clearDirty);
-  const markReviewed = useStore((s) => s.markReviewed);
+  const markFrameReviewed = useStore((s) => s.markFrameReviewed);
   const showSnackbar = useStore((s) => s.showSnackbar);
   const connected = useStore((s) => s.connected);
 
@@ -229,10 +228,10 @@ export function AgentDiffSection({
   };
 
   /** Acknowledge this agent's changes: clears its dirty set (frontend + the
-   *  daemon's accumulated watcher set) and keys review state by Agent ID. */
+   *  daemon's accumulated watcher set) and keys review state by Agent ID, in one
+   *  ordered action so the dirty-reset and ack-write can't race. */
   const onMarkReviewed = () => {
-    clearDirty(member.agent_id);
-    markReviewed(member.agent_id);
+    markFrameReviewed(member.agent_id);
   };
 
   // The diff below is authoritative only while the daemon answers, this

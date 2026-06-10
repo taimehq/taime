@@ -56,8 +56,7 @@ function StatusIcon({ status }: { status: string }) {
 export function DiffView() {
   const terminalId = useStore((s) => s.diffTerminalId);
   const closeDiff = useStore((s) => s.closeDiff);
-  const clearDirty = useStore((s) => s.clearDirty);
-  const markReviewed = useStore((s) => s.markReviewed);
+  const markFrameReviewed = useStore((s) => s.markFrameReviewed);
   const showSnackbar = useStore((s) => s.showSnackbar);
   const frames = useStore((s) => s.frames);
   const pendingSwitch = useStore((s) => s.pendingSwitch);
@@ -393,9 +392,10 @@ export function DiffView() {
   };
 
   const onMarkReviewed = () => {
-    clearDirty(terminalId);
-    // Review state is keyed by agent id — it outlives this frame.
-    markReviewed(terminalId);
+    // Reset the daemon dirty set + record the ack in one ordered action — keyed
+    // by agent id, so review state outlives this frame (and the two daemon
+    // writes can't race and wipe the durable ack).
+    markFrameReviewed(terminalId);
     closeDiff();
     if (pendingSwitch) resolveSwitch(true);
   };

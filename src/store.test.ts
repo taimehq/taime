@@ -1357,6 +1357,29 @@ describe("durable review acks", () => {
     expect(markReviewedApi).toHaveBeenCalledWith("agent-z");
   });
 
+  it("markFrameReviewed sets local dirty+ack and orders the daemon writes (dirty-clear before ack)", async () => {
+    useStore.setState({
+      dirty: { "term-1": { count: 2, paths: ["a.ts", "b.ts"] } },
+      reviewedFrames: {},
+    });
+
+    useStore.getState().markFrameReviewed("term-1");
+
+    // Local state is optimistic and immediate.
+    expect(useStore.getState().dirty["term-1"]).toBeUndefined();
+    expect(useStore.getState().reviewedFrames["term-1"]).toBe(true);
+
+    // The daemon ack INSERT must be issued only AFTER the dirty-clear (whose
+    // daemon arm DELETEs the ack) resolves — otherwise the two race and the
+    // durable ack can be wiped. clearDaemonDirty is awaited; markReviewed fires
+    // on its continuation.
+    expect(clearDaemonDirty).toHaveBeenCalledWith("term-1");
+    expect(markReviewedApi).not.toHaveBeenCalled(); // still awaiting the dirty-clear
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(markReviewedApi).toHaveBeenCalledWith("term-1");
+  });
+
   it("resolveSwitch(true) is a session-local skip — ack set locally, NOT persisted", () => {
     seedUnreviewedAgent();
     useStore.getState().setSection("dashboard"); // raises the guard

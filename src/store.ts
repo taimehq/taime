@@ -477,6 +477,12 @@ interface Store {
   /** Acknowledge an agent's dirty changes (keyed by agent id). Also persisted
    *  daemon-side so the ack survives a UI/daemon restart. */
   markReviewed: (agentId: string) => void;
+  /** The "Mark reviewed" gesture: reset the daemon's accumulated dirty set AND
+   *  record the durable ack — ordered so the two daemon writes can't race
+   *  (clear_dirty drops the ack daemon-side; if mark_reviewed's INSERT lost the
+   *  race the durable ack would be wiped). Use this instead of calling
+   *  clearDirty + markReviewed separately. */
+  markFrameReviewed: (agentId: string) => void;
   /** Merge daemon-persisted review acks into the guard state (boot/tick
    *  hydration — union only; can add an ack, never clear a local one). */
   hydrateReviewed: (agentIds: string[]) => void;
@@ -1207,6 +1213,27 @@ export const useStore = create<Store>((set, get) => ({
       const next = { ...s.dirty };
       delete next[terminalId];
       return { dirty: next };
+    });
+  },
+
+  markFrameReviewed: (agentId) => {
+    // The daemon's clear_dirty arm drops the durable ack (resetting the watcher
+    // begins a fresh review cycle), while mark_reviewed records it. Issued as
+    // two unordered RPCs they race and the ack can be lost; AWAIT the dirty
+    // reset so mark_reviewed's INSERT is guaranteed to land last. Local state is
+    // set optimistically and is authoritative for this session regardless.
+    void (async () => {
+      try {
+        await api.clearDaemonDirty(agentId);
+      } catch {
+        /* daemon may be down — the optimistic local state below still applies */
+      }
+      api.markReviewed(agentId).catch(() => {});
+    })();
+    set((s) => {
+      const dirty = { ...s.dirty };
+      delete dirty[agentId];
+      return { dirty, reviewedFrames: { ...s.reviewedFrames, [agentId]: true } };
     });
   },
 
