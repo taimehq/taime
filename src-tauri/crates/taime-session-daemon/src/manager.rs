@@ -516,6 +516,14 @@ impl Manager {
             };
             let Some(msg) = msg else { continue };
             let payload = format_delivery(&msg.sender_id, &msg.message);
+            // Close any still-open turn BEFORE injecting (self-guarded no-op
+            // when the quiet window already closed it): the receiver flips
+            // idle the moment output stops, ~700ms before the quiet close, so
+            // an undelimited injection would coalesce the prior turn's work
+            // with the delivered prompt's response — misattributing
+            // files_touched on the flagship Attribution surface. Mirrors the
+            // app's keystroke-submit checkpoint.
+            session.checkpoint();
             match session.input(payload.as_bytes()) {
                 Ok(_) => {
                     let _ = store.set_message_status(msg.id, "delivered");

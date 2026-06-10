@@ -1087,9 +1087,16 @@ export const useStore = create<Store>((set, get) => ({
       const frames = s.frames.filter((f) => f.key !== key);
       const rustPtySessions = { ...s.rustPtySessions };
       if (sid) delete rustPtySessions[sid];
+      // Dropping the agent drops its LOCAL dirty mirror too — with the agent
+      // gone there is no review surface left to clear it, and an orphaned
+      // entry shows a phantom "needs review" count forever. (Local only:
+      // the daemon's session state dies with the kill.)
+      const dirty = { ...s.dirty };
+      if (frame?.terminalId) delete dirty[frame.terminalId];
       return {
         frames,
         rustPtySessions,
+        dirty,
         activeFrameKey:
           s.activeFrameKey === key ? (frames[frames.length - 1]?.key ?? null) : s.activeFrameKey,
       };
@@ -1101,8 +1108,12 @@ export const useStore = create<Store>((set, get) => ({
     await daemonKill(ptySessionId);
     set((s) => {
       const rustPtySessions = { ...s.rustPtySessions };
+      const tid = rustPtySessions[ptySessionId]?.terminalId;
       delete rustPtySessions[ptySessionId];
-      return { rustPtySessions };
+      // Same phantom-dirty cleanup as killRustPty: no agent, no review surface.
+      const dirty = { ...s.dirty };
+      if (tid) delete dirty[tid];
+      return { rustPtySessions, dirty };
     });
   },
 
