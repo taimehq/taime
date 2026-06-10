@@ -269,6 +269,58 @@ export interface ApplyResult {
   error: string | null;
 }
 
+/** Result of `commit_merge`: the selected hunks landed AND were recorded as one
+ *  provenance commit (Co-authored-by + Taime-* trailer + refs/notes/taime note).
+ *  Extends the apply result with the commit + push outcome. */
+export interface CommitMergeResult extends ApplyResult {
+  /** True when the merge was recorded as a commit (false ⇒ refused / conflicted
+   *  / stale — see `error`/`conflicts`/`stale`, exactly like ApplyResult). */
+  committed: boolean;
+  /** Short sha of the provenance commit (present when `committed`). */
+  commit?: string;
+  /** Whether the `refs/notes/taime` git note was attached (best-effort). */
+  note_written?: boolean;
+  /** Whether an opt-in push of the target branch succeeded. */
+  pushed?: boolean;
+  /** A structured push failure (no remote / no upstream / rejected) — the commit
+   *  still stands. */
+  push_error?: string;
+}
+
+/** One recorded provenance merge (the merged-✓ badge / history). */
+export interface MergeRecord {
+  id: number | null;
+  commit: string;
+  target: string;
+  target_repo: string;
+  base_sha: string | null;
+  archive_ref: string | null;
+  digest: string | null;
+  scope: "full" | "partial";
+  hunks_selected: number;
+  hunks_total: number;
+  reviewed: boolean;
+  pushed: boolean;
+  pr_url: string | null;
+  files: string[];
+  merged_at: number;
+}
+
+/** The portable attribution export for an agent (gap #2) — identity + current
+ *  change set + recorded merges + turn count. `schema: "taime.attribution/v1"`. */
+export interface AgentAttribution {
+  schema: string;
+  agent_id: string;
+  provider: string;
+  base_sha: string | null;
+  archive_ref: string | null;
+  task_id: string | null;
+  turns: number;
+  current_files: string[];
+  merges: MergeRecord[];
+  exported_at: number;
+}
+
 export interface WorkspaceInfo {
   path: string;
   exists: boolean;
@@ -657,6 +709,47 @@ export const api = {
       },
       { applied: false, target_dir: body.target, files: [], conflicts: [], error: "daemon unavailable" },
     ),
+
+  /** Merge selected hunks into `target` AND record them as one provenance commit
+   *  (Co-authored-by + Taime-* trailer + git note). `expectedDigest` is required
+   *  (the integrity floor); `push` optionally pushes the target branch. The merge
+   *  records reviewed=true when a standing ack exists, else autonomous. */
+  commitMerge: (
+    id: string,
+    body: {
+      target: string;
+      selections: Record<string, number[] | null>;
+      expectedDigest: string;
+      push?: boolean;
+    },
+  ) =>
+    daemonQuery<CommitMergeResult>(
+      "commit_merge",
+      {
+        agent_id: id,
+        target_dir: body.target,
+        selections: body.selections,
+        expected_digest: body.expectedDigest,
+        push: body.push ?? false,
+      },
+      {
+        committed: false,
+        applied: false,
+        target_dir: body.target,
+        files: [],
+        conflicts: [],
+        error: "daemon unavailable",
+      },
+    ),
+
+  /** An agent's recorded provenance merges, newest first (the merged-✓ badge). */
+  mergeHistory: (id: string) =>
+    daemonQuery<MergeRecord[]>("merge_history", { agent_id: id }, []),
+
+  /** The portable attribution export for an agent (gap #2). STRICT: a daemon-down
+   *  read must reject, never silently return an empty artifact. */
+  exportAttribution: (id: string) =>
+    daemonQueryStrict<AgentAttribution>("export_attribution", { agent_id: id }),
 
   getContention: (session: string) =>
     daemonQueryStrict<{ path: string; terminals: string[] }[]>("contention", { session }),

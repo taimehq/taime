@@ -70,6 +70,12 @@ const STRICT_READS: Array<{
     kind: "contention",
     args: { session: "/proj" },
   },
+  {
+    name: "exportAttribution",
+    call: () => api.exportAttribution("agent-1"),
+    kind: "export_attribution",
+    args: { agent_id: "agent-1" },
+  },
 ];
 
 describe("strict review-surface reads", () => {
@@ -121,6 +127,42 @@ describe("getGraph", () => {
   it("propagates a daemon-down rejection", async () => {
     strict.mockRejectedValueOnce(new Error("daemon unreachable"));
     await expect(api.getGraph("/work/project")).rejects.toThrow("daemon unreachable");
+  });
+});
+
+describe("commit_merge (the provenance-merge path)", () => {
+  it("sends the agent, target, selections, digest, and push flag", async () => {
+    tolerant.mockResolvedValueOnce({ committed: true, applied: true, commit: "abc1234", files: ["a.txt"], conflicts: [], error: null });
+    const res = await api.commitMerge("agent-1", {
+      target: "main",
+      selections: { "a.txt": [0] },
+      expectedDigest: "deadbeef",
+      push: true,
+    });
+    expect(tolerant).toHaveBeenCalledWith(
+      "commit_merge",
+      { agent_id: "agent-1", target_dir: "main", selections: { "a.txt": [0] }, expected_digest: "deadbeef", push: true },
+      expect.objectContaining({ committed: false, applied: false, target_dir: "main" }),
+    );
+    expect(res.committed).toBe(true);
+    expect(res.commit).toBe("abc1234");
+  });
+
+  it("defaults push to false and falls back to committed:false on daemon-down", async () => {
+    tolerant.mockResolvedValueOnce({ committed: false, applied: false, target_dir: "main", files: [], conflicts: [], error: "daemon unavailable" });
+    await api.commitMerge("agent-1", { target: "main", selections: { "a.txt": null }, expectedDigest: "d" });
+    expect(tolerant).toHaveBeenCalledWith(
+      "commit_merge",
+      expect.objectContaining({ push: false }),
+      expect.objectContaining({ committed: false }),
+    );
+  });
+
+  it("mergeHistory is a tolerant read defaulting to an empty list", async () => {
+    tolerant.mockResolvedValueOnce([]);
+    await api.mergeHistory("agent-1");
+    expect(tolerant).toHaveBeenCalledWith("merge_history", { agent_id: "agent-1" }, []);
+    expect(strict).not.toHaveBeenCalled();
   });
 });
 

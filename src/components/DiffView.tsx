@@ -11,6 +11,8 @@ import {
   GitMerge,
   Undo2,
   Archive,
+  Download,
+  GitCommitHorizontal,
 } from "lucide-react";
 import {
   api,
@@ -19,6 +21,7 @@ import {
   type WorktreeInfo,
   type AttributionResponse,
   type FileContributor,
+  type MergeRecord,
 } from "../api";
 import { useStore } from "../store";
 import { providerTitle } from "../lib/providerLabel";
@@ -77,6 +80,8 @@ export function DiffView() {
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Recorded provenance merges for this agent (the merged-✓ badge).
+  const [merges, setMerges] = useState<MergeRecord[]>([]);
 
   const frame = frames.find((f) => f.terminalId === terminalId);
 
@@ -139,6 +144,24 @@ export function DiffView() {
     // up → the surface heals without reopening). Mirrors AgentDetail's probe.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terminalId, connected]);
+
+  // The agent's recorded provenance merges (the merged-✓ badge) — decoration,
+  // so it's a best-effort read separate from the STRICT diff load.
+  const loadMerges = useCallback(async () => {
+    if (!terminalId) {
+      setMerges([]);
+      return;
+    }
+    try {
+      setMerges(await api.mergeHistory(terminalId));
+    } catch {
+      /* decoration only — never block the review surface on it */
+    }
+  }, [terminalId]);
+
+  useEffect(() => {
+    loadMerges();
+  }, [loadMerges]);
 
   // Reset the review-in-progress state (hunk selection, focused file) only
   // when the SUBJECT changes. load() also re-fires on `connected` flips (the
@@ -335,58 +358,96 @@ export function DiffView() {
     );
   };
 
-  const apply = async (mode: "merge" | "revert") => {
-    if (selectionCount === 0) return;
+  // Shared handling for a refused/stale/conflicted apply-or-commit outcome.
+  const reportFailure = async (res: { stale?: boolean; conflicts: string[]; error: string | null }, verb: string) => {
+    if (res.stale) {
+      // The worktree moved since this view was fetched — show the fresh diff;
+      // the selection is meaningless against the new hunks.
+      showSnackbar({ type: "error", message: "The agent changed files after you loaded this diff — review the new changes" });
+      setSel({});
+      await load();
+    } else if (res.conflicts.length) {
+      showSnackbar({ type: "error", message: `Conflicts: ${res.conflicts[0]}` });
+      await load();
+    } else {
+      showSnackbar({ type: "error", message: res.error ?? `${verb} failed` });
+    }
+  };
+
+  // Merge = commit the selected hunks into the target WITH provenance (the gap-#1
+  // path: Co-authored-by + Taime-* trailer + git note, optional push). Merging
+  // through the Review surface IS the review act, so we record the ack first —
+  // best-effort: the merge proceeds either way (autonomy-primary), it's just
+  // recorded as reviewed vs autonomous in the provenance.
+  const commitMerge = async () => {
+    if (selectionCount === 0 || !digest) return;
     setBusy(true);
     try {
-      // Merging from the review surface IS the review act: record the durable
-      // ack the daemon's merge gate requires (it refuses unacked merges). A
-      // failed ack is a hard stop — proceeding would hit the gate with a
-      // refusal that doesn't name the real cause. The local guard state is
-      // untouched — unmerged changes still need review.
-      if (mode === "merge") {
-        const acked = await api.markReviewed(terminalId);
-        if (!acked) {
-          showSnackbar({
-            type: "error",
-            message: "Could not record the review ack (daemon persistence unavailable) — merge aborted",
-          });
-          return;
-        }
-      }
-      const res = await api.applySelection(terminalId, {
-        target: mode === "revert" ? "self" : target,
-        mode,
+      await api.markReviewed(terminalId);
+      const res = await api.commitMerge(terminalId, {
+        target,
         selections: buildSelections(),
-        expectedDigest: digest ?? undefined,
+        expectedDigest: digest,
       });
-      if (res.applied) {
-        const where = mode === "revert" ? agentName : target === "main" ? "main" : "agent";
+      if (res.committed) {
+        const where = target === "main" ? "main" : "the sibling worktree";
         showSnackbar({
           type: "success",
-          message: `${mode === "merge" ? "Merged" : "Reverted"} ${res.files.length} file(s) ${mode === "merge" ? `→ ${where}` : `from ${where}`}`,
+          message: `Committed ${res.commit} → ${where} — ${res.files.length} file(s), provenance recorded`,
         });
         setSel({});
-        await load();
-      } else if (res.stale) {
-        // The worktree moved since this view was fetched — show the fresh
-        // diff; the selection is meaningless against the new hunks.
-        showSnackbar({
-          type: "error",
-          message: "The agent changed files after you loaded this diff — review the new changes",
-        });
-        setSel({});
-        await load();
-      } else if (res.conflicts.length) {
-        showSnackbar({ type: "error", message: `Conflicts: ${res.conflicts[0]}` });
+        await loadMerges();
         await load();
       } else {
-        showSnackbar({ type: "error", message: res.error ?? "Apply failed" });
+        await reportFailure(res, "Merge");
       }
     } catch (e) {
       showSnackbar({ type: "error", message: String(e) });
     } finally {
       setBusy(false);
+    }
+  };
+
+  // Revert = reverse-apply the selected hunks from the agent's own worktree
+  // (discard its work back to base). No commit, no ack — the safe direction.
+  const revert = async () => {
+    if (selectionCount === 0) return;
+    setBusy(true);
+    try {
+      const res = await api.applySelection(terminalId, {
+        target: "self",
+        mode: "revert",
+        selections: buildSelections(),
+        expectedDigest: digest ?? undefined,
+      });
+      if (res.applied) {
+        showSnackbar({ type: "success", message: `Reverted ${res.files.length} file(s) from ${agentName}` });
+        setSel({});
+        await load();
+      } else {
+        await reportFailure(res, "Revert");
+      }
+    } catch (e) {
+      showSnackbar({ type: "error", message: String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Download the portable attribution artifact for this agent (gap #2).
+  const exportAttribution = async () => {
+    try {
+      const data = await api.exportAttribution(terminalId);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `taime-attribution-${terminalId.slice(0, 8)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showSnackbar({ type: "success", message: "Attribution exported" });
+    } catch (e) {
+      showSnackbar({ type: "error", message: `Export failed: ${String(e)}` });
     }
   };
 
@@ -409,6 +470,11 @@ export function DiffView() {
   const totalAdd = files.reduce((n, f) => n + f.additions, 0);
   const totalDel = files.reduce((n, f) => n + f.deletions, 0);
   const currentHunks = current ? (hunksByPath[current.path]?.hunks ?? []) : [];
+
+  // A one-line preview of what the merge commit will record (the differentiator,
+  // made visible). reviewed:true — a merge through the Review surface is reviewed.
+  const provenancePreview = `Records: Co-authored-by ${providerTitle(worktree?.provider ?? "")} · Taime-Agent-Id ${terminalId.slice(0, 8)} · reviewed · ${selectionCount} hunk(s) → ${target === "main" ? "main" : "sibling"}`;
+  const lastMerge = merges[0] ?? null;
 
   return (
     <div className="fixed inset-x-0 top-12 bottom-0 z-50 flex flex-col bg-ink-900">
@@ -456,68 +522,96 @@ export function DiffView() {
             <span className="text-emerald-400">+{totalAdd}</span>{" "}
             <span className="text-rose-400">-{totalDel}</span>
           </span>
+          {lastMerge && (
+            <span
+              className="flex shrink-0 items-center gap-1.5 rounded-md border border-emerald-600/40 bg-emerald-400/10 px-2 py-0.5 font-mono text-[11px] text-emerald-300"
+              title={`Merged → ${lastMerge.target} as ${lastMerge.commit} · ${lastMerge.scope} (${lastMerge.hunks_selected}/${lastMerge.hunks_total} hunks) · ${lastMerge.reviewed ? "reviewed" : "autonomous"}${merges.length > 1 ? ` · ${merges.length} merges total` : ""}`}
+            >
+              <Check size={12} />
+              merged {lastMerge.commit}
+            </span>
+          )}
         </div>
 
-        <div className="flex shrink-0 items-center gap-2">
-          {/* Merge target */}
-          <label className="flex items-center gap-1.5 text-[11px] text-zinc-500">
-            into
-            <select
-              value={target}
-              onChange={(e) => setTarget(e.target.value)}
-              className="rounded-md border border-ink-600 bg-ink-900 px-2 py-1 text-[11px] text-zinc-200"
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          <div className="flex items-center gap-2">
+            {/* Merge target */}
+            <label className="flex items-center gap-1.5 text-[11px] text-zinc-500">
+              into
+              <select
+                value={target}
+                onChange={(e) => setTarget(e.target.value)}
+                className="rounded-md border border-ink-600 bg-ink-900 px-2 py-1 text-[11px] text-zinc-200"
+              >
+                <option value="main">main</option>
+                {otherAgents.map((a) => (
+                  <option key={a.terminalId!} value={a.terminalId!}>
+                    {providerTitle(a.provider)} ({a.terminalId!.slice(0, 6)})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              disabled={busy || selectionCount === 0 || !reviewTrusted || loading || !digest}
+              onClick={() => void commitMerge()}
+              title={
+                reviewTrusted
+                  ? provenancePreview
+                  : "This diff may be stale — applying its hunk selection could merge the wrong lines"
+              }
+              className={`flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
             >
-              <option value="main">main</option>
-              {otherAgents.map((a) => (
-                <option key={a.terminalId!} value={a.terminalId!}>
-                  {providerTitle(a.provider)} ({a.terminalId!.slice(0, 6)})
-                </option>
-              ))}
-            </select>
-          </label>
-          <button
-            disabled={busy || selectionCount === 0 || !reviewTrusted || loading}
-            onClick={() => apply("merge")}
-            title={
-              reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could merge the wrong lines"
-            }
-            className={`flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
-          >
-            <GitMerge size={14} />
-            Merge {selectionCount > 0 ? `${selectionCount}` : ""}
-          </button>
-          <button
-            disabled={busy || selectionCount === 0 || !reviewTrusted || loading}
-            onClick={() => apply("revert")}
-            title={
-              reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could revert the wrong lines"
-            }
-            className={`flex items-center gap-1.5 rounded-md border border-rose-500/50 px-3 py-1.5 text-sm text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
-          >
-            <Undo2 size={14} />
-            Revert
-          </button>
-          <div className="mx-1 h-5 w-px bg-ink-600" />
-          <button
-            onClick={onMarkReviewed}
-            disabled={!reviewTrusted || loading}
-            title={
-              reviewTrusted
-                ? undefined
-                : "Daemon unreachable — the changes can't be verified, so they can't be acknowledged"
-            }
-            className={`flex items-center gap-1.5 rounded-md bg-emerald-600/90 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
-          >
-            <Check size={14} />
-            Mark reviewed
-          </button>
-          <button
-            onClick={closeDiff}
-            className={`rounded-md p-1.5 text-zinc-400 hover:bg-ink-600 hover:text-zinc-200 ${FOCUS_RING}`}
-            aria-label="Close diff"
-          >
-            <X size={18} />
-          </button>
+              <GitCommitHorizontal size={14} />
+              Commit &amp; merge {selectionCount > 0 ? `${selectionCount}` : ""}
+            </button>
+            <button
+              disabled={busy || selectionCount === 0 || !reviewTrusted || loading}
+              onClick={() => void revert()}
+              title={
+                reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could revert the wrong lines"
+              }
+              className={`flex items-center gap-1.5 rounded-md border border-rose-500/50 px-3 py-1.5 text-sm text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
+            >
+              <Undo2 size={14} />
+              Revert
+            </button>
+            <div className="mx-1 h-5 w-px bg-ink-600" />
+            <button
+              onClick={() => void exportAttribution()}
+              disabled={!reviewTrusted || loading}
+              title="Download this agent's attribution as a portable JSON artifact (identity, change set, recorded merges)"
+              className={`flex items-center gap-1.5 rounded-md border border-ink-600 px-3 py-1.5 text-sm text-zinc-300 hover:bg-ink-600 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
+            >
+              <Download size={14} />
+              Export
+            </button>
+            <button
+              onClick={onMarkReviewed}
+              disabled={!reviewTrusted || loading}
+              title={
+                reviewTrusted
+                  ? undefined
+                  : "Daemon unreachable — the changes can't be verified, so they can't be acknowledged"
+              }
+              className={`flex items-center gap-1.5 rounded-md bg-emerald-600/90 px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 disabled:cursor-default disabled:opacity-40 ${FOCUS_RING}`}
+            >
+              <Check size={14} />
+              Mark reviewed
+            </button>
+            <button
+              onClick={closeDiff}
+              className={`rounded-md p-1.5 text-zinc-400 hover:bg-ink-600 hover:text-zinc-200 ${FOCUS_RING}`}
+              aria-label="Close diff"
+            >
+              <X size={18} />
+            </button>
+          </div>
+          {/* Provenance preview — what the merge commit will record. */}
+          {selectionCount > 0 && reviewTrusted && (
+            <p className="font-mono text-[10px] text-zinc-500" title={provenancePreview}>
+              {provenancePreview}
+            </p>
+          )}
         </div>
       </div>
 

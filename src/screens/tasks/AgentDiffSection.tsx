@@ -4,11 +4,12 @@ import {
   Archive,
   ChevronDown,
   ChevronRight,
+  Download,
   FileMinus,
   FilePlus,
   FileText,
   GitBranch,
-  GitMerge,
+  GitCommitHorizontal,
   Undo2,
 } from "lucide-react";
 import { api, type FileDiffEntry, type HunkEntry, type TaskAgent } from "../../api";
@@ -169,62 +170,94 @@ export function AgentDiffSection({
   const totalAdd = files.reduce((n, f) => n + f.additions, 0);
   const totalDel = files.reduce((n, f) => n + f.deletions, 0);
 
-  /** Merge (→ main or a same-task sibling worktree) / Revert (from self) the
-   *  selected hunks — apply_selection per worktree, exactly as DiffView. */
-  const apply = async (mode: "merge" | "revert") => {
-    if (selectionCount === 0 || busy) return;
-    setBusy(mode);
+  // Shared handling for a refused/stale/conflicted apply-or-commit outcome.
+  const reportFailure = (res: { stale?: boolean; conflicts: string[]; error: string | null }, verb: string) => {
+    if (res.stale) {
+      // The worktree moved since this bundle was fetched — reload; the selection
+      // is meaningless against the new hunks.
+      showSnackbar({ type: "error", message: "The agent changed files after this diff loaded — review the new changes" });
+      setSel({});
+      onApplied();
+    } else if (res.conflicts.length) {
+      showSnackbar({ type: "error", message: `Conflicts: ${res.conflicts[0]}` });
+      onApplied();
+    } else {
+      showSnackbar({ type: "error", message: res.error ?? `${verb} failed` });
+    }
+  };
+
+  /** Commit & merge (→ main or a same-task sibling worktree): land the selected
+   *  hunks AND record them as one provenance commit. Merging through the Review
+   *  surface IS the review act, so the ack is recorded first (best-effort — the
+   *  merge is allowed either way, just labeled reviewed vs autonomous). */
+  const commitMerge = async () => {
+    if (selectionCount === 0 || busy || !bundle?.digest) return;
+    setBusy("merge");
     try {
-      // Merging from the review surface IS the review act: record the durable
-      // ack the daemon's merge gate requires (it refuses unacked merges). A
-      // failed ack is a hard stop — proceeding would hit the gate with a
-      // refusal that doesn't name the real cause. The local guard state is
-      // untouched — unmerged changes still need review.
-      if (mode === "merge") {
-        const acked = await api.markReviewed(member.agent_id);
-        if (!acked) {
-          showSnackbar({
-            type: "error",
-            message: "Could not record the review ack (daemon persistence unavailable) — merge aborted",
-          });
-          return;
-        }
-      }
-      const res = await api.applySelection(member.agent_id, {
-        target: mode === "revert" ? "self" : target,
-        mode,
+      await api.markReviewed(member.agent_id);
+      const res = await api.commitMerge(member.agent_id, {
+        target,
         selections: sel,
-        expectedDigest: bundle?.digest ?? undefined,
+        expectedDigest: bundle.digest,
       });
-      if (res.applied) {
-        const where = mode === "revert" ? agentName : target === "main" ? "main" : "agent";
+      if (res.committed) {
+        const where = target === "main" ? "main" : "the sibling worktree";
         showSnackbar({
           type: "success",
-          message: `${mode === "merge" ? "Merged" : "Reverted"} ${res.files.length} file(s) ${
-            mode === "merge" ? `→ ${where}` : `from ${where}`
-          }`,
+          message: `Committed ${res.commit} → ${where} — ${res.files.length} file(s), provenance recorded`,
         });
         setSel({});
-        onApplied();
-      } else if (res.stale) {
-        // The worktree moved since this bundle was fetched — reload; the
-        // selection is meaningless against the new hunks.
-        showSnackbar({
-          type: "error",
-          message: "The agent changed files after this diff loaded — review the new changes",
-        });
-        setSel({});
-        onApplied();
-      } else if (res.conflicts.length) {
-        showSnackbar({ type: "error", message: `Conflicts: ${res.conflicts[0]}` });
         onApplied();
       } else {
-        showSnackbar({ type: "error", message: res.error ?? "Apply failed" });
+        reportFailure(res, "Merge");
       }
     } catch (e) {
       showSnackbar({ type: "error", message: String(e) });
     } finally {
       setBusy(null);
+    }
+  };
+
+  /** Revert (reverse-apply from self): discard this agent's own work back to base.
+   *  No commit, no ack — the safe direction. */
+  const revert = async () => {
+    if (selectionCount === 0 || busy) return;
+    setBusy("revert");
+    try {
+      const res = await api.applySelection(member.agent_id, {
+        target: "self",
+        mode: "revert",
+        selections: sel,
+        expectedDigest: bundle?.digest ?? undefined,
+      });
+      if (res.applied) {
+        showSnackbar({ type: "success", message: `Reverted ${res.files.length} file(s) from ${agentName}` });
+        setSel({});
+        onApplied();
+      } else {
+        reportFailure(res, "Revert");
+      }
+    } catch (e) {
+      showSnackbar({ type: "error", message: String(e) });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /** Download this agent's attribution as a portable JSON artifact (gap #2). */
+  const exportAttribution = async () => {
+    try {
+      const data = await api.exportAttribution(member.agent_id);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `taime-attribution-${member.agent_id.slice(0, 8)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showSnackbar({ type: "success", message: "Attribution exported" });
+    } catch (e) {
+      showSnackbar({ type: "error", message: `Export failed: ${String(e)}` });
     }
   };
 
@@ -340,22 +373,35 @@ export function AgentDiffSection({
           </select>
         </label>
         <button
-          disabled={busy !== null || selectionCount === 0 || !reviewTrusted}
-          onClick={() => void apply("merge")}
-          title={reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could merge the wrong lines"}
+          disabled={busy !== null || selectionCount === 0 || !reviewTrusted || !bundle?.digest}
+          onClick={() => void commitMerge()}
+          title={
+            reviewTrusted
+              ? `Records: Co-authored-by ${providerTitle(member.provider ?? "")} · Taime-Agent-Id ${member.agent_id.slice(0, 8)} · reviewed · ${selectionCount} hunk(s) → ${target === "main" ? "main" : "sibling"}`
+              : "This diff may be stale — applying its hunk selection could merge the wrong lines"
+          }
           className="flex shrink-0 items-center gap-1 rounded-md bg-primary px-2 py-1 text-[11px] font-medium text-white hover:bg-primary-hover disabled:cursor-default disabled:opacity-40"
         >
-          <GitMerge size={11} />
-          {busy === "merge" ? "Merging…" : `Merge${selectionCount > 0 ? ` ${selectionCount}` : ""}`}
+          <GitCommitHorizontal size={11} />
+          {busy === "merge" ? "Committing…" : `Commit & merge${selectionCount > 0 ? ` ${selectionCount}` : ""}`}
         </button>
         <button
           disabled={busy !== null || selectionCount === 0 || !reviewTrusted}
-          onClick={() => void apply("revert")}
+          onClick={() => void revert()}
           title={reviewTrusted ? undefined : "This diff may be stale — applying its hunk selection could revert the wrong lines"}
           className="flex shrink-0 items-center gap-1 rounded-md border border-rose-500/50 px-2 py-1 text-[11px] text-rose-300 hover:bg-rose-500/10 disabled:cursor-default disabled:opacity-40"
         >
           <Undo2 size={11} />
           {busy === "revert" ? "Reverting…" : "Revert"}
+        </button>
+        <button
+          onClick={() => void exportAttribution()}
+          disabled={!reviewTrusted}
+          title="Download this agent's attribution as a portable JSON artifact"
+          className="flex shrink-0 items-center gap-1 rounded-md border border-ink-600 px-2 py-1 text-[11px] text-zinc-300 hover:bg-ink-600 disabled:cursor-default disabled:opacity-40"
+        >
+          <Download size={11} />
+          Export
         </button>
         <button
           onClick={onMarkReviewed}
