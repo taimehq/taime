@@ -90,6 +90,29 @@ fn is_transient(rel_path: &str) -> bool {
     crate::fswatch::is_transient_file(name)
 }
 
+/// Untracked (non-transient) files as synthetic new-file patches — the
+/// `git diff --no-index /dev/null` form, `(path, patch)` per file. Agents
+/// almost never commit, so their new files exist only as untracked paths,
+/// which `git diff <base>` omits. Every patch-shaped review surface
+/// (terminal_diff, hunked_diff, apply_selection) appends these, so
+/// agent-created files are visible, hunked, mergeable, AND revertable —
+/// not just listed.
+fn untracked_patches(path: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for f in git_ok(path, &["ls-files", "--others", "--exclude-standard"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty() && !is_transient(l))
+    {
+        // `--no-index` exits 1 when the sides differ — read stdout regardless.
+        let patch = git_raw(path, &["diff", "--no-index", "--", "/dev/null", f])
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        out.push((f.to_string(), patch));
+    }
+    out
+}
+
 pub fn terminal_diff(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
     let path = Path::new(cwd);
     if !is_git(path) {
@@ -106,16 +129,9 @@ pub fn terminal_diff(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
         .filter(|l| !l.is_empty() && !is_transient(l))
         .map(String::from)
         .collect();
-    // Untracked files as synthetic added diffs (skipping transient temps).
-    for f in git_ok(path, &["ls-files", "--others", "--exclude-standard"])
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.is_empty() && !is_transient(l))
-    {
-        if let Ok(o) = git_raw(path, &["diff", "--no-index", "--", "/dev/null", f]) {
-            diff.push_str(&String::from_utf8_lossy(&o.stdout));
-        }
-        files.push(f.to_string());
+    for (f, patch) in untracked_patches(path) {
+        diff.push_str(&patch);
+        files.push(f);
     }
     json!({
         "agent_id": agent_id, "working_directory": cwd, "is_git": true,
@@ -208,7 +224,10 @@ pub fn hunked_diff(agent_id: &str, cwd: &str, base: Option<&str>) -> Value {
         return json!({ "agent_id": agent_id, "base": null, "files": [] });
     }
     let base = resolve_base(path, base);
-    let raw = git_ok(path, &["diff", &base]).unwrap_or_default();
+    let mut raw = git_ok(path, &["diff", &base]).unwrap_or_default();
+    for (_, patch) in untracked_patches(path) {
+        raw.push_str(&patch);
+    }
     json!({ "agent_id": agent_id, "base": base, "files": parse_unified(&raw) })
 }
 
@@ -320,7 +339,13 @@ pub fn apply_selection(
 ) -> Value {
     let src = Path::new(cwd);
     let base = resolve_base(src, base);
-    let raw = git_ok(src, &["diff", &base]).unwrap_or_default();
+    // The same patch set hunked_diff serves: tracked changes + synthetic
+    // new-file patches for untracked files, so the UI's hunk selections
+    // (including agent-created files) reassemble 1:1.
+    let mut raw = git_ok(src, &["diff", &base]).unwrap_or_default();
+    for (_, patch) in untracked_patches(src) {
+        raw.push_str(&patch);
+    }
     let parsed = parse_unified(&raw);
 
     // Reassemble a patch from the selected hunks.
@@ -480,6 +505,15 @@ mod tests {
             }),
             "transient temps filtered from file_diffs review list"
         );
+
+        let h = hunked_diff("t1", dir.to_str().unwrap(), Some("HEAD"));
+        assert!(
+            !h["files"].as_array().unwrap().iter().any(|f| {
+                let p = f["path"].as_str().unwrap();
+                p.contains(".tmp.") || p.ends_with('~')
+            }),
+            "transient temps filtered from the hunked (mergeable) surface too"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -508,6 +542,57 @@ mod tests {
         assert!(hunks[0]["text"].as_str().unwrap().contains("@@"));
         assert_eq!(hunks[0]["index"], 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hunked_diff_includes_untracked_files_as_selectable_hunks() {
+        let dir = repo();
+        std::fs::write(dir.join("b.txt"), "new file\n").unwrap();
+        let v = hunked_diff("t1", dir.to_str().unwrap(), Some("HEAD"));
+        let files = v["files"].as_array().unwrap();
+        let b = files
+            .iter()
+            .find(|f| f["path"] == "b.txt")
+            .expect("untracked file present on the hunked surface");
+        let hunks = b["hunks"].as_array().unwrap();
+        assert_eq!(hunks.len(), 1, "one synthetic new-file hunk");
+        assert_eq!(hunks[0]["index"], 0);
+        assert!(hunks[0]["text"].as_str().unwrap().contains("+new file"));
+        assert_eq!(hunks[0]["additions"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_selection_merges_and_reverts_an_untracked_file() {
+        let src = repo();
+        std::fs::write(src.join("b.txt"), "agent-created\n").unwrap();
+        let target = std::env::temp_dir().join(format!("taime-target-{:08x}", rand::random::<u32>()));
+        std::fs::create_dir_all(&target).unwrap();
+        git(Path::new(&target), &["init", "-q"]);
+
+        // Merge: the new file lands in the target.
+        let v = apply_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            target.to_str().unwrap(),
+            "merge",
+            &json!({ "b.txt": [0] }),
+        );
+        assert_eq!(v["applied"], true, "error: {:?}", v["error"]);
+        assert_eq!(std::fs::read_to_string(target.join("b.txt")).unwrap(), "agent-created\n");
+
+        // Revert (reverse-apply to self): the file is removed from the source.
+        let v = apply_selection(
+            src.to_str().unwrap(),
+            Some("HEAD"),
+            src.to_str().unwrap(),
+            "revert",
+            &json!({ "b.txt": [0] }),
+        );
+        assert_eq!(v["applied"], true, "error: {:?}", v["error"]);
+        assert!(!src.join("b.txt").exists(), "reverted untracked file is gone");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     #[test]

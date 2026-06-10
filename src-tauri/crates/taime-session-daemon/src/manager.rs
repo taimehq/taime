@@ -3261,4 +3261,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&wt);
         let _ = std::fs::remove_dir_all(&proj);
     }
+
+    #[test]
+    fn untracked_agent_files_flow_through_review_end_to_end() {
+        let mgr = mem_manager();
+        let proj = project_repo();
+        let wt = seed_isolated_agent(&mgr, &proj, "agent-a");
+        // The most common agent output: a brand-new file, never committed.
+        std::fs::write(wt.join("generated.rs"), "fn agent_made_this() {}\n").unwrap();
+
+        // It must be hunked (selectable), not just listed.
+        let h: serde_json::Value = serde_json::from_str(
+            &mgr.query("hunked_diff", &serde_json::json!({ "agent_id": "agent-a" }).to_string()),
+        )
+        .unwrap();
+        let file = h["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "generated.rs")
+            .expect("untracked file appears on the hunked surface");
+        assert!(!file["hunks"].as_array().unwrap().is_empty(), "untracked file has hunks");
+
+        // And the UI's selection of that hunk must merge it into 'main'.
+        ack_review(&mgr, "agent-a");
+        let v: serde_json::Value = serde_json::from_str(&mgr.query(
+            "apply_selection",
+            &apply_args("agent-a", "main", "merge", serde_json::json!({ "generated.rs": [0] })),
+        ))
+        .unwrap();
+        assert_eq!(v["applied"], true, "untracked merge failed: {v}");
+        assert_eq!(
+            std::fs::read_to_string(proj.join("generated.rs")).unwrap(),
+            "fn agent_made_this() {}\n",
+            "the agent-created file must land in the project checkout"
+        );
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
 }
