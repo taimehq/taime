@@ -78,7 +78,11 @@ export function TaskReviewTab({
       return;
     }
     void loadAll();
-  }, [memberIds, loadAll]);
+    // `connected` in the deps heals the tab when the daemon comes back (the
+    // strict reads reject while it's down) — same wiring as DiffView/DiffPanel.
+    // Without it, the "until it answers" copy promised a retry that never ran,
+    // and pre-outage bundles silently became trusted again on reconnect.
+  }, [memberIds, loadAll, connected]);
 
   /** After a merge/revert: the worktree changed AND the rollups did. */
   const onApplied = useCallback(() => {
@@ -167,6 +171,16 @@ export function TaskReviewTab({
           The task aggregates — it does not own the diff. Merge runs per agent
           worktree.
         </p>
+        {loadedOnce && loadError && (
+          // A failed refresh after data has rendered: the sections below are
+          // STALE, not current — say so, and the per-agent Mark reviewed gates
+          // on this via the `stale` prop.
+          <p className="mt-1 text-[10px] text-amber">
+            {connected
+              ? "last refresh failed — the diffs below may be stale; reviewing is disabled until a refresh succeeds"
+              : "daemon unreachable — the diffs below may be stale; reviewing is disabled until it answers"}
+          </p>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -218,6 +232,7 @@ export function TaskReviewTab({
               member={a}
               siblings={members.filter((m) => m.agent_id !== a.agent_id)}
               bundle={bundles[a.agent_id]}
+              stale={loadError}
               contended={contended}
               onApplied={onApplied}
               sectionRef={(el) => {

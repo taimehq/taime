@@ -67,6 +67,7 @@ export function AgentDiffSection({
   member,
   siblings,
   bundle,
+  stale,
   contended,
   onApplied,
   sectionRef,
@@ -76,6 +77,9 @@ export function AgentDiffSection({
    *  (DiffView's rule: only same-task agents cross-link; Uncategorized never). */
   siblings: TaskAgent[];
   bundle: AgentDiffBundle | undefined;
+  /** The aggregate's last refresh failed: `bundle` is a kept-stale snapshot,
+   *  not current — Mark reviewed must not acknowledge it. */
+  stale: boolean;
   /** Workspace-wide contention: files also changed by another agent. */
   contended: Set<string>;
   onApplied: () => void;
@@ -197,10 +201,12 @@ export function AgentDiffSection({
     markReviewed(member.agent_id);
   };
 
-  // The diff below is authoritative only while the daemon answers and this
-  // agent's bundle actually loaded — acknowledging changes that were never
-  // shown would silently disarm the review guard.
-  const reviewTrusted = connected && bundle !== undefined;
+  // The diff below is authoritative only while the daemon answers, this
+  // agent's bundle actually loaded, AND the last refresh succeeded (a kept-
+  // stale bundle reads fine but may no longer reflect the worktree) —
+  // acknowledging changes that were never truly shown would silently disarm
+  // the review guard.
+  const reviewTrusted = connected && bundle !== undefined && !stale;
 
   const toggleFileCollapsed = (path: string) =>
     setCollapsedFiles((s) => {
@@ -303,7 +309,9 @@ export function AgentDiffSection({
           title={
             reviewTrusted
               ? "Acknowledge this agent's changes (clears its dirty set)"
-              : "Daemon unreachable — the changes can't be verified, so they can't be acknowledged"
+              : stale && connected
+                ? "Last refresh failed — this diff may be stale, so it can't be acknowledged"
+                : "Daemon unreachable — the changes can't be verified, so they can't be acknowledged"
           }
           className="flex shrink-0 items-center gap-1 rounded-md bg-emerald-600/90 px-2 py-1 text-[11px] font-medium text-white hover:brightness-110 disabled:cursor-default disabled:opacity-40"
         >
