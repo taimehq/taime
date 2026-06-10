@@ -240,9 +240,13 @@ export function TerminalViewRustPty({
         // The daemon CONNECTION dropped without a process exit (daemon crash /
         // codec error — deliberate detaches are silent). The agent may still be
         // running: never flip it to exited here (detach ≠ kill, the safe
-        //-context-switching invariant); the reconcile poll owns the lifecycle.
+        //-context-switching invariant). Flag the lost connection so the
+        // reconcile poll may demote this session against the daemon roster even
+        // while framed — without the flag, the framed exemption would wedge a
+        // crashed daemon's agent as "running · PTY attached" forever.
         () => {
-          if (!alive) return; // post-unmount push — nothing to surface
+          useStore.getState().setRustPtyConnectionLost(sessionId, true);
+          if (!alive) return; // post-unmount push — nothing to render
           term.write("\r\n\x1b[33m[daemon connection lost — reattach to resume]\x1b[0m\r\n");
           onConnectionChange?.("closed");
         },
@@ -255,6 +259,8 @@ export function TerminalViewRustPty({
         return;
       }
       channelRef.current = ch as Channel<unknown> | null;
+      // A live attach supersedes any earlier connection-lost flag.
+      if (ch) useStore.getState().setRustPtyConnectionLost(sessionId, false);
       onConnectionChange?.("open");
       // Nudge a redraw so a reattached TUI repaints cleanly at the current size.
       safeFit();

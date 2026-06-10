@@ -312,6 +312,28 @@ describe("markRustPtyExited", () => {
   });
 });
 
+describe("setRustPtyConnectionLost", () => {
+  it("sets and clears the flag, no-oping when unchanged", () => {
+    useStore.setState({ rustPtySessions: { "sess-1": makeMeta() } });
+
+    useStore.getState().setRustPtyConnectionLost("sess-1", true);
+    expect(useStore.getState().rustPtySessions["sess-1"].connectionLost).toBe(true);
+
+    const afterSet = useStore.getState();
+    useStore.getState().setRustPtyConnectionLost("sess-1", true);
+    expect(useStore.getState()).toBe(afterSet); // identity no-op
+
+    useStore.getState().setRustPtyConnectionLost("sess-1", false);
+    expect(useStore.getState().rustPtySessions["sess-1"].connectionLost).toBe(false);
+  });
+
+  it("no-ops on an unknown session id", () => {
+    const before = useStore.getState();
+    useStore.getState().setRustPtyConnectionLost("nope", true);
+    expect(useStore.getState()).toBe(before);
+  });
+});
+
 // ── reopenRustPty ───────────────────────────────────────────────────────────
 
 describe("reopenRustPty", () => {
