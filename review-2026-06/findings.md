@@ -69,8 +69,35 @@ P0 is **effectively complete**. Two batches landed and pushed:
     TOCTOU, per-batch de-dup lock cost.
 
 **Remaining P0:** only item 17 (protocol-version-without-bump), which is moot pre-release
-(version-gated handshake). **Next:** Phase 2 — commit/merge with provenance, redesigned around the
-archive ref (it's already a durable commit; `Taime-Agent-Id` ↔ `refs/taime/archive/<id>` unify).
+(version-gated handshake).
+
+## Status — Phase 2 (provenance/merge, roadmap step 2) landed on main (2026-06-11)
+
+Gaps #1 (merge dead-ends at `git apply`) and #2 (attribution not exportable) are closed; landed
+on `main` (commit `c7ea8c5`, branch `feat/provenance-merge`), validated independently: 210 cargo
+tests, clippy `-D warnings` clean, typecheck clean, 149 vitest.
+
+- **`commit_merge`** ends the dead-end: re-commits the assembled (hunk-selected) patch onto the
+  resolved target with provenance trailers, reusing the hardened `assemble_and_apply` core so live
+  and reclaimed (archive-ref) agents share one path. Surgical `git add/commit -- <files>` never
+  sweeps unrelated dirty files.
+- **Provenance trailers** — `Co-authored-by` (provider; model omitted as honest — not reliably
+  known), `Taime-Agent-Id` (= `refs/taime/archive/<id>`), base-sha, task, `Taime-Reviewed:
+  true|false`, reviewed-digest, merge-scope full|partial, hunks, turns.
+- **Gate = Option 1:** merge requires a matching `expected_digest` (integrity floor — no stale/
+  drifted merges) but the review ack is OPTIONAL; the trailer records `reviewed|autonomous`
+  honestly (aligns with the opt-in-review autonomy model; the digest is explicitly *not* a
+  proof-of-sight security boundary).
+- **Export (gap #2):** schema v14 `taime_merges` ledger + `git-notes` (`refs/notes/taime`) + a JSON
+  `export_attribution` query. **PR creation (`gh pr create`) deferred** to a fast-follow; opt-in
+  best-effort `push` is in scope.
+- **UX:** "Merge" → "Commit & merge" with a provenance preview, post-commit export action, merged ✓
+  badge. A code-review pass caught + fixed a **data-loss regression** (+ no-op merge + stale
+  target) before landing.
+
+**Next:** roadmap step 3 — Council (designed, `review-2026-06/council/`), now unblocked; or the
+gaps cluster (notifications, resume, run history, model picker, cleanup UI); or a reliability/UX
+hardening pass (§3/§4).
 
 ---
 
@@ -377,6 +404,7 @@ archive ref (it's already a durable commit; `Taime-Agent-Id` ↔ `refs/taime/arc
 - **Verifier notes:** Code facts check out (manager.rs:690-696 has no review precondition; store.rs acks are never joined into merges), but the defect framing is refuted. Evidence is wrong that peer-uid is "the sole socket auth": conn.rs handle_hello requires a constant-time attach-token match before any Query. The same-uid+token trust model is explicitly documented as accepted design (daemon-hardening-plan.md:169) and was adjudicated "correct by design" in the review behind HEAD. The lexicon defines Review as a derived view whose actions include Merge; acks are documented context-switch-guard state, not a merge precondition. "Proceed without review" merges nothing. And the claim concedes agents can git -C repo_root directly — no daemon gate can constrain a same-uid unsandboxed CLI, so the proposed fix cannot establish the invariant. At most a low-severity docs/positioning note. ||| Core code fact confirmed: manager.rs:690-696 apply_selection performs no review check, and store.rs review acks are write-only — the only reader (the "reviewed" arm) just lists them. So the merge gate is genuinely UI/workflow-only, not daemon-enforced. But severity is inflated and the evidence is partly wrong. The finding claims peer-uid is "the sole socket auth"; conn.rs/handle_hello require a rotating attach token on every connection before any Query. The sanctioned MCP surface (mcp.rs) exposes no merge tool; agents get only TAIME_MCP_TOKEN, never the attach token. Reaching apply_selection needs a malicious, Taime-aware agent reading the 0600 token and reimplementing the wire protocol. Direct git/fs access is inherent to driving trusted CLIs; "Proceed without review" is deliberate informed-consent design.
 
 ### [CONFIRMED | high] Edits outside the agent's worktree are invisible to attribution, diff, and review
+- **RESOLVED (by decision) 2026-06-10 — `3cb02ff` (batch 2, item 11):** the *misattribution* half is closed (shared-mode fs events are gated on the agent being mid-turn, so the user's/other agents' edits are no longer recorded as the agent's). The *invisibility* half — out-of-worktree edits producing no record — is now a **documented, accepted known limitation**: such edits are dropped, never misattributed. The proposed fix here (a per-workspace `project_root` escape-watcher surfacing "changes outside any worktree") was **deliberately deferred** as a future enhancement. Historical finding text below left intact; see the Status section at top.
 - **Area:** src-tauri/crates/taime-session-daemon/src/session.rs:688-706, src-tauri/crates/taime-session-daemon/src/manager.rs:656-668, src-tauri/crates/taime-session-daemon/src/fswatch.rs:58-85
 - **Description:** The only attribution sensors are the per-session watcher rooted at the agent's cwd and git diffs scoped to the worktree path. An agent that writes via an absolute path outside its worktree — highly realistic, since user prompts routinely contain main-repo absolute paths and the CLI will happily edit them — or whose subprocesses write elsewhere, produces no fs events, no turn files_touched, no dirty badge, no diff, and no review entry. The change lands directly in the user's tree with no record that any agent made it. The lexicon's claim that the worktree "proves" which agent made a change holds only for changes that stay inside the worktree; escapes are silent, not detected.
 - **Evidence:** start_fs_watch (session.rs:692) watches only PathBuf::from(&inner.cwd); diff_context (manager.rs:659-668) returns only the worktree path; no watcher exists on project_root for isolated agents; OSC-7 cwd tracking (attribution.rs:92-111) is captured but unused ("not yet surfaced on the wire").
